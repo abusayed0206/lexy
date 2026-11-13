@@ -102,10 +102,22 @@ Initial shortcuts:
 - `Ctrl+O`: open file.
 - `Ctrl+S`: save.
 - `Ctrl+Shift+S`: save as.
-- `Ctrl+B` or `F5`: compile. Pick one before implementation and document it in tracker.
+- `F5`: compile (decided 2026-11-13; `Ctrl+B` is bold).
+- `Ctrl+B` / `Ctrl+I` / `Ctrl+U`: bold / italic / underline the selection (editor only).
 - `Ctrl+L`: toggle logs.
 
 Shortcuts must not conflict with text editing expectations.
+
+## Ribbon (2026-11-13, feature 002)
+
+The compact command strip is replaced by a Word-style ribbon at the user's request (`specs/002-word-style-editor`). The LaTeX source stays visible; every ribbon action is a plain text edit.
+
+- Tabs: File (New, Open, Save, Save as), Home (Font, Size, Bold/Italic/Underline, Bullets, Numbering, Styles), Insert (Equation, Table, Page break, Footnote), Layout (Margins, Size, Orientation), View (Live preview, Compile now, Logs).
+- File name, unsaved dot, status pill and Compile stay visible at the right of the tab row on every tab.
+- At ≥ 900 px wide buttons show labels; below that they are icon-only with tooltips; below 820 px group captions hide. Nothing wraps or overlaps at 800 px.
+- Shortcuts are a capture-phase handler so they beat CodeMirror's own bindings: Ctrl+L (select line) and Ctrl+I (select parent) are taken over by Lexy.
+- Document-wide font, size, paper and margins are written into one marked "Lexy settings" block after `\documentclass`; Lexy never edits other preamble lines.
+- Live preview recompiles about 1 s after typing stops, without saving. Live failures show "Preview failed" in the status; only F5/Compile failures open the log drawer.
 
 ## Accessibility And Responsiveness
 
@@ -138,4 +150,5 @@ Add manual design ideas below. Keep each note dated and move accepted work into 
 
 | Date | Author | Note | Decision |
 | --- | --- | --- | --- |
-| 2026-06-10 | Codex | Keep MVP as split editor/preview with a compact command strip. | Accepted |
+| 2026-06-10 | Codex | Keep MVP as split editor/preview with a compact command strip. | Superseded 2026-11-13 by the ribbon |
+| 2026-11-13 | User | Word-style ribbon with fonts, equations, tables, margins and live preview. | Accepted (feature 002) |

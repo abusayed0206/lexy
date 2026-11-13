@@ -4,16 +4,19 @@ use std::{
     env,
     ffi::OsStr,
     fs::{self, File},
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
-use tauri::{AppHandle, Emitter};
+use tauri::{ipc::Response, AppHandle, Emitter, Manager, State};
 
-const MIKTEX_SETUP_URL: &str = "https://miktex.org/download/win/miktexsetup-x64.zip";
-const STRAWBERRY_PERL_MSI_URL: &str = "https://github.com/StrawberryPerl/Perl-Dist-Strawberry/releases/download/SP_54221_64bit/strawberry-perl-5.42.2.1-64bit.msi";
-const MIKTEX_SETUP_SHA256: Option<&str> = None;
-const STRAWBERRY_PERL_MSI_SHA256: Option<&str> = None;
+mod setup;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,94 +37,55 @@ struct EnvironmentStatus {
     latexmk: ToolProbe,
 }
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SetupProgress {
-    step: &'static str,
-    label: String,
-    detail: String,
-    progress: Option<u8>,
-    state: &'static str,
+// Probing and installing spawn processes for seconds to minutes; keep them off the UI thread.
+#[tauri::command]
+async fn check_environment() -> Result<EnvironmentStatus, String> {
+    tauri::async_runtime::spawn_blocking(detect_environment)
+        .await
+        .map_err(|error| format!("environment check failed: {error}"))
 }
 
+/// True while a setup run is in progress; a second click must not start another.
+struct SetupGuard(Arc<AtomicBool>);
+
 #[tauri::command]
-fn check_environment() -> EnvironmentStatus {
-    detect_environment()
+async fn start_initial_setup(app: AppHandle, guard: State<'_, SetupGuard>) -> Result<EnvironmentStatus, String> {
+    if guard.0.swap(true, Ordering::SeqCst) {
+        return Err("Setup is already running.".into());
+    }
+    let running = Arc::clone(&guard.0);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let root = setup_root()?;
+        let emit = |event: setup::SetupProgress| {
+            let _ = app.emit("setup-progress", event);
+        };
+        let report = setup::Reporter::new(&emit, Some(&root.join("setup.log")));
+        setup::run_setup(&report, &root)
+    })
+    .await
+    .map_err(|error| format!("setup task failed: {error}"));
+    running.store(false, Ordering::SeqCst);
+    result?
 }
 
+/// The end of the last setup run's log, for the setup screen's Details view.
 #[tauri::command]
-fn start_initial_setup(app: AppHandle) -> Result<EnvironmentStatus, String> {
-    emit_progress(
-        &app,
-        "check",
-        "Checking existing tools",
-        "Looking for MiKTeX, latexmk, and Strawberry Perl.",
-        Some(0),
-        "running",
-    );
-
-    let before = detect_environment();
-    if before.ready {
-        emit_progress(
-            &app,
-            "complete",
-            "Setup complete",
-            "Required LaTeX tools are already installed.",
-            Some(100),
-            "done",
-        );
-        return Ok(before);
-    }
-
-    let setup_root = setup_root()?;
-    let download_dir = setup_root.join("downloads");
-    fs::create_dir_all(&download_dir).map_err(|error| format!("failed to create setup cache: {error}"))?;
-
-    if !before.perl.installed {
-        install_strawberry_perl(&app, &download_dir)?;
-    }
-
-    let after_perl = detect_environment();
-    if !after_perl.miktex.installed || !after_perl.latexmk.installed {
-        install_miktex(&app, &setup_root, &download_dir)?;
-    }
-
-    emit_progress(
-        &app,
-        "verify",
-        "Verifying setup",
-        "Checking command versions after installation.",
-        Some(92),
-        "running",
-    );
-    let after = detect_environment();
-    if !after.ready {
-        emit_progress(
-            &app,
-            "verify",
-            "Setup needs attention",
-            "One or more required tools could not be verified. Open the setup log and retry.",
-            Some(100),
-            "error",
-        );
-        return Err("initial setup finished, but required tools were not verified".to_string());
-    }
-
-    emit_progress(
-        &app,
-        "complete",
-        "Setup complete",
-        "MiKTeX, latexmk, and Strawberry Perl are ready.",
-        Some(100),
-        "done",
-    );
-    Ok(after)
+fn read_setup_log() -> Result<String, String> {
+    Ok(setup::log_tail(&setup_root()?.join("setup.log"), 400))
 }
 
 fn detect_environment() -> EnvironmentStatus {
-    let perl = probe_tool("Strawberry Perl", "perl", &["--version"], &perl_candidates());
-    let miktex = probe_tool("MiKTeX", "miktex", &["--version"], &miktex_candidates("miktex"));
-    let latexmk = probe_tool("latexmk", "latexmk", &["--version"], &miktex_candidates("latexmk"));
+    let perl = probe_tool("Strawberry Perl", "perl", &["--version"], &perl_candidates(), &[]);
+    let miktex = probe_tool("MiKTeX", "miktex", &["--version"], &miktex_candidates("miktex"), &[]);
+    // latexmk is a Perl script: MiKTeX's latexmk.exe only works when perl is on its PATH,
+    // and Lexy's own portable Perl is never on the user's PATH. Probe it the way compiles run it.
+    let perl_dir: Vec<PathBuf> = perl
+        .path
+        .as_deref()
+        .and_then(|path| Path::new(path).parent().map(Path::to_path_buf))
+        .into_iter()
+        .collect();
+    let latexmk = probe_tool("latexmk", "latexmk", &["--version"], &miktex_candidates("latexmk"), &perl_dir);
 
     EnvironmentStatus {
         ready: perl.installed && miktex.installed && latexmk.installed,
@@ -136,6 +100,7 @@ fn probe_tool(
     command_name: &str,
     version_args: &[&str],
     candidates: &[PathBuf],
+    path_prefix: &[PathBuf],
 ) -> ToolProbe {
     let executable = candidates
         .iter()
@@ -153,13 +118,19 @@ fn probe_tool(
         };
     };
 
-    match Command::new(&path)
+    let mut command = Command::new(&path);
+    if !path_prefix.is_empty() {
+        if let Ok(value) = path_with_prefix(path_prefix) {
+            command.env("PATH", value);
+        }
+    }
+    match hide_console(&mut command)
         .args(version_args)
         .stdin(Stdio::null())
         .output()
     {
         Ok(output) if output.status.success() => {
-            let version = first_output_line(&output.stdout).or_else(|| first_output_line(&output.stderr));
+            let version = version_line(&output.stdout).or_else(|| version_line(&output.stderr));
             ToolProbe {
                 name,
                 installed: true,
@@ -173,7 +144,10 @@ fn probe_tool(
             installed: false,
             version: None,
             path: Some(path.display().to_string()),
-            message: format!("{name} exists but returned exit code {:?}.", output.status.code()),
+            message: match first_output_line(&output.stderr).or_else(|| first_output_line(&output.stdout)) {
+                Some(reason) => format!("{name} is installed but could not run: {reason}"),
+                None => format!("{name} is installed but exited with code {:?}.", output.status.code()),
+            },
         },
         Err(error) => ToolProbe {
             name,
@@ -183,223 +157,6 @@ fn probe_tool(
             message: format!("{name} could not be executed: {error}"),
         },
     }
-}
-
-fn install_strawberry_perl(app: &AppHandle, download_dir: &Path) -> Result<(), String> {
-    let msi_path = download_dir.join("strawberry-perl-5.42.2.1-64bit.msi");
-    emit_progress(
-        app,
-        "perl-download",
-        "Downloading Strawberry Perl",
-        "Using the official 64-bit MSI release.",
-        Some(8),
-        "running",
-    );
-    download_file(
-        app,
-        STRAWBERRY_PERL_MSI_URL,
-        &msi_path,
-        STRAWBERRY_PERL_MSI_SHA256,
-        "perl-download",
-        8,
-        30,
-    )?;
-
-    emit_progress(
-        app,
-        "perl-install",
-        "Installing Strawberry Perl",
-        "Running the MSI silently. Windows may request elevation if the MSI requires it.",
-        Some(32),
-        "running",
-    );
-    run_command(
-        app,
-        "perl-install",
-        "msiexec",
-        &[
-            OsStr::new("/i"),
-            msi_path.as_os_str(),
-            OsStr::new("/qn"),
-            OsStr::new("/norestart"),
-        ],
-        None,
-    )?;
-    emit_progress(
-        app,
-        "perl-install",
-        "Strawberry Perl installed",
-        "Perl installation command completed.",
-        Some(40),
-        "done",
-    );
-    Ok(())
-}
-
-fn install_miktex(app: &AppHandle, setup_root: &Path, download_dir: &Path) -> Result<(), String> {
-    let zip_path = download_dir.join("miktexsetup-x64.zip");
-    let utility_dir = setup_root.join("miktexsetup");
-    let repository_dir = setup_root.join("miktex-repository");
-    let install_dir = setup_root.join("MiKTeX");
-    let config_dir = setup_root.join("MiKTeXConfig");
-    let data_dir = setup_root.join("MiKTeXData");
-
-    fs::create_dir_all(&utility_dir).map_err(|error| format!("failed to create MiKTeX setup dir: {error}"))?;
-    fs::create_dir_all(&repository_dir).map_err(|error| format!("failed to create MiKTeX repository dir: {error}"))?;
-
-    emit_progress(
-        app,
-        "miktex-download",
-        "Downloading MiKTeX setup",
-        "Fetching the standalone setup utility from miktex.org.",
-        Some(42),
-        "running",
-    );
-    download_file(
-        app,
-        MIKTEX_SETUP_URL,
-        &zip_path,
-        MIKTEX_SETUP_SHA256,
-        "miktex-download",
-        42,
-        52,
-    )?;
-
-    emit_progress(
-        app,
-        "miktex-extract",
-        "Preparing MiKTeX setup",
-        "Extracting the standalone command-line setup utility.",
-        Some(54),
-        "running",
-    );
-    expand_archive(app, &zip_path, &utility_dir)?;
-    let setup_exe = find_file_named(&utility_dir, "miktexsetup_standalone.exe")
-        .ok_or_else(|| "miktexsetup_standalone.exe was not found after extraction".to_string())?;
-    let repository_arg = format!("--local-package-repository={}", repository_dir.display());
-
-    emit_progress(
-        app,
-        "miktex-repository",
-        "Downloading MiKTeX packages",
-        "Creating a local basic MiKTeX package repository. This can take several minutes.",
-        Some(58),
-        "running",
-    );
-    run_command(
-        app,
-        "miktex-repository",
-        setup_exe.as_os_str(),
-        &[
-            OsStr::new("--verbose"),
-            OsStr::new(&repository_arg),
-            OsStr::new("--package-set=basic"),
-            OsStr::new("download"),
-        ],
-        None,
-    )?;
-
-    emit_progress(
-        app,
-        "miktex-install",
-        "Installing MiKTeX",
-        "Installing MiKTeX for the current user with no setup wizard.",
-        Some(76),
-        "running",
-    );
-    let install_arg = format!("--user-install={}", install_dir.display());
-    let config_arg = format!("--user-config={}", config_dir.display());
-    let data_arg = format!("--user-data={}", data_dir.display());
-    run_command(
-        app,
-        "miktex-install",
-        setup_exe.as_os_str(),
-        &[
-            OsStr::new("--verbose"),
-            OsStr::new(&repository_arg),
-            OsStr::new("--shared=no"),
-            OsStr::new("--modify-path=no"),
-            OsStr::new("--package-set=basic"),
-            OsStr::new(&install_arg),
-            OsStr::new(&config_arg),
-            OsStr::new(&data_arg),
-            OsStr::new("install"),
-        ],
-        None,
-    )?;
-
-    emit_progress(
-        app,
-        "miktex-install",
-        "MiKTeX installed",
-        "MiKTeX installation command completed.",
-        Some(88),
-        "done",
-    );
-    Ok(())
-}
-
-fn download_file(
-    app: &AppHandle,
-    url: &str,
-    destination: &Path,
-    expected_sha256: Option<&str>,
-    step: &'static str,
-    start_percent: u8,
-    end_percent: u8,
-) -> Result<(), String> {
-    if expected_sha256.is_none() {
-        emit_progress(
-            app,
-            step,
-            "Checksum not configured",
-            "Using TLS and official source URL. Add a pinned SHA-256 before production release.",
-            Some(start_percent),
-            "running",
-        );
-    }
-
-    let command = format!(
-        "$ProgressPreference = 'SilentlyContinue'; Invoke-WebRequest -Uri '{}' -OutFile '{}'",
-        powershell_escape_text(url),
-        powershell_escape(destination),
-    );
-    emit_progress(
-        app,
-        step,
-        "Downloading",
-        "Downloading from the official source. This may take a while.",
-        Some(start_percent),
-        "running",
-    );
-    run_command(
-        app,
-        step,
-        "powershell",
-        &[
-            OsStr::new("-NoProfile"),
-            OsStr::new("-ExecutionPolicy"),
-            OsStr::new("Bypass"),
-            OsStr::new("-Command"),
-            OsStr::new(&command),
-        ],
-        None,
-    )?;
-
-    verify_sha256(destination, expected_sha256)?;
-    emit_progress(
-        app,
-        step,
-        "Download complete",
-        &format!(
-            "Saved {} ({}).",
-            destination.display(),
-            downloaded_file_size(destination)?
-        ),
-        Some(end_percent),
-        "done",
-    );
-    Ok(())
 }
 
 fn verify_sha256(path: &Path, expected_sha256: Option<&str>) -> Result<(), String> {
@@ -430,84 +187,6 @@ fn verify_sha256(path: &Path, expected_sha256: Option<&str>) -> Result<(), Strin
     Ok(())
 }
 
-fn expand_archive(app: &AppHandle, zip_path: &Path, destination: &Path) -> Result<(), String> {
-    let command = format!(
-        "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
-        powershell_escape(zip_path),
-        powershell_escape(destination)
-    );
-    run_command(
-        app,
-        "miktex-extract",
-        "powershell",
-        &[
-            OsStr::new("-NoProfile"),
-            OsStr::new("-ExecutionPolicy"),
-            OsStr::new("Bypass"),
-            OsStr::new("-Command"),
-            OsStr::new(&command),
-        ],
-        None,
-    )
-}
-
-fn run_command<S: AsRef<OsStr>>(
-    app: &AppHandle,
-    step: &'static str,
-    program: S,
-    args: &[&OsStr],
-    current_dir: Option<&Path>,
-) -> Result<(), String> {
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    if let Some(current_dir) = current_dir {
-        command.current_dir(current_dir);
-    }
-
-    let output = command
-        .output()
-        .map_err(|error| format!("failed to start setup command: {error}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let detail = summarize_command_output(&stdout, &stderr);
-
-    if output.status.success() {
-        emit_progress(app, step, "Command completed", &detail, None, "done");
-        Ok(())
-    } else {
-        emit_progress(app, step, "Command failed", &detail, None, "error");
-        Err(format!(
-            "setup command failed with exit code {:?}: {detail}",
-            output.status.code()
-        ))
-    }
-}
-
-fn emit_progress(
-    app: &AppHandle,
-    step: &'static str,
-    label: impl Into<String>,
-    detail: impl Into<String>,
-    progress: Option<u8>,
-    state: &'static str,
-) {
-    let _ = app.emit(
-        "setup-progress",
-        SetupProgress {
-            step,
-            label: label.into(),
-            detail: detail.into(),
-            progress,
-            state,
-        },
-    );
-}
-
 fn find_on_path(command_name: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     for entry in env::split_paths(&path) {
@@ -529,6 +208,10 @@ fn find_on_path(command_name: &str) -> Option<PathBuf> {
 
 fn perl_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+    // Lexy's own portable Strawberry Perl (installed without admin rights).
+    if let Ok(root) = setup_root() {
+        candidates.push(root.join(setup::PERL_DIR).join(r"perl\bin\perl.exe"));
+    }
     candidates.push(PathBuf::from(r"C:\Strawberry\perl\bin\perl.exe"));
     if let Some(program_files) = env::var_os("ProgramFiles") {
         candidates.push(PathBuf::from(program_files).join(r"Strawberry\perl\bin\perl.exe"));
@@ -584,14 +267,14 @@ fn first_output_line(bytes: &[u8]) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn summarize_command_output(stdout: &str, stderr: &str) -> String {
-    stderr
+/// The line that names the version (latexmk prints code-page notices first), else the first line.
+fn version_line(bytes: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(bytes)
         .lines()
-        .chain(stdout.lines())
         .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("No output.")
-        .to_string()
+        .find(|line| line.to_ascii_lowercase().contains("version"))
+        .map(ToOwned::to_owned)
+        .or_else(|| first_output_line(bytes))
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -603,28 +286,1259 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn powershell_escape(path: &Path) -> String {
-    path.display().to_string().replace('\'', "''")
+// ---------------------------------------------------------------------------
+// Documents
+// ---------------------------------------------------------------------------
+
+const MAX_DOCUMENT_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Only absolute `.tex` paths reach the filesystem.
+fn validate_tex_path(path: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err(format!("expected an absolute path, got {}", path.display()));
+    }
+    let is_tex = path
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("tex"));
+    if !is_tex {
+        return Err(format!("{} is not a .tex file", path.display()));
+    }
+    Ok(path)
 }
 
-fn powershell_escape_text(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
-fn downloaded_file_size(path: &Path) -> Result<String, String> {
+#[tauri::command]
+fn read_document(path: String) -> Result<String, String> {
+    let path = validate_tex_path(&path)?;
     let metadata =
-        fs::metadata(path).map_err(|error| format!("failed to stat {}: {error}", path.display()))?;
-    Ok(format_bytes(metadata.len()))
+        fs::metadata(&path).map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+    if metadata.len() > MAX_DOCUMENT_BYTES {
+        return Err(format!("{} is larger than 10 MiB", path.display()));
+    }
+    // Refuse non-UTF-8 rather than silently mangling it on the next save.
+    fs::read_to_string(&path).map_err(|error| format!("failed to read {}: {error}", path.display()))
+}
+
+#[tauri::command]
+fn write_document(path: String, contents: String) -> Result<(), String> {
+    let path = validate_tex_path(&path)?;
+    write_atomic(&path, contents.as_bytes())
+}
+
+/// Write to a sibling temp file, flush it to disk, then rename over the target,
+/// so a crash mid-save never leaves a half-written document.
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", path.display()))?;
+    let temp = path.with_file_name(format!(".{}.lexy-tmp", file_name.to_string_lossy()));
+    let write = || -> std::io::Result<()> {
+        let mut file = File::create(&temp)?;
+        file.write_all(contents)?;
+        file.sync_all()
+    };
+    if let Err(error) = write() {
+        let _ = fs::remove_file(&temp);
+        return Err(format!("failed to write {}: {error}", path.display()));
+    }
+    fs::rename(&temp, path).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        format!("failed to save {}: {error}", path.display())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Compilation
+// ---------------------------------------------------------------------------
+
+const COMPILE_TIMEOUT: Duration = Duration::from_secs(180);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Engine {
+    Pdflatex,
+    Xelatex,
+    Lualatex,
+}
+
+impl Engine {
+    fn latexmk_flag(self) -> &'static str {
+        match self {
+            Engine::Pdflatex => "-pdf",
+            Engine::Xelatex => "-xelatex",
+            Engine::Lualatex => "-lualatex",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompileResult {
+    ok: bool,
+    summary: String,
+    log: String,
+    pdf_path: Option<String>,
+    engine: Engine,
+}
+
+/// One compile at a time per process: live and explicit compiles share build folders.
+struct CompileLock(Arc<Mutex<()>>);
+
+/// Engine from a `% !TEX program = …` (or `TS-program`) line in the first 5 lines,
+/// the TeXworks/TeXShop convention, so the document stays the single source of truth.
+fn engine_from_marker(source: &str) -> Engine {
+    for line in source.lines().take(5) {
+        let Some(comment) = line.trim().strip_prefix('%') else { continue };
+        let lower = comment.trim_start().to_ascii_lowercase();
+        let Some(rest) = lower.strip_prefix("!tex") else { continue };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix("ts-program").or_else(|| rest.strip_prefix("program")) else {
+            continue;
+        };
+        let Some(value) = rest.trim_start().strip_prefix('=') else { continue };
+        return match value.trim() {
+            "xelatex" => Engine::Xelatex,
+            "lualatex" => Engine::Lualatex,
+            _ => Engine::Pdflatex,
+        };
+    }
+    Engine::Pdflatex
+}
+
+#[tauri::command]
+async fn compile_source(
+    source: String,
+    document_path: Option<String>,
+    lock: State<'_, CompileLock>,
+) -> Result<CompileResult, String> {
+    let document = document_path.as_deref().map(validate_tex_path).transpose()?;
+    let lock = Arc::clone(&lock.0);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        compile_snapshot(&build_root()?, &source, document.as_deref())
+    })
+    .await
+    .map_err(|error| format!("compile task failed: {error}"))?
+}
+
+/// Build folder and file stem for a snapshot: per saved document, or a shared `untitled` one.
+fn snapshot_location(root: &Path, document: Option<&Path>) -> Result<(PathBuf, String), String> {
+    match document {
+        Some(path) => {
+            let stem = path
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .ok_or("document name is not valid text")?;
+            Ok((root.join(build_key(path)), stem.to_string()))
+        }
+        None => Ok((root.join("untitled"), "Untitled".to_string())),
+    }
+}
+
+/// Compile the editor text without touching the user's file: it is written as a
+/// snapshot into the build folder and latexmk runs there. Files beside a saved
+/// document stay reachable through TEXINPUTS.
+fn compile_snapshot(root: &Path, source: &str, document: Option<&Path>) -> Result<CompileResult, String> {
+    if source.len() as u64 > MAX_DOCUMENT_BYTES {
+        return Err("the document is larger than 10 MiB".into());
+    }
+    let engine = engine_from_marker(source);
+    let (out_dir, stem) = snapshot_location(root, document)?;
+    fs::create_dir_all(&out_dir).map_err(|error| format!("failed to create build folder: {error}"))?;
+    write_atomic(&out_dir.join(format!("{stem}.tex")), source.as_bytes())?;
+
+    // Always revalidate tool paths before compiling (docs/PLAN.md).
+    let environment = detect_environment();
+    if !environment.ready {
+        let missing: Vec<&str> = [&environment.miktex, &environment.latexmk, &environment.perl]
+            .into_iter()
+            .filter(|tool| !tool.installed)
+            .map(|tool| tool.name)
+            .collect();
+        return Ok(CompileResult {
+            ok: false,
+            summary: format!("{} missing", missing.join(", ")),
+            log: "Lexy could not find the LaTeX tools it needs. Restart Lexy to run setup.".into(),
+            pdf_path: None,
+            engine,
+        });
+    }
+
+    let latexmk = environment
+        .latexmk
+        .path
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or("latexmk path is unknown")?;
+    // latexmk shells out to the TeX engine (MiKTeX) and needs perl, so put all three on its PATH.
+    let tool_dirs: Vec<PathBuf> = [&environment.latexmk.path, &environment.miktex.path, &environment.perl.path]
+        .into_iter()
+        .flatten()
+        .filter_map(|path| Path::new(path).parent().map(Path::to_path_buf))
+        .collect();
+
+    let mut command = Command::new(&latexmk);
+    command
+        .args([engine.latexmk_flag(), "-interaction=nonstopmode", "-halt-on-error", "-file-line-error"])
+        .arg(format!("{stem}.tex"))
+        .current_dir(&out_dir)
+        .env("PATH", path_with_prefix(&tool_dirs)?);
+    if let Some(folder) = document.and_then(Path::parent) {
+        command.env("TEXINPUTS", texinputs_for(folder)?);
+    }
+    let output = run_with_timeout(command, COMPILE_TIMEOUT)?;
+
+    let pdf = out_dir.join(format!("{stem}.pdf"));
+    let tex_log = fs::read(out_dir.join(format!("{stem}.log")))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    let ok = output.success && pdf.is_file();
+    let summary = if ok {
+        "PDF ready".to_string()
+    } else if output.timed_out {
+        format!("Compile stopped after {} s", COMPILE_TIMEOUT.as_secs())
+    } else {
+        first_latex_error(&tex_log)
+            .or_else(|| first_latex_error(&output.stdout))
+            .or_else(|| first_latex_error(&output.stderr))
+            .unwrap_or_else(|| format!("Compile failed (exit code {:?})", output.code))
+    };
+
+    Ok(CompileResult {
+        ok,
+        summary,
+        log: compose_log(&output, &tex_log),
+        pdf_path: ok.then(|| pdf.display().to_string()),
+        engine,
+    })
+}
+
+/// `<folder>;` — the trailing empty entry keeps TeX's default search path.
+fn texinputs_for(folder: &Path) -> Result<std::ffi::OsString, String> {
+    env::join_paths([folder.to_path_buf(), PathBuf::new()])
+        .map_err(|error| format!("failed to build TEXINPUTS: {error}"))
+}
+
+fn compose_log(output: &ProcessOutput, tex_log: &str) -> String {
+    let mut log = String::new();
+    for (title, text) in [("latexmk", output.stdout.as_str()), ("errors", output.stderr.as_str()), ("LaTeX log", tex_log)] {
+        if !text.trim().is_empty() {
+            if !log.is_empty() {
+                log.push_str("\n\n");
+            }
+            log.push_str(&format!("--- {title} ---\n{}", text.trim_end()));
+        }
+    }
+    if log.is_empty() {
+        log.push_str("No output.");
+    }
+    log
+}
+
+/// First error in a LaTeX log: a `file:line: message` line (from -file-line-error)
+/// becomes "Line N: message"; a classic `! message` line is returned as-is.
+fn first_latex_error(log: &str) -> Option<String> {
+    log.lines().find_map(|line| {
+        if let Some(message) = line.strip_prefix("! ") {
+            return Some(message.trim().to_string());
+        }
+        line.match_indices(':').find_map(|(index, _)| {
+            let rest = &line[index + 1..];
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            let message = rest[digits..].strip_prefix(": ")?;
+            (digits > 0 && !message.trim().is_empty())
+                .then(|| format!("Line {}: {}", &rest[..digits], message.trim()))
+        })
+    })
+}
+
+fn build_root() -> Result<PathBuf, String> {
+    let base = env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .ok_or_else(|| "LOCALAPPDATA is not set".to_string())?;
+    Ok(base.join("Lexy").join("Build"))
+}
+
+/// One build folder per document, keyed by its (case-insensitive) path, so
+/// aux files never land next to the user's document.
+fn build_key(source: &Path) -> String {
+    let key = source.display().to_string().to_lowercase();
+    format!("{:x}", Sha256::digest(key.as_bytes()))[..16].to_string()
+}
+
+fn path_with_prefix(dirs: &[PathBuf]) -> Result<std::ffi::OsString, String> {
+    let existing = env::var_os("PATH").unwrap_or_default();
+    env::join_paths(dirs.iter().cloned().chain(env::split_paths(&existing)))
+        .map_err(|error| format!("failed to build PATH: {error}"))
+}
+
+/// Serve PDFs only from Lexy's own build folder.
+fn validate_pdf_path(path: &str, root: &Path) -> Result<PathBuf, String> {
+    let canonical = fs::canonicalize(path).map_err(|error| format!("failed to open {path}: {error}"))?;
+    let root = fs::canonicalize(root).map_err(|error| format!("build folder is missing: {error}"))?;
+    let is_pdf = canonical
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"));
+    if !is_pdf || !canonical.starts_with(&root) {
+        return Err(format!("{path} is not a Lexy build output"));
+    }
+    Ok(canonical)
+}
+
+#[tauri::command]
+fn read_pdf(path: String) -> Result<Response, String> {
+    let path = validate_pdf_path(&path, &build_root()?)?;
+    let bytes = fs::read(&path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    Ok(Response::new(bytes))
+}
+
+/// Copy a compiled PDF from the build folder to `<document folder>\<stem>.pdf`.
+#[tauri::command]
+fn export_pdf(pdf_path: String, document_path: String) -> Result<String, String> {
+    export_pdf_to(&build_root()?, &pdf_path, &document_path)
+}
+
+fn export_pdf_to(build_root: &Path, pdf_path: &str, document_path: &str) -> Result<String, String> {
+    let pdf = validate_pdf_path(pdf_path, build_root)?;
+    let target = validate_tex_path(document_path)?.with_extension("pdf");
+    let bytes = fs::read(&pdf).map_err(|error| format!("failed to read {}: {error}", pdf.display()))?;
+    write_atomic(&target, &bytes).map_err(|error| format!("{error} (is the PDF open in another program?)"))?;
+    Ok(target.display().to_string())
+}
+
+/// Where a Save/Save as really goes: a file chosen directly in `Documents\Lexy`
+/// gets its own project folder (`Documents\Lexy\Name\Name.tex`). The folder is created.
+#[tauri::command]
+fn prepare_save_path(app: AppHandle, path: String) -> Result<String, String> {
+    let chosen = validate_tex_path(&path)?;
+    let target = match app.path().document_dir() {
+        Ok(documents) => project_location(&chosen, &documents.join("Lexy")),
+        Err(_) => chosen,
+    };
+    if let Some(folder) = target.parent() {
+        fs::create_dir_all(folder).map_err(|error| format!("failed to create {}: {error}", folder.display()))?;
+    }
+    Ok(target.display().to_string())
+}
+
+fn same_folder(a: &Path, b: &Path) -> bool {
+    let normalize = |path: &Path| path.display().to_string().trim_end_matches(['\\', '/']).to_lowercase();
+    normalize(a) == normalize(b)
+}
+
+/// `Lexy\Name.tex` → `Lexy\Name\Name.tex`, or `Lexy\Name (2)\Name (2).tex` when that
+/// project already exists, so an existing project is never overwritten.
+/// Files chosen anywhere else are left exactly where the user put them.
+fn project_location(chosen: &Path, lexy_root: &Path) -> PathBuf {
+    if !chosen.parent().is_some_and(|parent| same_folder(parent, lexy_root)) {
+        return chosen.to_path_buf();
+    }
+    let stem = chosen.file_stem().and_then(OsStr::to_str).unwrap_or("Untitled");
+    for number in 1..1000 {
+        let name = if number == 1 { stem.to_string() } else { format!("{stem} ({number})") };
+        let candidate = lexy_root.join(&name).join(format!("{name}.tex"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    chosen.to_path_buf()
+}
+
+// ---------------------------------------------------------------------------
+// Default folder and fonts
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DefaultFolder {
+    path: String,
+    fallback: bool,
+}
+
+/// `<Documents>\Lexy`, created on demand; the home folder when Documents is unusable.
+fn lexy_folder<E: std::fmt::Display>(documents: Result<PathBuf, E>, home: Option<PathBuf>) -> Result<DefaultFolder, String> {
+    if let Ok(documents) = documents {
+        let folder = documents.join("Lexy");
+        if fs::create_dir_all(&folder).is_ok() {
+            return Ok(DefaultFolder { path: folder.display().to_string(), fallback: false });
+        }
+    }
+    let home = home.ok_or("could not find your Documents or home folder")?;
+    Ok(DefaultFolder { path: home.display().to_string(), fallback: true })
+}
+
+#[tauri::command]
+async fn default_document_folder(app: AppHandle) -> Result<DefaultFolder, String> {
+    // document_dir() is FOLDERID_Documents on Windows, so OneDrive redirection is honoured.
+    let documents = app.path().document_dir();
+    let home = app.path().home_dir().ok();
+    tauri::async_runtime::spawn_blocking(move || lexy_folder(documents, home))
+        .await
+        .map_err(|error| format!("folder lookup failed: {error}"))?
+}
+
+/// Font names end up inside `\setmainfont{…}`; only allow characters that can't break out.
+fn is_valid_family(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || " _.'&+-".contains(c))
+}
+
+fn filter_families<I: IntoIterator<Item = String>>(names: I) -> Vec<String> {
+    let mut families: Vec<String> = names
+        .into_iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| is_valid_family(name))
+        .collect();
+    families.sort_by_key(|name| name.to_lowercase());
+    families.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    families
+}
+
+/// Installed font families, read once per process.
+struct FontCache(Arc<OnceLock<Vec<String>>>);
+
+#[tauri::command]
+async fn list_system_fonts(cache: State<'_, FontCache>) -> Result<Vec<String>, String> {
+    let cache = Arc::clone(&cache.0);
+    tauri::async_runtime::spawn_blocking(move || {
+        cache
+            .get_or_init(|| {
+                let mut database = fontdb::Database::new();
+                database.load_system_fonts();
+                filter_families(database.faces().flat_map(|face| face.families.iter().map(|(name, _)| name.clone())))
+            })
+            .clone()
+    })
+    .await
+    .map_err(|error| format!("font lookup failed: {error}"))
+}
+
+// ---------------------------------------------------------------------------
+// Processes
+// ---------------------------------------------------------------------------
+
+/// No console window flashes up when Lexy runs a tool (docs/PLAN.md principle 3).
+fn hide_console(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+struct ProcessOutput {
+    success: bool,
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+}
+
+fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<ProcessOutput, String> {
+    let mut child = hide_console(&mut command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to start {:?}: {error}", command.get_program()))?;
+    // Drain both pipes concurrently so a chatty process can't deadlock on a full buffer.
+    let stdout = child.stdout.take().map(read_to_end_in_background);
+    let stderr = child.stderr.take().map(read_to_end_in_background);
+
+    let deadline = Instant::now() + timeout;
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait().map_err(|error| format!("failed to wait for process: {error}"))? {
+            break (Some(status), false);
+        }
+        if Instant::now() >= deadline {
+            kill_tree(&mut child);
+            break (child.wait().ok(), true);
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    let collect = |handle: Option<JoinHandle<Vec<u8>>>| {
+        handle
+            .and_then(|handle| handle.join().ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default()
+    };
+    Ok(ProcessOutput {
+        success: !timed_out && status.is_some_and(|status| status.success()),
+        code: status.and_then(|status| status.code()),
+        stdout: collect(stdout),
+        stderr: collect(stderr),
+        timed_out,
+    })
+}
+
+fn read_to_end_in_background<R: Read + Send + 'static>(mut reader: R) -> JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = reader.read_to_end(&mut buffer);
+        buffer
+    })
+}
+
+/// latexmk spawns pdflatex; killing only latexmk would leave the child holding our pipes.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let mut taskkill = Command::new("taskkill");
+        let _ = hide_console(&mut taskkill)
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .manage(CompileLock(Arc::new(Mutex::new(()))))
+        .manage(FontCache(Arc::new(OnceLock::new())))
+        .manage(SetupGuard(Arc::new(AtomicBool::new(false))))
         .invoke_handler(tauri::generate_handler![
             check_environment,
-            start_initial_setup
+            start_initial_setup,
+            read_setup_log,
+            read_document,
+            write_document,
+            compile_source,
+            read_pdf,
+            default_document_folder,
+            list_system_fonts,
+            export_pdf,
+            prepare_save_path
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fresh, empty directory under the OS temp dir, removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let dir = env::temp_dir().join(format!("lexy-test-{}-{label}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // Any 64-hex value that is not the hash of "lexy".
+    const WRONG_SHA256: &str = "3c1a2ac8c4b2bf9c0dcd1f28a3e4e0e4bd5ad7e2d4b3a0c9c1c0b9a3b2f6e1d0";
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn first_output_line_skips_blank_lines_and_trims() {
+        assert_eq!(
+            first_output_line(b"\n  \r\n  MiKTeX 24.1  \nsecond"),
+            Some("MiKTeX 24.1".to_string())
+        );
+    }
+
+    #[test]
+    fn version_line_skips_latexmk_code_page_notices() {
+        let latexmk = b"Initial Win CP for (console input, console output, system): (CP65001, CP65001, CP1252)\nI changed them all to CP1252\nLatexmk, John Collins, 9 March 2026. Version 4.88\n";
+        assert_eq!(version_line(latexmk).as_deref(), Some("Latexmk, John Collins, 9 March 2026. Version 4.88"));
+        assert_eq!(version_line(b"\nThis is perl 5, version 42, subversion 2").as_deref(), Some("This is perl 5, version 42, subversion 2"));
+        assert_eq!(version_line(b"One MiKTeX Utility 1.12 (MiKTeX 26.5)\nmore").as_deref(), Some("One MiKTeX Utility 1.12 (MiKTeX 26.5)"));
+    }
+
+    #[test]
+    fn first_output_line_is_none_for_blank_output() {
+        assert_eq!(first_output_line(b""), None);
+        assert_eq!(first_output_line(b" \n\t\n"), None);
+    }
+
+    #[test]
+    fn first_output_line_tolerates_invalid_utf8() {
+        let line = first_output_line(&[0xff, b'o', b'k']).expect("a line");
+        assert!(line.ends_with("ok"));
+    }
+
+    #[test]
+    fn format_bytes_below_one_mib_uses_bytes() {
+        assert_eq!(format_bytes(0), "0 bytes");
+        assert_eq!(format_bytes(1024 * 1024 - 1), "1048575 bytes");
+    }
+
+    #[test]
+    fn format_bytes_at_and_above_one_mib_uses_mib() {
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_bytes(1536 * 1024), "1.5 MiB");
+        assert_eq!(format_bytes(250 * 1024 * 1024), "250.0 MiB");
+    }
+
+    #[test]
+    fn verify_sha256_skips_when_no_hash_configured() {
+        assert!(verify_sha256(Path::new("does-not-exist"), None).is_ok());
+    }
+
+    #[test]
+    fn verify_sha256_accepts_matching_hash_case_insensitively() {
+        let dir = TempDir::new("sha-ok");
+        let file = dir.0.join("a.bin");
+        fs::write(&file, b"lexy").unwrap();
+        let expected = sha256_hex(b"lexy");
+        assert!(verify_sha256(&file, Some(&expected)).is_ok());
+        assert!(verify_sha256(&file, Some(&expected.to_uppercase())).is_ok());
+    }
+
+    #[test]
+    fn verify_sha256_rejects_mismatch_with_both_hashes_in_message() {
+        let dir = TempDir::new("sha-bad");
+        let file = dir.0.join("a.bin");
+        fs::write(&file, b"lexy").unwrap();
+        let error = verify_sha256(&file, Some(WRONG_SHA256)).unwrap_err();
+        assert!(error.contains("checksum mismatch"));
+        assert!(error.contains(WRONG_SHA256));
+        assert!(error.contains(&sha256_hex(b"lexy")));
+    }
+
+    #[test]
+    fn verify_sha256_hashes_files_larger_than_one_buffer() {
+        let dir = TempDir::new("sha-big");
+        let file = dir.0.join("big.bin");
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&file, &data).unwrap();
+        assert!(verify_sha256(&file, Some(&sha256_hex(&data))).is_ok());
+    }
+
+    #[test]
+    fn verify_sha256_reports_missing_file() {
+        let error = verify_sha256(Path::new("definitely-missing.bin"), Some("00")).unwrap_err();
+        assert!(error.contains("failed to open"));
+    }
+
+    #[test]
+    fn find_file_named_finds_nested_file() {
+        let dir = TempDir::new("find-nested");
+        let nested = dir.0.join("a").join("b");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("miktexsetup_standalone.exe"), b"").unwrap();
+        assert_eq!(
+            find_file_named(&dir.0, "miktexsetup_standalone.exe"),
+            Some(nested.join("miktexsetup_standalone.exe"))
+        );
+    }
+
+    #[test]
+    fn find_file_named_returns_none_when_absent_or_root_missing() {
+        let dir = TempDir::new("find-none");
+        fs::write(dir.0.join("other.exe"), b"").unwrap();
+        assert_eq!(find_file_named(&dir.0, "miktexsetup_standalone.exe"), None);
+        assert_eq!(find_file_named(&dir.0.join("missing"), "x"), None);
+    }
+
+    #[test]
+    fn setup_root_is_under_localappdata() {
+        if env::var_os("LOCALAPPDATA").is_none() {
+            assert!(setup_root().is_err());
+            return;
+        }
+        let root = setup_root().unwrap();
+        assert!(root.ends_with(Path::new("Lexy").join("Setup")));
+    }
+
+    #[test]
+    fn miktex_candidates_prefer_app_managed_install() {
+        let candidates = miktex_candidates("latexmk");
+        if let Ok(root) = setup_root() {
+            assert_eq!(candidates[0], root.join(r"MiKTeX\miktex\bin\x64\latexmk.exe"));
+        }
+        assert!(candidates.iter().all(|path| path.ends_with("latexmk.exe")));
+    }
+
+    #[test]
+    fn perl_candidates_prefer_lexys_portable_perl() {
+        let candidates = perl_candidates();
+        if let Ok(root) = setup_root() {
+            assert_eq!(candidates[0], root.join(setup::PERL_DIR).join(r"perl\bin\perl.exe"));
+        }
+        assert!(candidates.contains(&PathBuf::from(r"C:\Strawberry\perl\bin\perl.exe")));
+    }
+
+    #[test]
+    fn probe_tool_reports_missing_tool() {
+        let probe = probe_tool(
+            "Ghost",
+            "lexy-no-such-command-9f3b",
+            &["--version"],
+            &[PathBuf::from(r"Z:\nowhere\ghost.exe")],
+            &[],
+        );
+        assert!(!probe.installed);
+        assert_eq!(probe.path, None);
+        assert_eq!(probe.message, "Ghost was not found.");
+    }
+
+    #[cfg(windows)]
+    fn cmd_exe() -> PathBuf {
+        find_on_path("cmd").expect("cmd.exe on PATH")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn find_on_path_appends_exe_on_windows() {
+        assert!(cmd_exe().to_string_lossy().to_lowercase().ends_with("cmd.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn probe_tool_reads_version_from_first_output_line() {
+        let probe = probe_tool("Echo", "unused", &["/C", "echo Echo 1.2.3"], &[cmd_exe()], &[]);
+        assert!(probe.installed);
+        assert_eq!(probe.version.as_deref(), Some("Echo 1.2.3"));
+        assert!(probe.path.is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn probe_tool_flags_nonzero_exit_as_not_installed() {
+        let probe = probe_tool("Broken", "unused", &["/C", "exit 3"], &[cmd_exe()], &[]);
+        assert!(!probe.installed);
+        assert!(probe.message.contains("exited with code Some(3)"), "{}", probe.message);
+        assert!(probe.path.is_some(), "the file exists, so setup must not try to reinstall it");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn probe_tool_explains_why_an_installed_tool_could_not_run() {
+        let probe = probe_tool("latexmk", "unused", &["/C", "echo perl was not found 1>&2 & exit 1"], &[cmd_exe()], &[]);
+        assert!(!probe.installed);
+        assert_eq!(probe.message, "latexmk is installed but could not run: perl was not found");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn probe_tool_puts_the_given_folders_first_on_path() {
+        // This is how latexmk.exe finds Lexy's portable Perl, which is never on the user's PATH.
+        let folder = PathBuf::from(r"C:\lexy-test-perl\bin");
+        let probe = probe_tool("Echo", "unused", &["/C", "echo %PATH%"], &[cmd_exe()], std::slice::from_ref(&folder));
+        assert!(probe.version.unwrap().starts_with(r"C:\lexy-test-perl\bin;"));
+    }
+
+    #[test]
+    fn environment_status_serializes_in_the_shape_the_frontend_expects() {
+        let tool = |name| ToolProbe {
+            name,
+            installed: true,
+            version: Some("1".into()),
+            path: None,
+            message: "ok".into(),
+        };
+        let status = EnvironmentStatus {
+            ready: true,
+            miktex: tool("MiKTeX"),
+            perl: tool("Strawberry Perl"),
+            latexmk: tool("latexmk"),
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["ready"], true);
+        for key in ["miktex", "perl", "latexmk"] {
+            let probe = &json[key];
+            for field in ["name", "installed", "version", "path", "message"] {
+                assert!(probe.get(field).is_some(), "{key}.{field} missing");
+            }
+        }
+        assert!(json["miktex"]["path"].is_null());
+    }
+
+    // ----- documents -----
+
+    fn abs(dir: &TempDir, name: &str) -> String {
+        dir.0.join(name).display().to_string()
+    }
+
+    #[test]
+    fn validate_tex_path_accepts_absolute_tex_any_case() {
+        let dir = TempDir::new("validate");
+        assert!(validate_tex_path(&abs(&dir, "a.tex")).is_ok());
+        assert!(validate_tex_path(&abs(&dir, "A.TEX")).is_ok());
+    }
+
+    #[test]
+    fn validate_tex_path_rejects_relative_and_other_extensions() {
+        let dir = TempDir::new("validate-bad");
+        assert!(validate_tex_path("main.tex").unwrap_err().contains("absolute"));
+        assert!(validate_tex_path(&abs(&dir, "notes.txt")).unwrap_err().contains("not a .tex file"));
+        assert!(validate_tex_path(&abs(&dir, "noext")).is_err());
+        assert!(validate_tex_path(&abs(&dir, "main.tex.exe")).is_err());
+    }
+
+    #[test]
+    fn write_then_read_document_round_trips_exact_text() {
+        let dir = TempDir::new("roundtrip");
+        let path = abs(&dir, "main.tex");
+        let text = "\\section{Ünïcødé}\r\nline two\n\n% trailing\n";
+        write_document(path.clone(), text.to_string()).unwrap();
+        assert_eq!(read_document(path).unwrap(), text);
+    }
+
+    #[test]
+    fn write_document_replaces_existing_file_and_leaves_no_temp_file() {
+        let dir = TempDir::new("replace");
+        let path = abs(&dir, "main.tex");
+        fs::write(&path, "old content that is longer").unwrap();
+        write_document(path.clone(), "new".into()).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        let leftovers: Vec<_> = fs::read_dir(&dir.0).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from("main.tex")]);
+    }
+
+    #[test]
+    fn write_document_fails_cleanly_when_folder_is_missing() {
+        let dir = TempDir::new("nofolder");
+        let path = dir.0.join("missing").join("main.tex");
+        let error = write_document(path.display().to_string(), "x".into()).unwrap_err();
+        assert!(error.contains("failed to write"), "{error}");
+        assert!(!dir.0.join("missing").exists());
+    }
+
+    #[test]
+    fn write_document_rejects_non_tex_paths_without_touching_disk() {
+        let dir = TempDir::new("write-bad");
+        let path = abs(&dir, "evil.bat");
+        assert!(write_document(path.clone(), "x".into()).is_err());
+        assert!(!Path::new(&path).exists());
+    }
+
+    #[test]
+    fn read_document_reports_missing_file() {
+        let dir = TempDir::new("read-missing");
+        assert!(read_document(abs(&dir, "nope.tex")).unwrap_err().contains("failed to open"));
+    }
+
+    #[test]
+    fn read_document_refuses_files_over_ten_mib() {
+        let dir = TempDir::new("read-big");
+        let path = abs(&dir, "big.tex");
+        File::create(&path).unwrap().set_len(MAX_DOCUMENT_BYTES + 1).unwrap();
+        assert!(read_document(path).unwrap_err().contains("larger than 10 MiB"));
+    }
+
+    #[test]
+    fn read_document_refuses_non_utf8_instead_of_mangling_it() {
+        let dir = TempDir::new("read-latin1");
+        let path = abs(&dir, "latin1.tex");
+        fs::write(&path, [b'c', b'a', b'f', 0xe9]).unwrap();
+        assert!(read_document(path).unwrap_err().contains("failed to read"));
+    }
+
+    // ----- compile helpers -----
+
+    #[test]
+    fn first_latex_error_reads_file_line_error_format() {
+        let log = "This is pdfTeX\n(./main.tex\n./main.tex:3: Undefined control sequence.\nl.3 \\foo\n";
+        assert_eq!(first_latex_error(log).as_deref(), Some("Line 3: Undefined control sequence."));
+    }
+
+    #[test]
+    fn first_latex_error_handles_windows_drive_paths() {
+        let log = "C:/Users/me/doc/main.tex:12: LaTeX Error: File `foo.sty' not found.";
+        assert_eq!(
+            first_latex_error(log).as_deref(),
+            Some("Line 12: LaTeX Error: File `foo.sty' not found.")
+        );
+    }
+
+    #[test]
+    fn first_latex_error_reads_bang_lines() {
+        assert_eq!(first_latex_error("ok\n! Emergency stop.\n").as_deref(), Some("Emergency stop."));
+    }
+
+    #[test]
+    fn first_latex_error_returns_first_of_several() {
+        let log = "./a.tex:1: First problem.\n./a.tex:9: Second problem.\n! Later.";
+        assert_eq!(first_latex_error(log).as_deref(), Some("Line 1: First problem."));
+    }
+
+    #[test]
+    fn first_latex_error_ignores_clock_times_and_warnings() {
+        let log = "Started 16:24\nPackage hyperref Warning: Token not allowed on input line 12.\n";
+        assert_eq!(first_latex_error(log), None);
+    }
+
+    #[test]
+    fn compose_log_labels_sections_and_skips_empty_ones() {
+        let output = ProcessOutput {
+            success: false,
+            code: Some(12),
+            stdout: "Rc files read\n".into(),
+            stderr: "  \n".into(),
+            timed_out: false,
+        };
+        let log = compose_log(&output, "! Undefined control sequence.");
+        assert_eq!(log, "--- latexmk ---\nRc files read\n\n--- LaTeX log ---\n! Undefined control sequence.");
+    }
+
+    #[test]
+    fn compose_log_says_no_output_when_everything_is_empty() {
+        let output = ProcessOutput { success: true, code: Some(0), stdout: String::new(), stderr: String::new(), timed_out: false };
+        assert_eq!(compose_log(&output, ""), "No output.");
+    }
+
+    #[test]
+    fn build_key_is_stable_case_insensitive_and_per_document() {
+        let a = build_key(Path::new(r"C:\Docs\Thesis.tex"));
+        assert_eq!(a, build_key(Path::new(r"c:\docs\thesis.tex")));
+        assert_ne!(a, build_key(Path::new(r"C:\Docs\Other.tex")));
+        assert_eq!(a.len(), 16);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn path_with_prefix_puts_tool_dirs_first() {
+        let dirs = vec![PathBuf::from(r"C:\Lexy\miktex"), PathBuf::from(r"C:\Strawberry\perl\bin")];
+        let joined = path_with_prefix(&dirs).unwrap();
+        let parts: Vec<PathBuf> = env::split_paths(&joined).collect();
+        assert_eq!(&parts[..2], dirs.as_slice());
+    }
+
+    #[test]
+    fn project_location_puts_a_document_saved_in_lexy_into_its_own_folder() {
+        let root = TempDir::new("projects");
+        let chosen = root.0.join("My Paper.tex");
+        assert_eq!(project_location(&chosen, &root.0), root.0.join("My Paper").join("My Paper.tex"));
+        // Case and a trailing separator on the root don't matter on Windows.
+        let shouted = PathBuf::from(root.0.display().to_string().to_uppercase() + "\\");
+        assert_eq!(project_location(&chosen, &shouted), shouted.join("My Paper").join("My Paper.tex"));
+    }
+
+    #[test]
+    fn project_location_never_overwrites_an_existing_project() {
+        let root = TempDir::new("projects-taken");
+        fs::create_dir_all(root.0.join("Thesis")).unwrap();
+        fs::write(root.0.join("Thesis").join("Thesis.tex"), "mine").unwrap();
+        fs::create_dir_all(root.0.join("Thesis (2)")).unwrap();
+        fs::write(root.0.join("Thesis (2)").join("Thesis (2).tex"), "also mine").unwrap();
+        assert_eq!(
+            project_location(&root.0.join("Thesis.tex"), &root.0),
+            root.0.join("Thesis (3)").join("Thesis (3).tex")
+        );
+    }
+
+    #[test]
+    fn project_location_reuses_an_empty_project_folder() {
+        let root = TempDir::new("projects-empty");
+        fs::create_dir_all(root.0.join("Notes")).unwrap();
+        assert_eq!(project_location(&root.0.join("Notes.tex"), &root.0), root.0.join("Notes").join("Notes.tex"));
+    }
+
+    #[test]
+    fn project_location_respects_files_saved_anywhere_else() {
+        let root = TempDir::new("projects-other");
+        let elsewhere = root.0.join("Thesis").join("chapter.tex");
+        assert_eq!(project_location(&elsewhere, &root.0), elsewhere);
+        let desktop = PathBuf::from(r"C:\Users\me\Desktop\draft.tex");
+        assert_eq!(project_location(&desktop, &root.0), desktop);
+    }
+
+    #[test]
+    fn export_pdf_copies_the_build_pdf_next_to_the_document() {
+        let build = TempDir::new("export-build");
+        let project = TempDir::new("export-project");
+        let pdf = build.0.join("abc").join("Thesis.pdf");
+        fs::create_dir_all(pdf.parent().unwrap()).unwrap();
+        fs::write(&pdf, b"%PDF-1.5 new").unwrap();
+        let document = project.0.join("Thesis.tex");
+        fs::write(project.0.join("Thesis.pdf"), b"%PDF-1.5 old").unwrap();
+
+        let saved = export_pdf_to(&build.0, &pdf.display().to_string(), &document.display().to_string()).unwrap();
+        assert_eq!(PathBuf::from(&saved), project.0.join("Thesis.pdf"));
+        assert_eq!(fs::read(project.0.join("Thesis.pdf")).unwrap(), b"%PDF-1.5 new");
+        let names: Vec<_> = fs::read_dir(&project.0).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("Thesis.pdf")], "no temp files left behind");
+    }
+
+    #[test]
+    fn export_pdf_only_copies_lexy_build_output_to_tex_documents() {
+        let build = TempDir::new("export-guard");
+        let outside = TempDir::new("export-outside");
+        let stray = outside.0.join("secret.pdf");
+        fs::write(&stray, b"%PDF").unwrap();
+        let document = outside.0.join("doc.tex").display().to_string();
+        assert!(export_pdf_to(&build.0, &stray.display().to_string(), &document).is_err());
+
+        let pdf = build.0.join("x.pdf");
+        fs::write(&pdf, b"%PDF").unwrap();
+        assert!(export_pdf_to(&build.0, &pdf.display().to_string(), &outside.0.join("doc.txt").display().to_string()).is_err());
+        assert!(!outside.0.join("doc.pdf").exists());
+    }
+
+    #[test]
+    fn validate_pdf_path_accepts_pdfs_inside_the_build_root() {
+        let root = TempDir::new("pdf-root");
+        let pdf = root.0.join("abc").join("main.pdf");
+        fs::create_dir_all(pdf.parent().unwrap()).unwrap();
+        fs::write(&pdf, b"%PDF-1.5").unwrap();
+        assert!(validate_pdf_path(&pdf.display().to_string(), &root.0).is_ok());
+    }
+
+    #[test]
+    fn validate_pdf_path_rejects_outside_traversal_and_non_pdf() {
+        let root = TempDir::new("pdf-root2");
+        let outside = TempDir::new("pdf-outside");
+        let stray = outside.0.join("secret.pdf");
+        fs::write(&stray, b"%PDF").unwrap();
+        let log = root.0.join("main.log");
+        fs::write(&log, b"log").unwrap();
+        let sneaky = root.0.join("..").join(outside.0.file_name().unwrap()).join("secret.pdf");
+
+        assert!(validate_pdf_path(&stray.display().to_string(), &root.0).is_err());
+        assert!(validate_pdf_path(&sneaky.display().to_string(), &root.0).is_err());
+        assert!(validate_pdf_path(&log.display().to_string(), &root.0).is_err());
+        assert!(validate_pdf_path(&root.0.join("none.pdf").display().to_string(), &root.0).is_err());
+    }
+
+    #[cfg(windows)]
+    fn cmd(args: &[&str]) -> Command {
+        let mut command = Command::new(cmd_exe());
+        command.args(args);
+        command
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_with_timeout_captures_stdout_stderr_and_exit_code() {
+        let output = run_with_timeout(cmd(&["/C", "echo out & echo err 1>&2 & exit 4"]), Duration::from_secs(20)).unwrap();
+        assert!(!output.success);
+        assert_eq!(output.code, Some(4));
+        assert!(output.stdout.contains("out"));
+        assert!(output.stderr.contains("err"));
+        assert!(!output.timed_out);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_with_timeout_kills_the_whole_process_tree() {
+        let started = Instant::now();
+        // cmd → ping: a parent with a long-running child, like latexmk → pdflatex.
+        let output = run_with_timeout(cmd(&["/C", "ping -n 30 127.0.0.1 >NUL"]), Duration::from_millis(500)).unwrap();
+        assert!(output.timed_out);
+        assert!(!output.success);
+        assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn run_with_timeout_reports_missing_program() {
+        let error = run_with_timeout(Command::new("lexy-no-such-program-9f3b"), Duration::from_secs(1)).err().unwrap();
+        assert!(error.contains("failed to start"), "{error}");
+    }
+
+    // ----- compile_source / snapshots -----
+
+    #[test]
+    fn engine_from_marker_reads_texworks_convention() {
+        assert_eq!(engine_from_marker("% !TEX program = xelatex\n\\documentclass{article}"), Engine::Xelatex);
+        assert_eq!(engine_from_marker("%!TEX TS-program = lualatex"), Engine::Lualatex);
+        assert_eq!(engine_from_marker("  % !tex PROGRAM=XeLaTeX  "), Engine::Xelatex);
+        assert_eq!(engine_from_marker("a\nb\nc\nd\n% !TEX program = xelatex"), Engine::Xelatex);
+    }
+
+    #[test]
+    fn engine_from_marker_defaults_to_pdflatex() {
+        assert_eq!(engine_from_marker("\\documentclass{article}"), Engine::Pdflatex);
+        assert_eq!(engine_from_marker("% !TEX program = context"), Engine::Pdflatex);
+        assert_eq!(engine_from_marker("a\nb\nc\nd\ne\n% !TEX program = xelatex"), Engine::Pdflatex);
+        assert_eq!(engine_from_marker("% !TEX root = main.tex"), Engine::Pdflatex);
+        assert_eq!(engine_from_marker("text % !TEX program = xelatex"), Engine::Pdflatex);
+    }
+
+    #[test]
+    fn engine_flags_match_latexmk() {
+        assert_eq!(Engine::Pdflatex.latexmk_flag(), "-pdf");
+        assert_eq!(Engine::Xelatex.latexmk_flag(), "-xelatex");
+        assert_eq!(Engine::Lualatex.latexmk_flag(), "-lualatex");
+    }
+
+    #[test]
+    fn snapshot_location_is_per_document_or_untitled() {
+        let root = Path::new(r"C:\build");
+        let (dir, stem) = snapshot_location(root, Some(Path::new(r"C:\Docs\Thesis.tex"))).unwrap();
+        assert_eq!(stem, "Thesis");
+        assert_eq!(dir, root.join(build_key(Path::new(r"c:\docs\thesis.tex"))));
+        let (dir, stem) = snapshot_location(root, None).unwrap();
+        assert_eq!((dir, stem.as_str()), (root.join("untitled"), "Untitled"));
+    }
+
+    #[test]
+    fn compile_snapshot_writes_into_build_folder_and_never_touches_the_document() {
+        let root = TempDir::new("snap-root");
+        let docs = TempDir::new("snap-docs");
+        let document = docs.0.join("main.tex");
+        fs::write(&document, "saved on disk").unwrap();
+        let before = fs::metadata(&document).unwrap().modified().unwrap();
+
+        // Runs latexmk if tools exist; either way the snapshot is written first.
+        let _ = compile_snapshot(&root.0, "\\documentclass{article}\\begin{document}x\\end{document}", Some(&document));
+
+        assert_eq!(fs::read_to_string(&document).unwrap(), "saved on disk");
+        assert_eq!(fs::metadata(&document).unwrap().modified().unwrap(), before);
+        let snapshot = root.0.join(build_key(&document)).join("main.tex");
+        assert!(fs::read_to_string(snapshot).unwrap().contains("\\begin{document}x"));
+        assert_eq!(fs::read_dir(&docs.0).unwrap().count(), 1, "nothing new beside the document");
+    }
+
+    #[test]
+    fn compile_snapshot_refuses_huge_sources() {
+        let root = TempDir::new("snap-huge");
+        let huge = "x".repeat(MAX_DOCUMENT_BYTES as usize + 1);
+        assert!(compile_snapshot(&root.0, &huge, None).unwrap_err().contains("larger than 10 MiB"));
+        assert_eq!(fs::read_dir(&root.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn texinputs_keeps_the_default_search_path() {
+        let value = texinputs_for(Path::new(r"C:\Docs")).unwrap();
+        let text = value.to_string_lossy();
+        assert!(text.starts_with(r"C:\Docs"));
+        assert!(text.ends_with(if cfg!(windows) { ';' } else { ':' }));
+    }
+
+    /// Real end-to-end compiles; skipped on machines without MiKTeX + latexmk + Perl.
+    #[test]
+    fn compile_end_to_end_when_tools_are_installed() {
+        if !detect_environment().ready {
+            eprintln!("skipping: LaTeX tools not installed");
+            return;
+        }
+        let root = TempDir::new("e2e-root");
+        let docs = TempDir::new("e2e-docs");
+
+        let good = docs.0.join("good.tex");
+        let result = compile_snapshot(&root.0, "\\documentclass{article}\\begin{document}Hi\\end{document}\n", Some(&good)).unwrap();
+        assert!(result.ok, "{}\n{}", result.summary, result.log);
+        assert_eq!(result.engine, Engine::Pdflatex);
+        assert!(fs::read(result.pdf_path.expect("pdf path")).unwrap().starts_with(b"%PDF"));
+
+        let result = compile_snapshot(&root.0, "\\documentclass{article}\n\\begin{document}\n\\foo\n\\end{document}\n", None).unwrap();
+        assert!(!result.ok);
+        assert_eq!(result.summary, "Line 3: Undefined control sequence.");
+        assert!(result.pdf_path.is_none());
+
+        // \input of a file next to the (saved) document resolves through TEXINPUTS.
+        fs::write(docs.0.join("chapter.tex"), "Included chapter text.\n").unwrap();
+        let main = docs.0.join("main.tex");
+        let result = compile_snapshot(&root.0, "\\documentclass{article}\\begin{document}\\input{chapter}\\end{document}\n", Some(&main)).unwrap();
+        assert!(result.ok, "TEXINPUTS route failed: {}\n{}", result.summary, result.log);
+
+        // System font through XeLaTeX + fontspec.
+        let xe = "% !TEX program = xelatex\n\\documentclass{article}\n\\usepackage{fontspec}\n\\setmainfont{Arial}\n\\begin{document}Arial text\\end{document}\n";
+        let result = compile_snapshot(&root.0, xe, Some(&docs.0.join("xe.tex"))).unwrap();
+        assert_eq!(result.engine, Engine::Xelatex);
+        assert!(result.ok, "XeLaTeX failed: {}\n{}", result.summary, result.log);
+
+        let names: Vec<_> = fs::read_dir(&docs.0).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("chapter.tex")], "aux files must not land next to documents");
+    }
+
+    // ----- default folder -----
+
+    #[test]
+    fn lexy_folder_creates_documents_lexy() {
+        let docs = TempDir::new("folder-docs");
+        let folder = lexy_folder::<String>(Ok(docs.0.clone()), None).unwrap();
+        assert_eq!(folder, DefaultFolder { path: docs.0.join("Lexy").display().to_string(), fallback: false });
+        assert!(docs.0.join("Lexy").is_dir());
+        // Second call with the folder already there is fine.
+        assert!(!lexy_folder::<String>(Ok(docs.0.clone()), None).unwrap().fallback);
+    }
+
+    #[test]
+    fn lexy_folder_falls_back_to_home() {
+        let home = TempDir::new("folder-home");
+        let folder = lexy_folder(Err("no documents"), Some(home.0.clone())).unwrap();
+        assert_eq!(folder, DefaultFolder { path: home.0.display().to_string(), fallback: true });
+    }
+
+    #[test]
+    fn lexy_folder_falls_back_when_documents_is_not_creatable() {
+        let home = TempDir::new("folder-home2");
+        let blocker = TempDir::new("folder-blocker");
+        let file = blocker.0.join("not-a-dir");
+        fs::write(&file, b"").unwrap();
+        let folder = lexy_folder::<String>(Ok(file), Some(home.0.clone())).unwrap();
+        assert!(folder.fallback);
+    }
+
+    #[test]
+    fn lexy_folder_errors_without_documents_or_home() {
+        assert!(lexy_folder(Err("no documents"), None).is_err());
+    }
+
+    // ----- fonts -----
+
+    #[test]
+    fn is_valid_family_blocks_latex_specials() {
+        for ok in ["Arial", "Times New Roman", "Segoe UI", "Noto Sans CJK-JP", "D'Nealian", "AT&T Font", "Font_1.0+"] {
+            assert!(is_valid_family(ok), "{ok}");
+        }
+        for bad in ["", "Evil}\\input{x", "50%", "C#", "Tab\tName", "Ünïcode", &"x".repeat(65)] {
+            assert!(!is_valid_family(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn filter_families_sorts_dedups_and_drops_invalid() {
+        let names = ["Georgia", "arial", "Arial", " Calibri ", "Bad{Name}", "Cambria"].map(String::from);
+        assert_eq!(filter_families(names), vec!["arial", "Calibri", "Cambria", "Georgia"]);
+    }
+
+    #[test]
+    fn system_fonts_load_on_this_machine() {
+        let mut database = fontdb::Database::new();
+        database.load_system_fonts();
+        let families = filter_families(database.faces().flat_map(|f| f.families.iter().map(|(n, _)| n.clone())));
+        if cfg!(windows) {
+            assert!(families.iter().any(|f| f == "Arial"), "expected Arial among {} families", families.len());
+        }
+    }
+
+    #[test]
+    fn default_folder_serializes_camel_case() {
+        let json = serde_json::to_value(DefaultFolder { path: "C:\\x".into(), fallback: true }).unwrap();
+        assert_eq!(json, serde_json::json!({ "path": "C:\\x", "fallback": true }));
+    }
+
+    #[test]
+    fn compile_result_serializes_pdf_path_in_camel_case() {
+        let json = serde_json::to_value(CompileResult {
+            ok: true,
+            summary: "PDF ready".into(),
+            log: String::new(),
+            pdf_path: Some("C:\\x.pdf".into()),
+            engine: Engine::Xelatex,
+        })
+        .unwrap();
+        assert_eq!(json["pdfPath"], "C:\\x.pdf");
+        assert!(json.get("pdf_path").is_none());
+    }
+
 }
