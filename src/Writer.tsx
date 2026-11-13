@@ -1,17 +1,7 @@
 import { lazy, Suspense, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { compileSource, exportPdf, loadPdf, type CompileResult } from "./compile";
-import {
-  chooseOpenPath,
-  chooseSavePath,
-  confirmDiscard,
-  defaultFolder,
-  fileName,
-  prepareSavePath,
-  readDocument,
-  suggestFileName,
-  writeDocument,
-} from "./documents";
+import { exportPdf, loadPdf, type CompileResult } from "./compile";
 import { Editor, type EditorHandle } from "./Editor";
 import { findEquationAt, wrapEquation, type FoundEquation } from "./latex/equations";
 import type { FontChoice } from "./latex/fonts";
@@ -19,9 +9,39 @@ import { footnote, insertBlock, pageBreak, replaceWith, setHeading, toList, wrap
 import { applySettings, conflicts, hasSettingsBlock, parseSettings, type DocumentSettings, type FontSize } from "./latex/settings";
 import { tableLatex, type TableSpec } from "./latex/tables";
 import { createLivePreview, type LivePreview } from "./livePreview";
+import { dirtyFiles, emptyOpenFiles, isDirty, keyOf, openFilesReducer, type OpenFilesEvent } from "./openFiles";
 import { PdfView } from "./PdfView";
+import { chooseProjectFolder, useChoice, useNamePrompt } from "./ProjectDialogs";
+import {
+  absolutePath,
+  baseName,
+  compileProject,
+  createFile,
+  createFolder,
+  createProject,
+  deleteEntry,
+  errorText,
+  importFiles,
+  isProjectError,
+  joinRel,
+  listDir,
+  listProjects,
+  openEntryExternal,
+  parentOf,
+  readFile,
+  renameEntry,
+  sameRel,
+  setMainDocument,
+  writeFile,
+  type Buffer,
+  type Entry,
+  type OpenedProject,
+  type ProjectSummary,
+} from "./projects";
 import { Ribbon, type RibbonActions } from "./Ribbon";
+import { Dialog } from "./ribbon/Dialog";
 import type { EquationResult } from "./ribbon/EquationDialog";
+import { Sidebar } from "./Sidebar";
 import { STARTER_DOCUMENT } from "./starter";
 
 const EquationDialog = lazy(() => import("./ribbon/EquationDialog"));
@@ -84,12 +104,21 @@ export function statusLabel(state: CompileState): string {
 
 export const MIN_SPLIT = 0.2;
 export const MAX_SPLIT = 0.8;
+export const MIN_SIDEBAR = 160;
+export const MAX_SIDEBAR = 400;
 const SPLIT_KEY = "lexy.split";
 const LIVE_KEY = "lexy.livePreview";
+const SIDEBAR_KEY = "lexy.sidebarWidth";
+const FILES_KEY = "lexy.filesOpen";
 
 export function clampSplit(ratio: number): number {
   if (!Number.isFinite(ratio)) return 0.5;
   return Math.min(MAX_SPLIT, Math.max(MIN_SPLIT, ratio));
+}
+
+export function clampSidebar(width: number): number {
+  if (!Number.isFinite(width)) return 220;
+  return Math.round(Math.min(MAX_SIDEBAR, Math.max(MIN_SIDEBAR, width)));
 }
 
 function readStorage(key: string): string | null {
@@ -113,48 +142,84 @@ function loadSplit(): number {
   return saved === null ? 0.5 : clampSplit(Number(saved));
 }
 
+/** Sidebar starts collapsed in narrow windows unless the user chose otherwise (contracts/ui.md). */
+function loadFilesOpen(): boolean {
+  const saved = readStorage(FILES_KEY);
+  if (saved !== null) return saved === "1";
+  return typeof window === "undefined" || window.innerWidth >= 900;
+}
+
 type EquationTarget = { found: FoundEquation | null };
 
-export function Writer() {
-  const [path, setPath] = useState<string | null>(null);
-  const [source, setSource] = useState(STARTER_DOCUMENT);
-  const [savedSource, setSavedSource] = useState(STARTER_DOCUMENT);
+type Props = {
+  project: OpenedProject;
+  /** Leave this project: open another folder, or `null` for Project Home. Unsaved work is handled first. */
+  onSwitch: (target: string | null) => void;
+};
+
+export function Writer({ project, onSwitch }: Props) {
+  const readOnly = project.readOnly;
+  const [files, dispatchFiles] = useReducer(openFilesReducer, { ...emptyOpenFiles, main: project.mainDocument });
   const [state, dispatch] = useReducer(compileReducer, initialState);
   const [logsOpen, setLogsOpen] = useState(false);
   const [pdfBytes, setPdfBytes] = useState<Uint8Array | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+  const [missing, setMissing] = useState(false);
   const [split, setSplit] = useState(loadSplit);
-  const [liveEnabled, setLiveEnabled] = useState(() => readStorage(LIVE_KEY) !== "0");
+  const [sidebarWidth, setSidebarWidth] = useState(() => clampSidebar(Number(readStorage(SIDEBAR_KEY) ?? 220)));
+  const [filesOpen, setFilesOpen] = useState(loadFilesOpen);
+  const [liveEnabled, setLiveEnabled] = useState(() => readStorage(LIVE_KEY) !== "0" && !readOnly);
   const [equation, setEquation] = useState<EquationTarget | null>(null);
+  const [treeVersion, setTreeVersion] = useState(0);
+  const [recent, setRecent] = useState<ProjectSummary[]>([]);
+  const [mainChooser, setMainChooser] = useState<string[] | null>(null);
   const panes = useRef<HTMLDivElement>(null);
-  const dragging = useRef(false);
+  const dragging = useRef<"split" | "sidebar" | null>(null);
   const editor = useRef<EditorHandle>(null);
   const live = useRef<LivePreview | null>(null);
   const conflictWarned = useRef(false);
-  const folderWarned = useRef(false);
+  const { ask, dialog: choiceDialog } = useChoice();
+  const { prompt, dialog: nameDialog } = useNamePrompt();
 
-  const unsaved = source !== savedSource;
-  const unsavedRef = useRef(unsaved);
-  unsavedRef.current = unsaved;
-  const pathRef = useRef(path);
-  pathRef.current = path;
-  const savedRef = useRef(savedSource);
-  savedRef.current = savedSource;
-  /** The PDF in the build folder ("in memory") and exactly which text/document produced it. */
-  const lastPdf = useRef<{ pdfPath: string; text: string; documentPath: string | null } | null>(null);
+  const filesRef = useRef(files);
+  filesRef.current = files;
+  /** Dispatch and update the ref at once, so code later in the same handler (save, then compile) sees the change. */
+  function applyFiles(event: OpenFilesEvent) {
+    filesRef.current = openFilesReducer(filesRef.current, event);
+    dispatchFiles(event);
+  }
+  /** Bumped on every save or outside change, so the exit export knows if the last PDF still matches disk. */
+  const diskVersion = useRef(0);
+  /** The PDF in the build folder and whether it was compiled from exactly what is on disk. */
+  const lastPdf = useRef<{ pdfPath: string; clean: boolean; diskVersion: number } | null>(null);
   const exportWarned = useRef(false);
+  const editSeq = useRef(0);
 
-  const settings = useMemo(() => parseSettings(source), [source]);
-  const settingsManaged = useMemo(() => hasSettingsBlock(source), [source]);
+  const current = files.current;
+  const currentFile = current !== null ? files.files.get(current) : undefined;
+  const main = files.main;
+  const mainText = main !== null ? (files.files.get(keyOf(files, main) ?? main)?.text ?? null) : null;
+  const dirty = useMemo(() => dirtyFiles(files), [files]);
+  const dirtySet = useMemo(() => new Set(dirty.map((path) => path.toLowerCase())), [dirty]);
 
-  async function showResult(result: CompileResult, origin: Origin, text: string, documentPath: string | null) {
+  const settings = useMemo(() => parseSettings(mainText ?? ""), [mainText]);
+  const settingsManaged = useMemo(() => hasSettingsBlock(mainText ?? ""), [mainText]);
+
+  /** Unsaved open files, sent with every compile (never written to disk). */
+  function buffers(): Buffer[] {
+    const state = filesRef.current;
+    return dirtyFiles(state).map((path) => ({ path, text: state.files.get(path)!.text }));
+  }
+
+  async function showResult(result: CompileResult, origin: Origin, clean: boolean, version: number) {
     let final = result;
     if (result.ok && result.pdfPath) {
       try {
         setPdfBytes(await loadPdf(result.pdfPath));
-        lastPdf.current = { pdfPath: result.pdfPath, text, documentPath };
+        lastPdf.current = { pdfPath: result.pdfPath, clean, diskVersion: version };
       } catch (error) {
-        const message = String(error);
+        const message = errorText(error);
         final = { ...result, ok: false, summary: message, log: message, pdfPath: null };
       }
     }
@@ -162,138 +227,416 @@ export function Writer() {
     if (origin === "explicit" && !final.ok) setLogsOpen(true);
   }
 
+  function failure(error: unknown): CompileResult {
+    const text = errorText(error);
+    return { ok: false, summary: text, log: text, pdfPath: null, engine: "pdflatex" };
+  }
+
+  /** Compile the main document with the unsaved buffers; a missing main asks for a new one. */
+  async function compileNow(origin: Origin): Promise<CompileResult> {
+    const target = filesRef.current.main;
+    if (target === null) {
+      // Only an explicit compile asks; live preview must not pop up dialogs while typing.
+      if (origin === "explicit") void chooseMain();
+      return failure("Choose a main document first.");
+    }
+    const sent = buffers();
+    const version = diskVersion.current;
+    dispatch({ type: "start", origin });
+    let result: CompileResult;
+    try {
+      result = await compileProject(target, sent);
+    } catch (error) {
+      if (isProjectError(error, "notFound")) void chooseMain(`${target} is missing. Choose the main document.`);
+      result = failure(error);
+    }
+    await showResult(result, origin, sent.length === 0, version);
+    return result;
+  }
+  const compileRef = useRef(compileNow);
+  compileRef.current = compileNow;
+
   /**
-   * On exit, write the PDF next to the saved .tex. It must match what is saved on disk,
-   * so if the last preview was of other (unsaved or discarded) text, compile the saved text first.
+   * On exit, write the PDF beside the main document. It must match what is saved on disk,
+   * so if the last PDF came from unsaved text or older files, compile the saved files first.
    */
   async function exportPdfOnExit() {
-    const documentPath = pathRef.current;
-    if (!documentPath) return; // Untitled: there is no project folder to put it in.
-    const saved = savedRef.current;
+    const target = filesRef.current.main;
+    if (target === null || readOnly) return;
     let pdf = lastPdf.current;
-    if (!pdf || pdf.text !== saved || pdf.documentPath !== documentPath) {
-      const result = await compileSource(saved, documentPath);
+    if (!pdf || !pdf.clean || pdf.diskVersion !== diskVersion.current) {
+      const result = await compileProject(target, []);
       if (!result.ok || !result.pdfPath) throw new Error(`the saved document doesn't compile (${result.summary})`);
-      pdf = { pdfPath: result.pdfPath, text: saved, documentPath };
+      pdf = { pdfPath: result.pdfPath, clean: true, diskVersion: diskVersion.current };
     }
-    await exportPdf(pdf.pdfPath, documentPath);
+    await exportPdf(pdf.pdfPath, absolutePath(project.root, target));
   }
-  const exportRef = useRef(exportPdfOnExit);
-  exportRef.current = exportPdfOnExit;
 
-  // Live preview: compile a snapshot of the editor text ~1 s after typing stops (research R5).
+  // Live preview: compile ~1 s after typing stops in any file (research R5 of spec 001).
   useEffect(() => {
-    let compiledFor: string | null = null;
     const scheduler = createLivePreview({
-      compile: (text) => {
-        dispatch({ type: "start", origin: "live" });
-        compiledFor = pathRef.current;
-        return compileSource(text, compiledFor);
-      },
-      onResult: (result, text) => void showResult(result, "live", text, compiledFor),
+      compile: () => compileRef.current("live"),
+      // Results are shown inside compileNow.
+      onResult: () => undefined,
     });
     scheduler.setEnabled(liveEnabled);
     live.current = scheduler;
-    if (liveEnabled) scheduler.now(source);
     return () => scheduler.dispose();
-    // Created once; text and toggles are pushed into it below.
+    // Created once; edits and toggles are pushed into it below.
   }, []);
 
   useEffect(() => {
     live.current?.setEnabled(liveEnabled);
-    writeStorage(LIVE_KEY, liveEnabled ? "1" : "0");
+    if (!readOnly) writeStorage(LIVE_KEY, liveEnabled ? "1" : "0");
   }, [liveEnabled]);
 
-  function loadDocument(nextPath: string | null, text: string) {
-    setPath(nextPath);
-    pathRef.current = nextPath;
-    setSource(text);
-    setSavedSource(text);
-    dispatch({ type: "reset" });
-    setPdfBytes(null);
-    setNotice(null);
-    conflictWarned.current = false;
-    if (liveEnabled) live.current?.now(text);
-  }
+  // Open the main document (or ask which one it is).
+  useEffect(() => {
+    if (project.mainDocument) void openFile(project.mainDocument, { first: true });
+    else if (project.candidates.length) setMainChooser(project.candidates);
+    else setNotice("No main document found. Pick a .tex file in the sidebar and choose Set as main document.");
+    void listProjects().then(setRecent, () => undefined);
+  }, []);
 
-  /** `<Documents>\Lexy`, with a one-time notice if Lexy had to fall back to the home folder. */
-  async function startFolder(): Promise<string | null> {
+  /** Show a text file; loads it from disk the first time. */
+  async function openFile(path: string, { first = false } = {}) {
+    const state = filesRef.current;
+    const key = keyOf(state, path);
+    if (key !== undefined) {
+      editor.current?.switchTo(key, state.files.get(key)!.text);
+      applyFiles({ type: "switched", path: key });
+      return;
+    }
     try {
-      const folder = await defaultFolder();
-      if (folder.fallback && !folderWarned.current) {
-        folderWarned.current = true;
-        setNotice(`Saving to ${folder.path} because Documents isn't available.`);
-      }
-      return folder.path;
-    } catch {
-      return null;
+      const text = await readFile(path);
+      editor.current?.switchTo(path, text);
+      applyFiles({ type: "opened", path, text });
+      if (first && liveEnabled) live.current?.now(String(++editSeq.current));
+    } catch (error) {
+      setNotice(`Could not open ${baseName(path)}. ${errorText(error)}`);
     }
   }
 
-  async function newDocument() {
-    if (unsavedRef.current && !(await confirmDiscard())) return;
-    loadDocument(null, STARTER_DOCUMENT);
+  function onEntryOpen(entry: Entry) {
+    if (entry.editable) void openFile(entry.path);
+    else openEntryExternal(entry.path).catch((error) => setNotice(`Could not open ${entry.name}. ${errorText(error)}`));
   }
 
-  async function openDocument() {
-    if (unsavedRef.current && !(await confirmDiscard())) return;
+  async function chooseMain(message?: string) {
     try {
-      const picked = await chooseOpenPath(await startFolder());
-      if (!picked) return;
-      loadDocument(picked, await readDocument(picked));
+      const entries = await listDir("");
+      const candidates = entries.filter((entry) => entry.kind === "file" && /\.tex$/i.test(entry.name)).map((entry) => entry.path);
+      if (!candidates.length) {
+        setNotice(message ?? "No main document found. Pick a .tex file in the sidebar and choose Set as main document.");
+        return;
+      }
+      setMainChooser(candidates);
     } catch (error) {
-      setNotice(`Could not open the file. ${error}`);
+      setNotice(errorText(error));
     }
   }
 
-  /** Returns the saved path and text, or null if the user cancelled or saving failed. */
-  async function saveDocument(saveAs = false): Promise<{ path: string; text: string } | null> {
+  async function setMain(path: string) {
+    setMainChooser(null);
     try {
-      const text = editor.current?.getText() ?? source;
-      let target = path;
-      if (saveAs || !path) {
-        const picked = await chooseSavePath(path, path ? null : await startFolder(), suggestFileName(text));
-        if (!picked) return null;
-        // A file chosen directly in Documents\Lexy gets its own project folder.
-        target = await prepareSavePath(picked);
-      }
-      if (!target) return null;
-      await writeDocument(target, text);
-      setPath(target);
-      pathRef.current = target;
-      setSavedSource(text);
-      setNotice((current) => (current?.startsWith("Could not save") ? null : current));
-      return { path: target, text };
+      await setMainDocument(path);
+      applyFiles({ type: "mainSet", path });
+      setNotice(null);
+      await openFile(path);
+      if (liveEnabled) live.current?.now(String(++editSeq.current));
     } catch (error) {
-      setNotice(`Could not save the file. ${error}`);
-      return null;
+      setNotice(`Could not set the main document. ${errorText(error)}`);
+    }
+  }
+
+  /** Save every modified file. Returns false if any save failed. */
+  async function saveAll(): Promise<boolean> {
+    if (readOnly) return false;
+    const state = filesRef.current;
+    let ok = true;
+    for (const path of dirtyFiles(state)) {
+      const text = state.files.get(path)!.text;
+      try {
+        await writeFile(path, text);
+        applyFiles({ type: "saved", path, text });
+        diskVersion.current++;
+      } catch (error) {
+        ok = false;
+        setNotice(`Could not save ${baseName(path)}. ${errorText(error)}`);
+      }
+    }
+    if (ok) setNotice((current) => (current?.startsWith("Could not save") ? null : current));
+    return ok;
+  }
+
+  async function saveCurrentAs() {
+    const from = filesRef.current.current;
+    if (from === null || readOnly) return;
+    const target = await prompt("Save as", "File name in this project", from);
+    if (!target || sameRel(target, from)) return;
+    const text = filesRef.current.files.get(from)!.text;
+    try {
+      await writeFile(target, text);
+      diskVersion.current++;
+      // The new file takes over the editor state; the old file keeps what is on disk.
+      const wasMain = sameRel(from, filesRef.current.main);
+      editor.current?.rename(from, target);
+      applyFiles({ type: "renamed", from, to: target });
+      applyFiles({ type: "saved", path: target, text });
+      if (wasMain) applyFiles({ type: "mainSet", path: from });
+      setTreeVersion((v) => v + 1);
+    } catch (error) {
+      setNotice(`Could not save ${baseName(target)}. ${errorText(error)}`);
     }
   }
 
   async function runCompile() {
-    if (state.explicitBusy) return;
-    const saved = await saveDocument();
-    if (!saved) return;
-    dispatch({ type: "start", origin: "explicit" });
-    let result: CompileResult;
-    try {
-      result = await compileSource(saved.text, saved.path);
-    } catch (error) {
-      const text = String(error);
-      result = { ok: false, summary: text, log: text, pdfPath: null, engine: "pdflatex" };
-    }
-    await showResult(result, "explicit", saved.text, saved.path);
+    if (state.explicitBusy || readOnly) return;
+    if (!(await saveAll())) return;
+    await compileNow("explicit");
   }
+
+  /** One prompt for all unsaved files; false means the user cancelled (or saving failed). */
+  async function settleUnsaved(): Promise<boolean> {
+    const pending = dirtyFiles(filesRef.current);
+    if (!pending.length || readOnly) return true;
+    const choice = await ask(
+      "Unsaved changes",
+      <>
+        <p>Save changes to these files?</p>
+        <ul className="file-list">
+          {pending.map((path) => (
+            <li key={path}>{path}</li>
+          ))}
+        </ul>
+      </>,
+      [
+        { label: "Cancel", value: "cancel" },
+        { label: "Don't save", value: "discard" },
+        { label: "Save all", value: "save", primary: true },
+      ],
+    );
+    if (choice === "save") return saveAll();
+    return choice === "discard";
+  }
+
+  /** Leave the project: unsaved prompt, PDF export, then switch. */
+  async function leave(target: string | null) {
+    if (!(await settleUnsaved())) return;
+    try {
+      await exportPdfOnExit();
+    } catch (error) {
+      setNotice(`Lexy couldn't save the PDF next to your document: ${errorText(error)}`);
+    }
+    onSwitch(target);
+  }
+
+  async function openFolder() {
+    try {
+      const picked = await chooseProjectFolder(async () =>
+        (await ask("Large folder", "This folder is large. Open anyway?", [
+          { label: "Cancel", value: "cancel" },
+          { label: "Open", value: "open", primary: true },
+        ])) === "open",
+      );
+      if (picked) await leave(picked);
+    } catch (error) {
+      setNotice(`Could not open the folder. ${errorText(error)}`);
+    }
+  }
+
+  async function newProject() {
+    const name = await prompt("New project", "Project name", "Untitled");
+    if (!name) return;
+    if (name.includes("\\")) {
+      setNotice("Use a project name without \\ or /.");
+      return;
+    }
+    try {
+      await leave(await createProject(name, STARTER_DOCUMENT));
+    } catch (error) {
+      setNotice(`Could not create the project. ${errorText(error)}`);
+    }
+  }
+
+  // ----- sidebar actions -----
+
+  async function newFile(dir: string) {
+    if (readOnly) return;
+    const name = await prompt("New file", "File name", "untitled.tex");
+    if (!name) return;
+    const path = joinRel(dir, name);
+    try {
+      await createFile(path);
+      setTreeVersion((v) => v + 1);
+      if (/\.(tex|bib|cls|sty|txt|bst|md)$/i.test(name)) await openFile(path);
+    } catch (error) {
+      setNotice(`Could not create ${name}. ${errorText(error)}`);
+    }
+  }
+
+  async function newFolder(dir: string) {
+    if (readOnly) return;
+    const name = await prompt("New folder", "Folder name", "New folder");
+    if (!name) return;
+    try {
+      await createFolder(joinRel(dir, name));
+      setTreeVersion((v) => v + 1);
+    } catch (error) {
+      setNotice(`Could not create ${name}. ${errorText(error)}`);
+    }
+  }
+
+  async function rename(entry: Entry, name: string): Promise<boolean> {
+    const to = joinRel(parentOf(entry.path), name);
+    try {
+      await renameEntry(entry.path, to);
+      editor.current?.rename(entry.path, to);
+      applyFiles({ type: "renamed", from: entry.path, to });
+      setTreeVersion((v) => v + 1);
+      return true;
+    } catch (error) {
+      setNotice(`Could not rename ${entry.name}. ${errorText(error)}`);
+      return !isProjectError(error, "nameTaken") && !isProjectError(error, "invalidName");
+    }
+  }
+
+  async function remove(entry: Entry) {
+    if (readOnly) return;
+    const confirmed = await ask("Delete", `Move ${entry.name} to the Recycle Bin?`, [
+      { label: "Cancel", value: "cancel" },
+      { label: "Delete", value: "delete", primary: true },
+    ]);
+    if (confirmed !== "delete") return;
+    try {
+      try {
+        await deleteEntry(entry.path, false);
+      } catch (error) {
+        if (!isProjectError(error, "noRecycleBin")) throw error;
+        const permanent = await ask("Delete", `This drive has no Recycle Bin. Delete ${entry.name} permanently?`, [
+          { label: "Cancel", value: "cancel" },
+          { label: "Delete permanently", value: "delete", primary: true },
+        ]);
+        if (permanent !== "delete") return;
+        await deleteEntry(entry.path, true);
+      }
+      forgetUnder(entry.path);
+      setTreeVersion((v) => v + 1);
+    } catch (error) {
+      setNotice(`Could not delete ${entry.name}. ${errorText(error)}`);
+    }
+  }
+
+  /** Drop open files at or below `path` (deleted), showing the main document instead. */
+  function forgetUnder(path: string) {
+    const state = filesRef.current;
+    const next = openFilesReducer(state, { type: "deleted", path });
+    for (const key of state.files.keys()) if (!next.files.has(key)) editor.current?.forget(key);
+    if (next.current !== null && next.current !== state.current) {
+      editor.current?.switchTo(next.current, next.files.get(next.current)!.text);
+    }
+    applyFiles({ type: "deleted", path });
+  }
+
+  async function importDropped(sources: string[], dir: string) {
+    if (readOnly) return;
+    try {
+      const result = await importFiles(sources, dir, "ask");
+      if (result.conflicts.length) {
+        const n = result.conflicts.length;
+        const choice = await ask("Files already exist", `${n} ${n === 1 ? "file already exists" : "files already exist"}.`, [
+          { label: "Skip", value: "skip" },
+          { label: "Keep both", value: "keepBoth" },
+          { label: "Replace", value: "replace", primary: true },
+        ]);
+        if (choice) await importFiles(result.conflicts, dir, choice);
+      }
+      setTreeVersion((v) => v + 1);
+    } catch (error) {
+      setNotice(`Could not copy the files. ${errorText(error)}`);
+    }
+  }
+
+  // ----- outside changes (research R3) -----
+
+  async function onDiskChange(paths: string[]) {
+    diskVersion.current++;
+    setTreeVersion((v) => v + 1);
+    const state = filesRef.current;
+    for (const changed of paths) {
+      const key = keyOf(state, changed);
+      if (key === undefined) continue;
+      const file = state.files.get(key)!;
+      if (isDirty(file)) {
+        applyFiles({ type: "diskChanged", path: key });
+        continue;
+      }
+      try {
+        const text = await readFile(key);
+        if (text === file.text) continue;
+        if (key !== filesRef.current.current) editor.current?.forget(key);
+        applyFiles({ type: "reloaded", path: key, text });
+      } catch (error) {
+        if (isProjectError(error, "notFound")) forgetUnder(key);
+      }
+    }
+  }
+
+  async function reloadCurrent() {
+    const path = filesRef.current.current;
+    if (path === null) return;
+    try {
+      applyFiles({ type: "reloaded", path, text: await readFile(path) });
+    } catch (error) {
+      setNotice(errorText(error));
+    }
+  }
+
+  useEffect(() => {
+    let disposed = false;
+    const unlisteners: (() => void)[] = [];
+    const keep = (dispose: () => void) => (disposed ? dispose() : unlisteners.push(dispose));
+    try {
+      listen<{ paths: string[] }>("project-changed", (event) => void onDiskChangeRef.current(event.payload.paths)).then(keep, () => undefined);
+      listen("project-missing", () => setMissing(true)).then(keep, () => undefined);
+    } catch {
+      // Not running inside Tauri.
+    }
+    return () => {
+      disposed = true;
+      unlisteners.forEach((dispose) => dispose());
+    };
+  }, []);
+  const onDiskChangeRef = useRef(onDiskChange);
+  onDiskChangeRef.current = onDiskChange;
+
+  async function saveAsNewProject() {
+    const name = await prompt("Save as new project", "Project name", project.name);
+    if (!name) return;
+    try {
+      const created = await createProject(name, filesRef.current.files.get(filesRef.current.main ?? "")?.text ?? STARTER_DOCUMENT);
+      onSwitch(created);
+    } catch (error) {
+      setNotice(`Could not create the project. ${errorText(error)}`);
+    }
+  }
+
+  // ----- editing -----
 
   function edit(change: (text: string, selection: { from: number; to: number }) => TextEdit) {
     const handle = editor.current;
-    if (!handle) return;
+    if (!handle || filesRef.current.current === null) return;
     handle.apply(change(handle.getText(), handle.getSelection()));
   }
 
+  /** Document settings always live in the main document (FR-017), whichever file is shown. */
   function changeSettings(next: DocumentSettings) {
-    const handle = editor.current;
-    const text = handle?.getText() ?? source;
+    const target = filesRef.current.main;
+    const text = target !== null ? filesRef.current.files.get(keyOf(filesRef.current, target) ?? target)?.text : undefined;
+    if (target === null || text === undefined) {
+      setNotice("Open the main document first. Lexy keeps page and font settings there.");
+      return;
+    }
     try {
       const updated = applySettings(text, next);
       if (updated === null) {
@@ -305,10 +648,24 @@ export function Writer() {
         conflictWarned.current = true;
         setNotice(`This document already sets fonts or margins itself (${clashes[0]}). Lexy's settings may conflict with it.`);
       }
-      handle?.replaceAll(updated);
+      const key = keyOf(filesRef.current, target)!;
+      if (key === filesRef.current.current) {
+        editor.current?.replaceAll(updated);
+        return;
+      }
+      const result = editor.current?.applyTo(key, { from: 0, to: text.length, insert: updated, selectFrom: 0, selectTo: 0 }) ?? null;
+      if (result === null) editor.current?.forget(key);
+      applyFiles({ type: "edited", path: key, text: result ?? updated });
+      afterEdit();
+      setInfo(`Applied to ${baseName(key)}`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
     }
+  }
+
+  function afterEdit() {
+    dispatch({ type: "edit" });
+    live.current?.edit(String(++editSeq.current));
   }
 
   function insertEquation(result: EquationResult, target: EquationTarget) {
@@ -325,14 +682,25 @@ export function Writer() {
     edit((text, selection) => insertBlock(text, selection, latex, cursor));
   }
 
+  function toggleFiles() {
+    setFilesOpen((open) => {
+      writeStorage(FILES_KEY, open ? "0" : "1");
+      return !open;
+    });
+  }
+
   const actions: RibbonActions = {
-    onNew: () => void newDocument(),
-    onOpen: () => void openDocument(),
-    onSave: () => void saveDocument(),
-    onSaveAs: () => void saveDocument(true),
+    onNew: () => void newFile(current ? parentOf(current) : ""),
+    onNewProject: () => void newProject(),
+    onOpen: () => void openFolder(),
+    onHome: () => void leave(null),
+    onRecent: (path) => void leave(path),
+    onSave: () => void saveAll(),
+    onSaveAs: () => void saveCurrentAs(),
     onCompile: () => void runCompile(),
     onToggleLogs: () => setLogsOpen((open) => !open),
-    onToggleLive: () => setLiveEnabled((on) => !on),
+    onToggleLive: () => setLiveEnabled((on) => !on && !readOnly),
+    onToggleFiles: toggleFiles,
     onFormat: (command) => edit((text, selection) => wrap(text, selection, command)),
     onList: (kind) => edit((text, selection) => toList(text, selection, kind)),
     onHeading: (level) => edit((text, selection) => setHeading(text, selection, level)),
@@ -354,12 +722,14 @@ export function Writer() {
   useEffect(() => {
     // Capture phase so these win over the editor's own bindings (Ctrl+L select line, Ctrl+I select parent).
     function onKeyDown(event: KeyboardEvent) {
+      if ((event.target as HTMLElement | null)?.closest?.(".dialog")) return;
       const key = event.key.toLowerCase();
       const ctrl = event.ctrlKey && !event.altKey && !event.metaKey;
       const run = actionsRef.current;
       let action: (() => void) | null = null;
       if (event.key === "F5" && !event.ctrlKey) action = run.onCompile;
       else if (ctrl && key === "s") action = event.shiftKey ? run.onSaveAs : run.onSave;
+      else if (ctrl && event.shiftKey && key === "e") action = run.onToggleFiles;
       else if (ctrl && !event.shiftKey) {
         action =
           { n: run.onNew, o: run.onOpen, l: run.onToggleLogs, b: () => run.onFormat("textbf"), i: () => run.onFormat("textit"), u: () => run.onFormat("underline") }[key] ??
@@ -367,7 +737,7 @@ export function Writer() {
       }
       if (!action) return;
       // Formatting shortcuts only apply while typing in the editor, not inside dialogs.
-      if (["b", "i", "u"].includes(key) && !(event.target as HTMLElement | null)?.closest?.(".editor")) return;
+      if (["b", "i", "u"].includes(key) && !event.shiftKey && !(event.target as HTMLElement | null)?.closest?.(".editor")) return;
       event.preventDefault();
       event.stopPropagation();
       action();
@@ -376,13 +746,19 @@ export function Writer() {
     return () => window.removeEventListener("keydown", onKeyDown, true);
   }, []);
 
+  const settleRef = useRef(settleUnsaved);
+  settleRef.current = settleUnsaved;
+  const exportRef = useRef(exportPdfOnExit);
+  exportRef.current = exportPdfOnExit;
+
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     try {
       getCurrentWindow()
         .onCloseRequested(async (event) => {
-          if (unsavedRef.current && !(await confirmDiscard())) {
+          // Window close keeps lastOpen, so this project reopens next time.
+          if (!(await settleRef.current())) {
             event.preventDefault();
             return;
           }
@@ -393,7 +769,7 @@ export function Writer() {
             if (!exportWarned.current) {
               exportWarned.current = true;
               event.preventDefault();
-              setNotice(`Lexy couldn't save the PDF next to your document: ${error}. Close again to quit without it.`);
+              setNotice(`Lexy couldn't save the PDF next to your document: ${errorText(error)}. Close again to quit without it.`);
             }
           }
         })
@@ -407,6 +783,12 @@ export function Writer() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!info) return;
+    const timer = setTimeout(() => setInfo(null), 2500);
+    return () => clearTimeout(timer);
+  }, [info]);
+
   function splitFromPointer(clientX: number) {
     const box = panes.current?.getBoundingClientRect();
     if (!box || box.width === 0) return;
@@ -419,27 +801,66 @@ export function Writer() {
     writeStorage(SPLIT_KEY, String(next));
   }
 
+  function updateSidebar(width: number) {
+    const next = clampSidebar(width);
+    setSidebarWidth(next);
+    writeStorage(SIDEBAR_KEY, String(next));
+  }
+
   const compiling = state.status === "compiling";
+  const currentName = current ?? "No file open";
 
   return (
     <main className="writer">
       <Ribbon
         actions={actions}
         state={{
-          fileName: fileName(path),
-          path,
-          unsaved,
+          fileName: currentName,
+          path: current ? absolutePath(project.root, current) : null,
+          unsaved: isDirty(currentFile),
+          isMain: sameRel(current, main),
+          projectName: project.name,
+          mainName: main,
           statusLabel: statusLabel(state),
           statusClass: state.status,
           statusDetail: state.status === "error" ? state.summary : null,
           compiling: state.explicitBusy,
+          readOnly,
           logsOpen,
           liveEnabled,
+          filesOpen,
+          recent: recent.filter((item) => !item.missing && !sameRel(item.path, project.root)).slice(0, 10),
           settings,
           settingsManaged,
         }}
       />
 
+      {readOnly ? (
+        <div className="notice info" role="status">
+          <span>Open in another Lexy window. Read-only.</span>
+        </div>
+      ) : null}
+      {missing ? (
+        <div className="notice" role="alert">
+          <span>Project folder is missing.</span>
+          <button type="button" onClick={() => void saveAsNewProject()}>
+            Save as new project
+          </button>
+        </div>
+      ) : null}
+      {currentFile?.diskChanged ? (
+        <div className="notice" role="alert">
+          <span>{baseName(current!)} changed on disk.</span>
+          <span className="notice-actions">
+            <button type="button" onClick={() => void reloadCurrent()}>
+              Reload
+            </button>
+            <button type="button" onClick={() => applyFiles({ type: "keptMine", path: current! })}>
+              Keep mine
+            </button>
+          </span>
+        </div>
+      ) : null}
       {notice ? (
         <div className="notice" role="alert">
           <span>{notice}</span>
@@ -448,62 +869,131 @@ export function Writer() {
           </button>
         </div>
       ) : null}
+      {info ? (
+        <div className="notice info" role="status">
+          <span>{info}</span>
+        </div>
+      ) : null}
 
       <div
-        className="panes"
-        ref={panes}
-        style={{ gridTemplateColumns: `minmax(0, ${split}fr) 6px minmax(0, ${1 - split}fr)` }}
+        className="workspace"
+        style={{ gridTemplateColumns: filesOpen ? `${sidebarWidth}px 4px minmax(0, 1fr)` : "minmax(0, 1fr)" }}
+        onPointerMove={(event) => {
+          if (dragging.current === "sidebar") updateSidebar(event.clientX - event.currentTarget.getBoundingClientRect().left);
+        }}
+        onPointerUp={() => {
+          if (dragging.current === "sidebar") dragging.current = null;
+        }}
       >
-        <Editor
-          handle={editor}
-          value={source}
-          label="LaTeX source"
-          onChange={(next) => {
-            setSource(next);
-            dispatch({ type: "edit" });
-            live.current?.edit(next);
-          }}
-        />
+        {filesOpen ? (
+          <>
+            <Sidebar
+              projectName={project.name}
+              version={treeVersion}
+              current={current}
+              main={main}
+              dirty={dirtySet}
+              readOnly={readOnly}
+              actions={{
+                onOpen: onEntryOpen,
+                onNewFile: (dir) => void newFile(dir),
+                onNewFolder: (dir) => void newFolder(dir),
+                onRename: rename,
+                onDelete: (entry) => void remove(entry),
+                onSetMain: (path) => void setMain(path),
+                onReveal: (dir) => void openEntryExternal(dir).catch((error) => setNotice(errorText(error))),
+                onHome: () => void leave(null),
+                onImport: (sources, dir) => void importDropped(sources, dir),
+                onError: setNotice,
+              }}
+            />
+            <div
+              className="splitter sidebar-splitter"
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize file list"
+              aria-valuemin={MIN_SIDEBAR}
+              aria-valuemax={MAX_SIDEBAR}
+              aria-valuenow={sidebarWidth}
+              tabIndex={0}
+              onPointerDown={(event) => {
+                dragging.current = "sidebar";
+                event.currentTarget.setPointerCapture?.(event.pointerId);
+              }}
+              onPointerMove={(event) => {
+                if (dragging.current === "sidebar") {
+                  const box = event.currentTarget.parentElement?.getBoundingClientRect();
+                  if (box) updateSidebar(event.clientX - box.left);
+                }
+              }}
+              onPointerUp={() => (dragging.current = null)}
+              onKeyDown={(event) => {
+                if (event.key === "ArrowLeft") updateSidebar(sidebarWidth - 20);
+                else if (event.key === "ArrowRight") updateSidebar(sidebarWidth + 20);
+                else return;
+                event.preventDefault();
+              }}
+            />
+          </>
+        ) : null}
+
         <div
-          className="splitter"
-          role="separator"
-          aria-orientation="vertical"
-          aria-label="Resize editor and preview"
-          aria-valuemin={MIN_SPLIT * 100}
-          aria-valuemax={MAX_SPLIT * 100}
-          aria-valuenow={Math.round(split * 100)}
-          tabIndex={0}
-          title="Drag to resize. Double-click to reset."
-          onPointerDown={(event) => {
-            dragging.current = true;
-            event.currentTarget.setPointerCapture?.(event.pointerId);
-          }}
-          onPointerMove={(event) => {
-            if (dragging.current) splitFromPointer(event.clientX);
-          }}
-          onPointerUp={() => {
-            dragging.current = false;
-            writeStorage(SPLIT_KEY, String(split));
-          }}
-          onDoubleClick={() => updateSplit(0.5)}
-          onKeyDown={(event) => {
-            if (event.key === "ArrowLeft") updateSplit(split - 0.05);
-            else if (event.key === "ArrowRight") updateSplit(split + 0.05);
-            else return;
-            event.preventDefault();
-          }}
-        />
-        <section className="preview" aria-label="PDF preview">
-          {state.status === "error" ? (
-            <div className="preview-banner">
-              <span>{state.origin === "live" ? `Preview failed: ${state.summary}` : "Compile failed. Open log."}</span>
-              <button type="button" onClick={() => setLogsOpen(true)}>
-                Open log
-              </button>
-            </div>
-          ) : null}
-          <PdfView bytes={pdfBytes} busy={compiling} onError={setNotice} />
-        </section>
+          className="panes"
+          ref={panes}
+          style={{ gridTemplateColumns: `minmax(0, ${split}fr) 6px minmax(0, ${1 - split}fr)` }}
+        >
+          <Editor
+            handle={editor}
+            value={currentFile?.text ?? ""}
+            label="LaTeX source"
+            onChange={(next) => {
+              const path = filesRef.current.current;
+              if (path === null) return;
+              applyFiles({ type: "edited", path, text: next });
+              afterEdit();
+            }}
+          />
+          <div
+            className="splitter"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize editor and preview"
+            aria-valuemin={MIN_SPLIT * 100}
+            aria-valuemax={MAX_SPLIT * 100}
+            aria-valuenow={Math.round(split * 100)}
+            tabIndex={0}
+            title="Drag to resize. Double-click to reset."
+            onPointerDown={(event) => {
+              dragging.current = "split";
+              event.currentTarget.setPointerCapture?.(event.pointerId);
+            }}
+            onPointerMove={(event) => {
+              if (dragging.current === "split") splitFromPointer(event.clientX);
+            }}
+            onPointerUp={() => {
+              dragging.current = null;
+              writeStorage(SPLIT_KEY, String(split));
+            }}
+            onDoubleClick={() => updateSplit(0.5)}
+            onKeyDown={(event) => {
+              if (event.key === "ArrowLeft") updateSplit(split - 0.05);
+              else if (event.key === "ArrowRight") updateSplit(split + 0.05);
+              else return;
+              event.preventDefault();
+            }}
+          />
+          <section className="preview" aria-label="PDF preview">
+            {state.status === "error" ? (
+              <div className="preview-banner">
+                <span>{state.origin === "live" ? `Preview failed: ${state.summary}` : "Compile failed. Open log."}</span>
+                <button type="button" onClick={() => setLogsOpen(true)}>
+                  Open log
+                </button>
+              </div>
+            ) : null}
+            <PdfView bytes={pdfBytes} busy={compiling} onError={setNotice} />
+          </section>
+        </div>
       </div>
 
       {logsOpen ? (
@@ -520,6 +1010,10 @@ export function Writer() {
           </div>
           <pre>{state.log || "No log yet"}</pre>
         </section>
+      ) : null}
+
+      {mainChooser ? (
+        <MainChooser candidates={mainChooser} onChoose={(path) => void setMain(path)} onCancel={() => setMainChooser(null)} />
       ) : null}
 
       {equation ? (
@@ -540,6 +1034,40 @@ export function Writer() {
           />
         </Suspense>
       ) : null}
+      {choiceDialog}
+      {nameDialog}
     </main>
+  );
+}
+
+
+/** "Which file is the main document?" (contracts/ui.md). */
+function MainChooser({ candidates, onChoose, onCancel }: { candidates: string[]; onChoose: (path: string) => void; onCancel: () => void }) {
+  const [picked, setPicked] = useState(candidates[0]);
+  return (
+    <Dialog
+      title="Main document"
+      onClose={onCancel}
+      actions={
+        <>
+          <button type="button" onClick={onCancel}>
+            Cancel
+          </button>
+          <button type="button" className="primary" onClick={() => onChoose(picked)}>
+            Use this
+          </button>
+        </>
+      }
+    >
+      <fieldset className="main-choices">
+        <legend>Which file is the main document?</legend>
+        {candidates.map((path) => (
+          <label key={path}>
+            <input type="radio" name="main-document" checked={picked === path} onChange={() => setPicked(path)} />
+            {path}
+          </label>
+        ))}
+      </fieldset>
+    </Dialog>
   );
 }

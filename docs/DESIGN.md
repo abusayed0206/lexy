@@ -96,15 +96,16 @@ Do not build a broad preferences system until required.
 
 ## Keyboard Shortcuts
 
-Initial shortcuts:
+Shortcuts (projects since feature 004):
 
-- `Ctrl+N`: new file.
-- `Ctrl+O`: open file.
-- `Ctrl+S`: save.
-- `Ctrl+Shift+S`: save as.
-- `F5`: compile (decided 2026-11-13; `Ctrl+B` is bold).
+- `Ctrl+N`: new file in the current folder (on Project Home: new project).
+- `Ctrl+O`: open folder as a project.
+- `Ctrl+S`: save all modified files in the project.
+- `Ctrl+Shift+S`: save the current file as another name inside the project.
+- `F5`: save all, then compile the main document (decided 2026-11-13; `Ctrl+B` is bold).
 - `Ctrl+B` / `Ctrl+I` / `Ctrl+U`: bold / italic / underline the selection (editor only).
 - `Ctrl+L`: toggle logs.
+- `Ctrl+Shift+E`: show or hide the file sidebar (`Ctrl+B` stays Bold).
 
 Shortcuts must not conflict with text editing expectations.
 
@@ -112,12 +113,22 @@ Shortcuts must not conflict with text editing expectations.
 
 The compact command strip is replaced by a Word-style ribbon at the user's request (`specs/002-word-style-editor`). The LaTeX source stays visible; every ribbon action is a plain text edit.
 
-- Tabs: File (New, Open, Save, Save as), Home (Font, Size, Bold/Italic/Underline, Bullets, Numbering, Styles), Insert (Equation, Table, Page break, Footnote), Layout (Margins, Size, Orientation), View (Live preview, Compile now, Logs).
+- Tabs: File (New project, Open folder…, Recent projects, Project Home, New file, Save, Save as; was New, Open, Save, Save as before feature 004), Home (Font, Size, Bold/Italic/Underline, Bullets, Numbering, Styles), Insert (Equation, Table, Page break, Footnote), Layout (Margins, Size, Orientation), View (Files, Live preview, Compile now, Logs).
 - File name, unsaved dot, status pill and Compile stay visible at the right of the tab row on every tab.
 - At ≥ 900 px wide buttons show labels; below that they are icon-only with tooltips; below 820 px group captions hide. Nothing wraps or overlaps at 800 px.
 - Shortcuts are a capture-phase handler so they beat CodeMirror's own bindings: Ctrl+L (select line) and Ctrl+I (select parent) are taken over by Lexy.
 - Document-wide font, size, paper and margins are written into one marked "Lexy settings" block after `\documentclass`; Lexy never edits other preamble lines.
 - Live preview recompiles about 1 s after typing stops, without saving. Live failures show "Preview failed" in the status; only F5/Compile failures open the log drawer.
+
+## Projects (2026-11-13, feature 004)
+
+Lexy works on folders, not single files (`specs/004-project-workspace`).
+
+- Start: Project Home lists folders in `Documents\Lexy` plus recently opened folders elsewhere (newest first, location shown for outside ones, "Missing" rows can be removed). The last open project reopens directly.
+- Writer layout: file sidebar | editor | PDF. Sidebar 220 px default, 160–400 px, resizable by drag or arrow keys, hidden with Ctrl+Shift+E or View → Files; it starts hidden below 900 px wide. Nothing overlaps at 800x600 with it open.
+- The sidebar is a tree (arrow keys, Enter, F2 rename, Delete, Shift+F10 menu). The current file is highlighted, the main document has a "Main" badge, unsaved files (and folders containing them) show the unsaved dot. Build clutter and dot-files are hidden unless "Show hidden files" is on.
+- Font, size and page settings always go to the main document, even when another file is shown.
+- One prompt lists every unsaved file on close, Project Home or project switch.
 
 ## Accessibility And Responsiveness
 

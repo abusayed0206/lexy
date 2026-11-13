@@ -40,13 +40,13 @@ This tracker is the source of truth for implementation status. Any contributor w
 | F-007 | Debounced auto compile toggle | P1 | In Progress | Claude | UI interaction test | Live preview (View tab, default on): compiles a snapshot ~1 s after typing, one running + one queued. Unit/UI-tested; native check pending. |
 | F-008 | Compile status indicator | P0 | In Progress | Claude | UI state review | Idle/Changed/Compiling/PDF ready/Compile failed via reducer in `src/Writer.tsx`; compile is an M1 stub. |
 | F-009 | Collapsible log panel | P0 | In Progress | Claude | Compile failure test | Collapsed by default, Ctrl+L toggle, opens on failed compile, Copy log. Live check pending. |
-| F-010 | Open `.tex` file | P0 | In Progress | Claude | Manual file test | Dialog plugin + `read_document` (abs .tex only, 10 MiB cap, UTF-8 only). Unit-tested; native dialog check pending. |
-| F-011 | Save current `.tex` file | P0 | In Progress | Claude | Manual file test | `write_document` is atomic (temp + fsync + rename); exact round-trip Rust-tested. Native check pending. |
-| F-012 | Save as `.tex` file | P0 | In Progress | Claude | Manual file test | Appends `.tex` if the user omits it. Unit-tested; native check pending. |
-| F-013 | Dirty state tracking | P0 | In Progress | Claude | UI state test | Unsaved dot by file name; confirm before New/Open/close (`onCloseRequested`). Unit-tested; native close check pending. |
-| F-014 | Recent files | P2 | Not Started | Unassigned | App relaunch | Store in app config data. |
-| F-015 | Rust workspace service | P0 | Done | Claude | Rust tests | `read_document` / `write_document` in `src-tauri/src/lib.rs`; `cargo test` covers validation, limits, atomic write. |
-| F-016 | Rust compiler service | P0 | Done | Claude | Rust tests + smoke test | `compile_document`: latexmk with -outdir build folder, tool PATH, hidden console, 180 s tree-kill timeout, first-error summary. Real compile e2e test passed on dev machine. |
+| F-010 | Open `.tex` file | P0 | Superseded | Claude | — | Replaced by Open folder (F-046): projects are folders; files open from the sidebar via `read_file` (project-relative, 10 MiB cap, UTF-8 only). |
+| F-011 | Save current `.tex` file | P0 | In Progress | Claude | Manual file test | Ctrl+S saves every modified project file via `write_file` (atomic temp + fsync + rename). Unit-tested; native check pending. |
+| F-012 | Save as `.tex` file | P0 | In Progress | Claude | Manual file test | Save as writes the current file under a new name inside the project (Ctrl+Shift+S). Unit-tested; native check pending. |
+| F-013 | Dirty state tracking | P0 | In Progress | Claude | UI state test | Per-file unsaved state (`src/openFiles.ts`); unsaved dots in title and sidebar; one Save all / Don't save / Cancel prompt on close, Project Home or project switch. Unit-tested; native close check pending. |
+| F-014 | Recent files | P2 | Superseded | Claude | — | Replaced by recent projects (F-046): Project Home list and File → Recent projects, stored in `%LOCALAPPDATA%\Lexy\projects.json`. |
+| F-015 | Rust workspace service | P0 | Done | Claude | Rust tests | `src-tauri/src/project.rs`: project-relative file commands behind one path gate (`resolve_in_project`); `cargo test` covers escapes, junctions, limits, CRUD, import. |
+| F-016 | Rust compiler service | P0 | Done | Claude | Rust tests + smoke test | `compile_project`: latexmk in the build folder, unsaved buffers in an overlay first on TEXINPUTS/BIBINPUTS, tool PATH, hidden console, 180 s tree-kill timeout, first-error summary. Real multi-file e2e (input, include, image, bib) passed on dev machine. |
 | F-017 | Compile job cancellation/queue | P1 | In Progress | Claude | Rapid edit test | Compile disabled while running (F5 ignored) and timed out after 180 s; no user-facing cancel yet. |
 | F-018 | PDF preview refresh | P0 | In Progress | Claude | Successful compile test | pdf.js canvases, double-buffered, scroll kept; last good PDF kept on failure. Unit-tested; native WebView2 check pending. |
 | F-019 | MiKTeX detection | P0 | In Progress | Codex | Machine with MiKTeX | Detects `miktex`; package behavior check still needed. |
@@ -62,7 +62,7 @@ This tracker is the source of truth for implementation status. Any contributor w
 | F-029 | Bundle dependency resource decision | P0 | Blocked | Product/Engineering | Decision recorded | Bundle installers or download on demand. |
 | F-030 | WebView2 installer mode decision | P1 | Blocked | Engineering | Build review | Tauri supports download/offline/fixed runtime modes. |
 | F-031 | App update strategy | P2 | Not Started | Unassigned | Release plan review | Decide after MVP installer works. |
-| F-032 | Keyboard shortcuts | P1 | In Progress | Claude | Manual shortcut test | Ctrl+N/O/S, Ctrl+Shift+S, F5 compile, Ctrl+L logs; capture-phase so they beat CodeMirror. Unit-tested; native check pending. |
+| F-032 | Keyboard shortcuts | P1 | In Progress | Claude | Manual shortcut test | Ctrl+N new file, Ctrl+O open folder, Ctrl+S save all, Ctrl+Shift+S save as, Ctrl+Shift+E sidebar, F5 compile, Ctrl+L logs; capture-phase so they beat CodeMirror. Unit-tested; native check pending. |
 | F-033 | Minimal settings screen | P2 | Not Started | Unassigned | UI review | Dependency paths, auto compile, theme. |
 | F-034 | Accessibility pass | P1 | In Progress | Claude | Keyboard/display scaling test | Named icon buttons with shortcut tooltips, focus order, keyboard-resizable splitter, text status labels. 125/150% scaling check pending. |
 | F-035 | Fresh Windows VM smoke test | P0 | Not Started | Unassigned | VM checklist | No MiKTeX/Perl preinstalled. |
@@ -74,7 +74,13 @@ This tracker is the source of truth for implementation status. Any contributor w
 | F-041 | Page layout: margins, paper, orientation | P1 | In Progress | Claude | Settings tests | Word presets + custom 0.5–6 cm. Native check pending. |
 | F-042 | Default save folder Documents\Lexy | P1 | In Progress | Claude | Rust + UI tests | `default_document_folder` (FOLDERID_Documents, created on demand, home fallback). Native check pending. |
 | F-043 | Formatting commands (bold/italic/underline, headings, lists, page break, footnote) | P2 | In Progress | Claude | Generator + UI tests | One undo step each; Ctrl+B/I/U. Native check pending. |
-| F-044 | Project folders and file names | P1 | In Progress | Claude | Rust + UI tests | Saving into Documents\Lexy creates `Lexy\Name\Name.tex` (never overwrites: `Name (2)`); name suggested from `\title`. Native check pending. |
+| F-044 | Project folders and file names | P1 | Superseded | Claude | — | Replaced by New project (F-046): `Documents\Lexy\Name\Name.tex`, `Name (2)` when taken. |
+| F-046 | Project Home and recent projects | P1 | In Progress | Claude | UI + Rust tests | `src/ProjectHome.tsx`; lists `Documents\Lexy` folders + recent projects (max 20, Missing rows removable), New project, Open folder… (warns above 5,000 entries), reopens the last project on start. Native check pending. |
+| F-047 | File sidebar | P1 | In Progress | Claude | UI tests | `src/Sidebar.tsx`: lazy tree, keyboard tree pattern, F2 rename, Recycle Bin delete (permanent fallback asks), context menu, drag-in import from Explorer with Replace / Keep both / Skip, Ctrl+Shift+E. Native drag-drop check pending. |
+| F-048 | Main document per project | P1 | In Progress | Claude | Rust + UI tests | Auto-detected when one top-level `.tex` has `\documentclass`, else chosen once and remembered in `projects.json`; Set as main document in the sidebar; settings ribbon always edits it. |
+| F-049 | Multi-file compile with unsaved buffers | P1 | In Progress | Claude | Rust e2e + UI tests | Live preview and F5 compile the main document from any file; unsaved files go to an overlay in the build folder, never to disk; images/bib read from the project. |
+| F-050 | Outside changes and missing folder | P1 | In Progress | Claude | Rust + UI tests | `notify-debouncer-full` watcher (500 ms); clean files reload, modified ones get Reload / Keep mine; Lexy's own writes ignored; "Project folder is missing" bar. Native check pending. |
+| F-051 | Same project in two windows | P2 | In Progress | Claude | Rust + UI tests | Exclusive lock file per project; the second window opens read-only (no save, compile or file actions). Native two-window check pending. |
 | F-045 | PDF saved next to the document on exit | P1 | In Progress | Claude | Rust + UI tests | PDF lives in the build folder while editing; on close it is written as `<name>.pdf` beside the saved `.tex` (recompiled first if the preview doesn't match the saved text). Native check pending. |
 
 ## Manual Feature Intake
@@ -87,6 +93,22 @@ Add new ideas here first. During triage, either move them into the feature track
 | 2026-06-10 | Codex | Choose editor engine: textarea, CodeMirror, or Monaco. | Affects app weight and LaTeX editing capability. | Resolved 2026-11-13: CodeMirror 6 |
 | 2026-06-10 | Codex | Choose PDF preview strategy. | Affects file permissions, refresh behavior, and app size. | Resolved 2026-11-13: blob URL iframe |
 | 2026-06-10 | Codex | Decide whether to switch Strawberry Perl from MSI to portable. | Portable may better match no-GUI app-managed setup, but asset URL and extraction flow need confirmation. | Resolved 2026-11-13: portable ZIP |
+| 2026-11-13 | User | Click-to-jump between PDF and source (SyncTeX). | Standard in TeXstudio, Overleaf, LaTeX Workshop; fastest way to find preview text in source. | Specced: `specs/003-pdf-source-sync` |
+| 2026-11-13 | User | Document outline sidebar (sections, figures, tables). | Navigate long documents. | Accepted, needs spec |
+| 2026-11-13 | User | Smart autocomplete (commands, environments, `\ref`/`\cite` keys). | Fewer typos, discoverability for new users. | Accepted, needs spec |
+| 2026-11-13 | User | Friendly compile errors with "Go to line". | Raw latexmk logs are hard for non-experts. | Accepted, needs spec |
+| 2026-11-13 | User | Citations / bibliography (.bib, citation picker, add by DOI). | Core need for academic writing. | Accepted, needs spec |
+| 2026-11-13 | User | Insert image (ribbon + drag-and-drop, copied into project folder). | Word-style users expect it. | Accepted, needs spec |
+| 2026-11-13 | User | Template gallery for New (article, report, letter, CV, beamer). | Faster start than the single starter document. | Accepted, needs spec |
+| 2026-11-13 | User | Spell check (LaTeX-aware) and word count. | Basic writing aids every word processor has. | Accepted, needs spec |
+| 2026-11-13 | User | Project workspace: Project Home, open folder, file sidebar, main document. | Multi-file documents (chapters, .bib, images); replaces single-file model and F-014 Recent files. | Implemented as F-046…F-051 (`specs/004-project-workspace`) |
+| 2026-11-13 | Claude | Local version history (automatic snapshots per project, restore any version). | Undo across sessions; safety net without Git. | Suggested |
+| 2026-11-13 | Claude | Command palette (Ctrl+Shift+P) to run any ribbon action by name. | Fast keyboard access as features grow. | Suggested |
+| 2026-11-13 | Claude | Find and replace across the whole project. | Needed once documents span several files. | Suggested |
+| 2026-11-13 | Claude | Export to Word (.docx) and HTML. | Share with people who do not use LaTeX. | Suggested |
+| 2026-11-13 | Claude | Auto-save (optional, every few seconds). | Word-style users expect it; pairs with version history. | Suggested |
+| 2026-11-13 | Claude | Settings screen (theme, editor font size, live preview delay, auto-save). | Covers F-033; needed as options multiply. | Suggested |
+| 2026-11-13 | Claude | Layout revamp: three panes (sidebar with Files/Outline tabs, editor, PDF) plus focus mode. | Gives the outline and the project tree one home; focus mode for distraction-free writing. | Suggested |
 
 ## Decision Log
 
@@ -95,6 +117,9 @@ Add new ideas here first. During triage, either move them into the feature track
 | 2026-06-10 | Use Tauri 2 + React + Rust as the app foundation. | Current scaffold already uses this stack and it fits a small Windows desktop app. |
 | 2026-06-10 | Treat `PLAN_draft.md` as historical input, not the source of truth. | The draft includes useful direction but also unsafe installer assumptions and template-level snippets. |
 | 2026-06-10 | Require Context7 checks for external framework/package docs before implementation decisions. | User requested updated docs; packaging and permissions change over time. |
+| 2026-11-13 | Projects are plain folders; Lexy state (recent list, main document) lives in `%LOCALAPPDATA%\Lexy\projects.json`, nothing is written into project folders. | Keeps projects portable to other editors, Overleaf and Git (`specs/004-project-workspace/research.md` R8). |
+| 2026-11-13 | Multi-file compiles use an overlay folder for unsaved buffers, first on `TEXINPUTS`/`BIBINPUTS`, instead of copying the project. | Live preview with unsaved sub-files without copying images; user files never written by compile (R1). |
+| 2026-11-13 | Add crates `notify-debouncer-full` (folder watching) and `trash` (Recycle Bin). | Native, maintained; avoids polling and spawning PowerShell per delete (R3, R4). |
 | 2026-06-10 | Use MiKTeX standalone setup utility with a local basic package repository for initial setup. | Official MiKTeX deployment docs recommend `miktexsetup_standalone` for unattended deployment. |
 | 2026-11-13 | M1 Compile is a frontend stub (`src/compile.ts`) returning a clear "not available yet" failure in the result shape M3's Rust command must return. | Keeps the error state and auto-open log testable in M1; M3 swaps one function body. |
 | 2026-11-13 | Real compile replaces the M1 stub; compile saves the document first. | latexmk reads from disk; saving on compile is an explicit user action, so no hidden writes. |
@@ -130,3 +155,5 @@ Add new ideas here first. During triage, either move them into the feature track
 | 2026-11-13 | `cargo test` after setup rework | Passed | 80 Rust tests: downloads against a local HTTP server (progress, checksum mismatch, 404, unreachable, reuse), ZIP extraction incl. path-traversal refusal, streamed output with last lines on failure. Real Perl URL returns 200 with the pinned size. |
 | 2026-11-13 | `npm test` + `npm run build` after setup rework | Passed | 292 Vitest tests incl. new setup screen (step plan, live bytes, failure + Try again, log details). Native setup run pending. |
 | 2026-11-13 | `cargo test` + `npm test` + `npm run build` (project folders, PDF on exit) | Passed | 90 Rust and 312 Vitest tests. Not yet tried in the native window. |
+| 2026-11-13 | `cargo test` + `npm test` + `npm run build`, feature 004 (project workspace) | Passed | 101 Rust tests incl. real latexmk e2e: unsaved `\input` buffer read from the overlay, `\include`, PNG and `.bib` read from the project, nothing written into the project; path gate refuses `..`, drive/UNC paths, reserved names and an outside junction. 326 Vitest tests. |
+| 2026-11-13 | Browser pane, backend mocked, 800x600 | Passed | Project Home list (dates, outside location, Missing row); sidebar hidden below 900 px, Ctrl+Shift+E shows it at 220 px with no horizontal overflow; with real CodeMirror, editing a chapter sends it as a buffer to `compile_project` without `write_file`; switching files keeps text and undo history. Not covered: native dialogs, Explorer drag-drop, Recycle Bin, file watcher, two-window lock (quickstart scenarios 2, 4, 5, 9 in the Tauri window). |

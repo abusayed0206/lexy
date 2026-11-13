@@ -12,12 +12,16 @@ vi.mock("./latex/fonts", async (importOriginal) => ({
 function makeActions(): RibbonActions {
   return {
     onNew: vi.fn(),
+    onNewProject: vi.fn(),
     onOpen: vi.fn(),
+    onHome: vi.fn(),
+    onRecent: vi.fn(),
     onSave: vi.fn(),
     onSaveAs: vi.fn(),
     onCompile: vi.fn(),
     onToggleLogs: vi.fn(),
     onToggleLive: vi.fn(),
+    onToggleFiles: vi.fn(),
     onFormat: vi.fn(),
     onList: vi.fn(),
     onHeading: vi.fn(),
@@ -35,12 +39,18 @@ const baseState: RibbonState = {
   fileName: "thesis.tex",
   path: "C:\\docs\\thesis.tex",
   unsaved: false,
+  isMain: true,
+  projectName: "Thesis",
+  mainName: "thesis.tex",
   statusLabel: "PDF ready",
   statusClass: "ready",
   statusDetail: null,
   compiling: false,
+  readOnly: false,
   logsOpen: false,
   liveEnabled: true,
+  filesOpen: true,
+  recent: [{ path: "D:\\Papers\\Survey", name: "Survey" }],
   settings: DEFAULT_SETTINGS,
   settingsManaged: true,
 };
@@ -112,7 +122,9 @@ describe("Ribbon header", () => {
 
   it("always shows the file name, status and Compile", async () => {
     const { user, actions } = setup({ unsaved: true, statusLabel: "Preview failed", statusClass: "error", statusDetail: "Line 3: Undefined control sequence." });
-    expect(screen.getByText("thesis.tex").parentElement).toHaveAttribute("title", "C:\\docs\\thesis.tex");
+    expect(screen.getByText("thesis.tex").parentElement).toHaveAttribute("title", "C:\\docs\\thesis.tex · Main: thesis.tex");
+    expect(screen.getByText("Thesis")).toBeInTheDocument();
+    expect(screen.getByText("Main")).toBeInTheDocument();
     expect(screen.getByRole("img", { name: "Unsaved changes" })).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent("Preview failed");
     expect(screen.getByRole("status")).toHaveAttribute("title", "Line 3: Undefined control sequence.");
@@ -125,6 +137,11 @@ describe("Ribbon header", () => {
     setup({ compiling: true });
     expect(screen.getByRole("button", { name: "Compiling" })).toBeDisabled();
   });
+
+  it("disables Compile in a read-only project", () => {
+    setup({ readOnly: true });
+    expect(screen.getByRole("button", { name: "Compile" })).toBeDisabled();
+  });
 });
 
 describe("Ribbon panels", () => {
@@ -134,8 +151,8 @@ describe("Ribbon panels", () => {
     const { user, actions } = setup();
     await user.click(tab("File"));
     for (const [name, shortcut, action] of [
-      ["New", "Ctrl+N", actions.onNew],
-      ["Open", "Ctrl+O", actions.onOpen],
+      ["New file", "Ctrl+N", actions.onNew],
+      ["Open folder…", "Ctrl+O", actions.onOpen],
       ["Save", "Ctrl+S", actions.onSave],
       ["Save as", "Ctrl+Shift+S", actions.onSaveAs],
     ] as const) {
@@ -144,6 +161,25 @@ describe("Ribbon panels", () => {
       await user.click(button);
       expect(action).toHaveBeenCalled();
     }
+    await user.click(screen.getByRole("button", { name: "New project" }));
+    expect(actions.onNewProject).toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Project Home" }));
+    expect(actions.onHome).toHaveBeenCalled();
+  });
+
+  it("File → Recent projects opens another project", async () => {
+    const { user, actions } = setup();
+    await user.click(tab("File"));
+    await user.click(screen.getByRole("button", { name: "Recent projects" }));
+    await user.click(screen.getByRole("menuitem", { name: /Survey/ }));
+    expect(actions.onRecent).toHaveBeenCalledWith("D:\\Papers\\Survey");
+  });
+
+  it("File tab disables writing commands in a read-only project", async () => {
+    const { user } = setup({ readOnly: true });
+    await user.click(tab("File"));
+    for (const name of ["New file", "Save", "Save as"]) expect(screen.getByRole("button", { name })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Open folder…" })).toBeEnabled();
   });
 
   it("Home tab formats text", async () => {
@@ -207,6 +243,11 @@ describe("Ribbon panels", () => {
     expect(actions.onToggleLogs).toHaveBeenCalled();
     await user.click(screen.getByRole("button", { name: "Compile now" }));
     expect(actions.onCompile).toHaveBeenCalled();
+    const files = screen.getByRole("button", { name: "Files" });
+    expect(files).toHaveAttribute("aria-pressed", "true");
+    expect(files).toHaveAttribute("title", "Files (Ctrl+Shift+E)");
+    await user.click(files);
+    expect(actions.onToggleFiles).toHaveBeenCalled();
   });
 
   it("every control in every panel has an accessible name", async () => {

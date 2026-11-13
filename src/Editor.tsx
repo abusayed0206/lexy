@@ -16,6 +16,19 @@ export type EditorHandle = {
   /** Replace the whole document (settings changes), keeping the cursor where it can stay. */
   replaceAll: (text: string) => void;
   focus: () => void;
+  /**
+   * Show another project file (research R7). The outgoing file's state (text, selection,
+   * undo history) is kept; `text` is only used the first time a file is shown.
+   */
+  switchTo: (path: string, text: string) => void;
+  /** Current text of any file the editor has shown (null if never shown). */
+  textOf: (path: string) => string | null;
+  /** Apply an edit to a file that may not be on screen; one undo step there. Returns the new text. */
+  applyTo: (path: string, edit: TextEdit) => string | null;
+  /** Drop a file's saved state (deleted, or reloaded from disk while not shown). */
+  forget: (path: string) => void;
+  /** Keep a file's state under its new path after a rename (folder renames move all files below). */
+  rename: (from: string, to: string) => void;
 };
 
 type Props = {
@@ -55,8 +68,13 @@ export function Editor({ value, onChange, label, handle }: Props) {
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
   const extensions = useRef<Extension[]>([]);
+  /** Saved states of files not on screen, by path. */
+  const states = useRef(new Map<string, EditorState>());
+  const currentPath = useRef<string | null>(null);
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
+
+  const stateOf = (path: string) => (path === currentPath.current ? view.current?.state : states.current.get(path));
 
   useImperativeHandle(
     handle,
@@ -86,6 +104,47 @@ export function Editor({ value, onChange, label, handle }: Props) {
         });
       },
       focus: () => view.current?.focus(),
+      switchTo: (path, text) => {
+        const editor = view.current;
+        if (!editor || path === currentPath.current) return;
+        if (currentPath.current !== null) states.current.set(currentPath.current, editor.state);
+        const saved = states.current.get(path);
+        states.current.delete(path);
+        currentPath.current = path;
+        editor.setState(saved ?? EditorState.create({ doc: text, extensions: extensions.current }));
+      },
+      textOf: (path) => stateOf(path)?.doc.toString() ?? null,
+      applyTo: (path, edit) => {
+        if (path === currentPath.current) {
+          const editor = view.current;
+          if (!editor) return null;
+          editor.dispatch({
+            changes: { from: edit.from, to: edit.to, insert: edit.insert },
+            selection: EditorSelection.single(edit.selectFrom, edit.selectTo),
+            userEvent: "input.lexy",
+          });
+          return editor.state.doc.toString();
+        }
+        const saved = states.current.get(path);
+        if (!saved) return null;
+        const next = saved.update({
+          changes: { from: edit.from, to: edit.to, insert: edit.insert },
+          selection: EditorSelection.single(edit.selectFrom, edit.selectTo),
+          userEvent: "input.lexy",
+        }).state;
+        states.current.set(path, next);
+        return next.doc.toString();
+      },
+      forget: (path) => {
+        states.current.delete(path);
+      },
+      rename: (from, to) => {
+        const lowerFrom = from.toLowerCase();
+        const moved = (path: string) =>
+          path.toLowerCase() === lowerFrom || path.toLowerCase().startsWith(`${lowerFrom}\\`) ? to + path.slice(from.length) : path;
+        states.current = new Map([...states.current].map(([path, state]) => [moved(path), state]));
+        if (currentPath.current !== null) currentPath.current = moved(currentPath.current);
+      },
     }),
     [],
   );

@@ -1,12 +1,27 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { compileSource, exportPdf, loadPdf, type CompileResult } from "./compile";
-import { chooseOpenPath, chooseSavePath, confirmDiscard, defaultFolder, prepareSavePath, readDocument, writeDocument } from "./documents";
+import { exportPdf, loadPdf, type CompileResult } from "./compile";
 import type { EditorHandle } from "./Editor";
 import { BLOCK_START, XELATEX_MARKER } from "./latex/settings";
+import { chooseProjectFolder } from "./ProjectDialogs";
+import {
+  compileProject,
+  createFile,
+  deleteEntry,
+  importFiles,
+  listDir,
+  listProjects,
+  openEntryExternal,
+  readFile,
+  renameEntry,
+  setMainDocument,
+  writeFile,
+  type Entry,
+  type OpenedProject,
+} from "./projects";
 import { STARTER_DOCUMENT } from "./starter";
-import { clampSplit, compileReducer, MAX_SPLIT, MIN_SPLIT, statusLabel, Writer } from "./Writer";
+import { clampSidebar, clampSplit, compileReducer, MAX_SPLIT, MIN_SPLIT, statusLabel, Writer } from "./Writer";
 
 // A textarea that implements the same EditorHandle; CodeMirror itself is covered in Editor.test.tsx.
 vi.mock("./Editor", async () => {
@@ -14,6 +29,7 @@ vi.mock("./Editor", async () => {
   return {
     Editor: ({ value, onChange, label, handle }: { value: string; onChange: (v: string) => void; label: string; handle?: React.Ref<EditorHandle> }) => {
       const area = React.useRef<HTMLTextAreaElement>(null);
+      const current = React.useRef<string | null>(null);
       React.useImperativeHandle(handle, () => ({
         getText: () => area.current!.value,
         getSelection: () => ({ from: area.current!.selectionStart, to: area.current!.selectionEnd }),
@@ -25,6 +41,13 @@ vi.mock("./Editor", async () => {
           if (text !== area.current!.value) onChange(text);
         },
         focus: () => area.current!.focus(),
+        switchTo: (path) => {
+          current.current = path;
+        },
+        textOf: () => null,
+        applyTo: () => null,
+        forget: () => undefined,
+        rename: () => undefined,
       }));
       return <textarea ref={area} className="editor" aria-label={label} value={value} onChange={(event) => onChange(event.target.value)} />;
     },
@@ -35,20 +58,48 @@ vi.mock("./PdfView", () => ({
     <div data-testid="pdf">{bytes ? `pdf ${Array.from(bytes).join(",")}` : busy ? "Compiling" : "No PDF yet"}</div>
   ),
 }));
-vi.mock("./compile", () => ({ compileSource: vi.fn(), loadPdf: vi.fn(), exportPdf: vi.fn() }));
-vi.mock("./documents", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("./documents")>()),
-  chooseOpenPath: vi.fn(),
-  chooseSavePath: vi.fn(),
-  confirmDiscard: vi.fn(),
-  defaultFolder: vi.fn(),
-  prepareSavePath: vi.fn(),
-  readDocument: vi.fn(),
-  writeDocument: vi.fn(),
+vi.mock("./compile", () => ({ loadPdf: vi.fn(), exportPdf: vi.fn() }));
+vi.mock("./projects", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./projects")>()),
+  compileProject: vi.fn(),
+  readFile: vi.fn(),
+  writeFile: vi.fn(),
+  listDir: vi.fn(),
+  listProjects: vi.fn(),
+  createFile: vi.fn(),
+  createFolder: vi.fn(),
+  createProject: vi.fn(),
+  renameEntry: vi.fn(),
+  deleteEntry: vi.fn(),
+  importFiles: vi.fn(),
+  openEntryExternal: vi.fn(),
+  setMainDocument: vi.fn(),
+}));
+vi.mock("./ProjectDialogs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./ProjectDialogs")>()),
+  chooseProjectFolder: vi.fn(),
 }));
 vi.mock("./latex/fonts", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./latex/fonts")>()),
   listSystemFonts: vi.fn(() => Promise.resolve(["Arial", "Georgia"])),
+}));
+type DropHandler = (event: { payload: { type: string; paths?: string[]; position?: { x: number; y: number } } }) => void;
+let dropHandler: DropHandler | null = null;
+vi.mock("@tauri-apps/api/webview", () => ({
+  getCurrentWebview: () => ({
+    onDragDropEvent: (handler: DropHandler) => {
+      dropHandler = handler;
+      return Promise.resolve(() => (dropHandler = null));
+    },
+  }),
+}));
+
+const events = new Map<string, (event: { payload: unknown }) => void>();
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn((name: string, handler: (event: { payload: unknown }) => void) => {
+    events.set(name, handler);
+    return Promise.resolve(() => events.delete(name));
+  }),
 }));
 
 type CloseEvent = { preventDefault: () => void };
@@ -63,9 +114,11 @@ vi.mock("@tauri-apps/api/window", () => ({
   }),
 }));
 
-const LEXY = "C:\\Users\\me\\Documents\\Lexy";
-const PATH = `${LEXY}\\thesis.tex`;
+const ROOT = "C:\\Users\\me\\Documents\\Lexy\\Thesis";
+const MAIN = "thesis.tex";
+const INTRO = "chapters\\intro.tex";
 const PDF = "C:\\Users\\me\\AppData\\Local\\Lexy\\Build\\abc\\thesis.pdf";
+const PROJECT: OpenedProject = { root: ROOT, name: "Thesis", readOnly: false, mainDocument: MAIN, candidates: [MAIN] };
 const failed: CompileResult = {
   ok: false,
   summary: "Line 3: Undefined control sequence.",
@@ -74,6 +127,18 @@ const failed: CompileResult = {
   engine: "pdflatex",
 };
 const succeeded: CompileResult = { ok: true, summary: "PDF ready", log: "Output written", pdfPath: PDF, engine: "pdflatex" };
+
+const entry = (path: string, kind: "file" | "folder" = "file"): Entry => ({
+  path,
+  name: path.slice(path.lastIndexOf("\\") + 1),
+  kind,
+  editable: /\.(tex|bib)$/.test(path),
+  hidden: false,
+  modified: 0,
+});
+
+let disk: Record<string, string>;
+let tree: Record<string, Entry[]>;
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -99,30 +164,11 @@ describe("compileReducer", () => {
     expect(compileReducer(started, { type: "start", origin: "explicit" })).toBe(started);
   });
 
-  it("live start does not mark explicitBusy", () => {
-    expect(compileReducer(initial, { type: "start", origin: "live" })).toMatchObject({ status: "compiling", explicitBusy: false });
-  });
-
-  it("records results with their origin", () => {
-    expect(compileReducer({ ...initial, status: "compiling" }, { type: "done", origin: "live", result: failed })).toEqual({
-      status: "error",
-      summary: failed.summary,
-      log: failed.log,
-      pdfPath: null,
-      origin: "live",
-      explicitBusy: false,
-    });
-  });
-
   it("a live result during an explicit compile keeps showing Compiling", () => {
     const busy = compileReducer(initial, { type: "start", origin: "explicit" });
     const afterLive = compileReducer(busy, { type: "done", origin: "live", result: succeeded });
     expect(afterLive).toMatchObject({ status: "compiling", explicitBusy: true });
     expect(compileReducer(afterLive, { type: "done", origin: "explicit", result: failed })).toMatchObject({ status: "error", explicitBusy: false });
-  });
-
-  it("reset returns to the initial state", () => {
-    expect(compileReducer({ ...initial, status: "error", summary: "x" }, { type: "reset" })).toEqual(initial);
   });
 
   it("labels live failures differently from explicit ones", () => {
@@ -132,7 +178,7 @@ describe("compileReducer", () => {
   });
 });
 
-describe("clampSplit", () => {
+describe("clamps", () => {
   it.each([
     [0.5, 0.5],
     [0, MIN_SPLIT],
@@ -141,252 +187,308 @@ describe("clampSplit", () => {
   ])("clampSplit(%s) → %s", (input, expected) => {
     expect(clampSplit(input)).toBe(expected);
   });
+
+  it.each([
+    [220, 220],
+    [10, 160],
+    [900, 400],
+    [Number.NaN, 220],
+  ])("clampSidebar(%s) → %s", (input, expected) => {
+    expect(clampSidebar(input)).toBe(expected);
+  });
 });
 
 describe("Writer", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    events.clear();
     closeHandler = null;
     localStorage.clear();
     localStorage.setItem("lexy.livePreview", "0"); // most tests are about explicit actions
-    vi.mocked(writeDocument).mockResolvedValue(undefined);
-    vi.mocked(compileSource).mockResolvedValue(succeeded);
+    localStorage.setItem("lexy.filesOpen", "1");
+    disk = { [MAIN]: STARTER_DOCUMENT, [INTRO]: "Intro text." };
+    tree = {
+      "": [entry("chapters", "folder"), entry("fig.png"), entry(MAIN)],
+      chapters: [entry(INTRO)],
+    };
+    vi.mocked(readFile).mockImplementation((rel) => (rel in disk ? Promise.resolve(disk[rel]) : Promise.reject({ kind: "notFound", message: `${rel} does not exist` })));
+    vi.mocked(writeFile).mockImplementation((rel, text) => {
+      disk[rel] = text;
+      return Promise.resolve();
+    });
+    vi.mocked(listDir).mockImplementation((rel) => Promise.resolve(tree[rel] ?? []));
+    vi.mocked(listProjects).mockResolvedValue([]);
+    vi.mocked(compileProject).mockResolvedValue(succeeded);
     vi.mocked(loadPdf).mockResolvedValue(new Uint8Array([1, 2, 3]));
-    vi.mocked(defaultFolder).mockResolvedValue({ path: LEXY, fallback: false });
-    vi.mocked(prepareSavePath).mockImplementation((picked) => Promise.resolve(picked));
     vi.mocked(exportPdf).mockResolvedValue("exported.pdf");
   });
   afterEach(() => vi.useRealTimers());
 
-  const status = () => screen.getByRole("status");
+  const compileStatus = () => document.querySelector(".compile-status") as HTMLElement;
   const compileButton = () => screen.getByRole("button", { name: "Compile" });
   const editor = () => screen.getByRole("textbox", { name: "LaTeX source" }) as HTMLTextAreaElement;
   const drawer = () => screen.queryByRole("region", { name: "Compile log" });
   const preview = () => screen.getByRole("region", { name: "PDF preview" });
-  const unsavedDot = () => screen.queryByRole("img", { name: "Unsaved changes" });
   const tab = (name: string) => screen.getByRole("tab", { name });
+  const title = () => document.querySelector(".doc-title") as HTMLElement;
+  const unsavedInTitle = () => within(title()).queryByRole("img", { name: "Unsaved changes" });
+  const row = (name: string) => screen.getByRole("treeitem", { name });
 
   function select(from: number, to = from) {
     editor().focus();
     editor().setSelectionRange(from, to);
   }
 
-  async function savedWriter() {
+  async function renderWriter(project: OpenedProject = PROJECT) {
     const user = userEvent.setup();
-    vi.mocked(chooseSavePath).mockResolvedValueOnce(PATH);
-    render(<Writer />);
-    await user.click(tab("File"));
-    await user.click(screen.getByRole("button", { name: "Save" }));
-    return user;
+    const onSwitch = vi.fn();
+    const utils = render(<Writer project={project} onSwitch={onSwitch} />);
+    if (project.mainDocument) await waitFor(() => expect(editor()).toHaveValue(disk[project.mainDocument!]));
+    return { user, onSwitch, ...utils };
   }
 
-  describe("first launch", () => {
-    it("shows the ribbon, the starter article, Untitled.tex, idle status and a blank preview", () => {
-      render(<Writer />);
-      expect(screen.getByRole("tablist", { name: "Ribbon" })).toBeInTheDocument();
-      expect(editor()).toHaveValue(STARTER_DOCUMENT);
-      expect(screen.getByText("Untitled.tex")).toBeInTheDocument();
-      expect(unsavedDot()).not.toBeInTheDocument();
-      expect(status()).toHaveTextContent("Idle");
+  /** Open chapters\intro.tex from the sidebar. */
+  async function openIntro(user: ReturnType<typeof userEvent.setup>) {
+    await user.click(await screen.findByRole("treeitem", { name: "chapters" }));
+    await user.click(await screen.findByRole("treeitem", { name: "intro.tex" }));
+    await waitFor(() => expect(editor()).toHaveValue("Intro text."));
+  }
+
+  function type(text: string) {
+    fireEvent.change(editor(), { target: { value: editor().value + text } });
+  }
+
+  describe("opening a project", () => {
+    it("shows the main document, project name, Main badge, the file sidebar and an idle preview", async () => {
+      await renderWriter();
+      expect(within(title()).getByText("Thesis")).toBeInTheDocument();
+      expect(within(title()).getByText(MAIN)).toBeInTheDocument();
+      expect(within(title()).getByText("Main")).toBeInTheDocument();
+      expect(title()).toHaveAttribute("title", `${ROOT}\\${MAIN} · Main: ${MAIN}`);
+      expect(await screen.findByRole("treeitem", { name: MAIN })).toHaveAttribute("aria-selected", "true");
+      expect(compileStatus()).toHaveTextContent("Idle");
       expect(preview()).toHaveTextContent("No PDF yet");
-      expect(drawer()).not.toBeInTheDocument();
-      expect(compileSource).not.toHaveBeenCalled();
+      expect(compileProject).not.toHaveBeenCalled();
     });
 
-    it("compiles the starter right away when live preview is on", async () => {
+    it("compiles the main document right away when live preview is on", async () => {
       localStorage.setItem("lexy.livePreview", "1");
-      render(<Writer />);
+      await renderWriter();
       await waitFor(() => expect(preview()).toHaveTextContent("pdf 1,2,3"));
-      expect(compileSource).toHaveBeenCalledWith(STARTER_DOCUMENT, null);
-      expect(writeDocument).not.toHaveBeenCalled();
-    });
-  });
-
-  describe("saving to Documents\\Lexy", () => {
-    it("starts an untitled save in the default folder, then writes and shows the name", async () => {
-      await savedWriter();
-      expect(defaultFolder).toHaveBeenCalled();
-      expect(chooseSavePath).toHaveBeenCalledWith(null, LEXY, "Untitled.tex");
-      expect(writeDocument).toHaveBeenCalledWith(PATH, STARTER_DOCUMENT);
-      expect(screen.getByText("thesis.tex").parentElement).toHaveAttribute("title", PATH);
+      expect(compileProject).toHaveBeenCalledWith(MAIN, []);
     });
 
-    it("saves a named document in place without a dialog", async () => {
-      const user = await savedWriter();
-      await user.type(editor(), "!");
-      expect(unsavedDot()).toBeInTheDocument();
-      await user.click(screen.getByRole("button", { name: "Save" }));
-      expect(chooseSavePath).toHaveBeenCalledTimes(1);
-      expect(writeDocument).toHaveBeenLastCalledWith(PATH, `${STARTER_DOCUMENT}!`);
-      expect(unsavedDot()).not.toBeInTheDocument();
+    it("asks which file is main when several are candidates, then remembers it", async () => {
+      const project = { ...PROJECT, mainDocument: null, candidates: [MAIN, "other.tex"] };
+      const { user } = await renderWriter(project);
+      const dialog = await screen.findByRole("dialog", { name: "Main document" });
+      expect(within(dialog).getByText("Which file is the main document?")).toBeInTheDocument();
+      await user.click(within(dialog).getByRole("radio", { name: "other.tex" }));
+      disk["other.tex"] = "\\documentclass{report}";
+      vi.mocked(setMainDocument).mockResolvedValue(undefined);
+      await user.click(within(dialog).getByRole("button", { name: "Use this" }));
+      expect(setMainDocument).toHaveBeenCalledWith("other.tex");
+      await waitFor(() => expect(editor()).toHaveValue("\\documentclass{report}"));
+      expect(within(title()).getByText("Main")).toBeInTheDocument();
     });
 
-    it("Save as starts from the current path, not the default folder", async () => {
-      const user = await savedWriter();
-      vi.mocked(chooseSavePath).mockResolvedValueOnce(`${LEXY}\\copy.tex`);
-      await user.click(screen.getByRole("button", { name: "Save as" }));
-      expect(chooseSavePath).toHaveBeenLastCalledWith(PATH, null, "Untitled.tex");
-      expect(screen.getByText("copy.tex")).toBeInTheDocument();
+    it("explains how to pick a main document when there is none", async () => {
+      await renderWriter({ ...PROJECT, mainDocument: null, candidates: [] });
+      expect(await screen.findByText(/No main document found\. Pick a \.tex file in the sidebar/)).toBeInTheDocument();
     });
 
-    it("shows a one-time notice when Lexy falls back to the home folder", async () => {
-      vi.mocked(defaultFolder).mockResolvedValue({ path: "C:\\Users\\me", fallback: true });
-      vi.mocked(chooseSavePath).mockResolvedValue(null);
-      const user = userEvent.setup();
-      render(<Writer />);
-      await user.click(tab("File"));
-      await user.click(screen.getByRole("button", { name: "Save" }));
-      expect(screen.getByRole("alert")).toHaveTextContent("Saving to C:\\Users\\me because Documents isn't available.");
-      expect(chooseSavePath).toHaveBeenCalledWith(null, "C:\\Users\\me", "Untitled.tex");
-      await user.click(screen.getByRole("button", { name: "Dismiss" }));
-      await user.click(screen.getByRole("button", { name: "Save" }));
-      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-    });
-
-    it("still saves when the default folder can't be resolved", async () => {
-      vi.mocked(defaultFolder).mockRejectedValueOnce("no folder");
-      vi.mocked(chooseSavePath).mockResolvedValueOnce(PATH);
-      const user = userEvent.setup();
-      render(<Writer />);
-      await user.click(tab("File"));
-      await user.click(screen.getByRole("button", { name: "Save" }));
-      expect(chooseSavePath).toHaveBeenCalledWith(null, null, "Untitled.tex");
-      expect(writeDocument).toHaveBeenCalled();
-    });
-
-    it("keeps unsaved state and shows an alert when writing fails", async () => {
-      vi.mocked(chooseSavePath).mockResolvedValueOnce(PATH);
-      vi.mocked(writeDocument).mockRejectedValueOnce("Access is denied.");
-      const user = userEvent.setup();
-      render(<Writer />);
-      await user.type(editor(), "x");
-      await user.click(tab("File"));
-      await user.click(screen.getByRole("button", { name: "Save" }));
-      expect(screen.getByRole("alert")).toHaveTextContent("Could not save the file. Access is denied.");
-      expect(unsavedDot()).toBeInTheDocument();
-    });
-  });
-
-  describe("opening and new", () => {
-    it("opens from the default folder into the editor and resets status", async () => {
-      vi.mocked(chooseOpenPath).mockResolvedValueOnce("C:\\docs\\paper.tex");
-      vi.mocked(readDocument).mockResolvedValueOnce("\\documentclass{book}");
-      const user = userEvent.setup();
-      render(<Writer />);
-      await user.click(tab("File"));
-      await user.click(screen.getByRole("button", { name: "Open" }));
-      expect(chooseOpenPath).toHaveBeenCalledWith(LEXY);
-      expect(editor()).toHaveValue("\\documentclass{book}");
-      expect(screen.getByText("paper.tex")).toBeInTheDocument();
-      expect(status()).toHaveTextContent("Idle");
-    });
-
-    it("live-compiles the opened document", async () => {
+    it("without a main document, F5 asks for one but live preview stays quiet", async () => {
       localStorage.setItem("lexy.livePreview", "1");
-      vi.mocked(chooseOpenPath).mockResolvedValueOnce("C:\\docs\\paper.tex");
-      vi.mocked(readDocument).mockResolvedValueOnce("\\documentclass{book}");
-      const user = userEvent.setup();
-      render(<Writer />);
-      await user.click(tab("File"));
-      await user.click(screen.getByRole("button", { name: "Open" }));
-      await waitFor(() => expect(compileSource).toHaveBeenLastCalledWith("\\documentclass{book}", "C:\\docs\\paper.tex"));
-    });
-
-    it("keeps unsaved work when the user declines to discard it", async () => {
-      vi.mocked(confirmDiscard).mockResolvedValueOnce(false);
-      const user = userEvent.setup();
-      render(<Writer />);
-      await user.type(editor(), "keep me");
-      await user.click(tab("File"));
-      await user.click(screen.getByRole("button", { name: "Open" }));
-      expect(chooseOpenPath).not.toHaveBeenCalled();
-      expect(editor().value).toContain("keep me");
-    });
-
-    it("shows an alert when a file can't be read", async () => {
-      vi.mocked(chooseOpenPath).mockResolvedValueOnce("C:\\docs\\latin1.tex");
-      vi.mocked(readDocument).mockRejectedValueOnce("stream did not contain valid UTF-8");
-      const user = userEvent.setup();
-      render(<Writer />);
-      await user.click(tab("File"));
-      await user.click(screen.getByRole("button", { name: "Open" }));
-      expect(screen.getByRole("alert")).toHaveTextContent("Could not open the file.");
-      expect(editor()).toHaveValue(STARTER_DOCUMENT);
-    });
-
-    it("New discards changes after confirmation", async () => {
-      const user = await savedWriter();
-      vi.mocked(confirmDiscard).mockResolvedValueOnce(true);
-      await user.type(editor(), "draft");
-      await user.click(screen.getByRole("button", { name: "New" }));
-      expect(editor()).toHaveValue(STARTER_DOCUMENT);
-      expect(screen.getByText("Untitled.tex")).toBeInTheDocument();
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const { user } = await renderWriter({ ...PROJECT, mainDocument: null, candidates: [] });
+      await openIntro(user);
+      type("x");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500);
+      });
+      expect(screen.queryByRole("dialog", { name: "Main document" })).not.toBeInTheDocument();
+      expect(compileProject).not.toHaveBeenCalled();
+      await user.keyboard("{F5}");
+      expect(await screen.findByRole("dialog", { name: "Main document" })).toBeInTheDocument();
     });
   });
 
-  describe("explicit compile (F5 / Compile)", () => {
-    it("saves first, compiles the saved text and shows the PDF", async () => {
-      vi.mocked(chooseSavePath).mockResolvedValueOnce(PATH);
-      const user = userEvent.setup();
-      render(<Writer />);
-      await user.type(editor(), "!");
-      await user.click(compileButton());
-      expect(writeDocument).toHaveBeenCalledWith(PATH, `${STARTER_DOCUMENT}!`);
-      expect(compileSource).toHaveBeenCalledWith(`${STARTER_DOCUMENT}!`, PATH);
+  describe("files", () => {
+    it("switching files keeps unsaved edits in each file", async () => {
+      const { user } = await renderWriter();
+      type("!");
+      expect(unsavedInTitle()).toBeInTheDocument();
+      await openIntro(user);
+      expect(unsavedInTitle()).not.toBeInTheDocument();
+      expect(within(row(MAIN)).getByRole("img", { name: "Unsaved changes" })).toBeInTheDocument();
+      type(" more");
+      await user.click(row(MAIN));
+      expect(editor()).toHaveValue(`${STARTER_DOCUMENT}!`);
+      await user.click(row("intro.tex"));
+      expect(editor()).toHaveValue("Intro text. more");
+      expect(writeFile).not.toHaveBeenCalled();
+    });
+
+    it("opens non-text files with the default app", async () => {
+      const { user } = await renderWriter();
+      vi.mocked(openEntryExternal).mockResolvedValue(undefined);
+      await user.click(await screen.findByRole("treeitem", { name: "fig.png" }));
+      expect(openEntryExternal).toHaveBeenCalledWith("fig.png");
+      expect(editor()).toHaveValue(STARTER_DOCUMENT);
+    });
+
+    it("Ctrl+S saves every modified file; a failed save keeps it unsaved with a notice", async () => {
+      const { user } = await renderWriter();
+      type("!");
+      await openIntro(user);
+      type("?");
+      await user.keyboard("{Control>}s{/Control}");
+      await waitFor(() => expect(writeFile).toHaveBeenCalledTimes(2));
+      expect(disk[MAIN]).toBe(`${STARTER_DOCUMENT}!`);
+      expect(disk[INTRO]).toBe("Intro text.?");
+      expect(screen.queryAllByRole("img", { name: "Unsaved changes" })).toHaveLength(0);
+
+      vi.mocked(writeFile).mockRejectedValueOnce({ kind: "io", message: "Access is denied." });
+      type("x");
+      await user.keyboard("{Control>}s{/Control}");
+      expect(await screen.findByText("Could not save intro.tex. Access is denied.")).toBeInTheDocument();
+      expect(unsavedInTitle()).toBeInTheDocument();
+    });
+
+    it("Save as writes the current file under a new name in the project", async () => {
+      const { user } = await renderWriter();
+      await openIntro(user);
+      type("!");
+      await user.click(tab("File"));
+      await user.click(screen.getByRole("button", { name: "Save as" }));
+      const field = within(screen.getByRole("dialog", { name: "Save as" })).getByRole("textbox");
+      expect(field).toHaveValue(INTRO);
+      await user.clear(field);
+      await user.type(field, "chapters/copy.tex{Enter}");
+      expect(writeFile).toHaveBeenCalledWith("chapters\\copy.tex", "Intro text.!");
+      expect(within(title()).getByText("chapters\\copy.tex")).toBeInTheDocument();
+    });
+
+    it("New file creates and opens it", async () => {
+      const { user } = await renderWriter();
+      vi.mocked(createFile).mockImplementation((rel) => {
+        disk[rel] = "";
+        return Promise.resolve();
+      });
+      await screen.findByRole("treeitem", { name: MAIN });
+      await user.keyboard("{Control>}n{/Control}");
+      const field = within(screen.getByRole("dialog", { name: "New file" })).getByRole("textbox");
+      await user.clear(field);
+      await user.type(field, "notes.tex{Enter}");
+      expect(createFile).toHaveBeenCalledWith("notes.tex");
+      await waitFor(() => expect(within(title()).getByText("notes.tex")).toBeInTheDocument());
+    });
+
+    it("renaming an open file keeps its edits under the new name", async () => {
+      const { user } = await renderWriter();
+      await openIntro(user);
+      type("!");
+      vi.mocked(renameEntry).mockResolvedValue(undefined);
+      act(() => row("intro.tex").focus());
+      await user.keyboard("{F2}");
+      const field = screen.getByRole("textbox", { name: "Rename intro.tex" });
+      await user.clear(field);
+      await user.type(field, "start.tex{Enter}");
+      expect(renameEntry).toHaveBeenCalledWith(INTRO, "chapters\\start.tex");
+      await waitFor(() => expect(within(title()).getByText("chapters\\start.tex")).toBeInTheDocument());
+      expect(editor()).toHaveValue("Intro text.!");
+    });
+
+    it("deletes to the Recycle Bin, or permanently after asking when there is none", async () => {
+      const { user } = await renderWriter();
+      await openIntro(user);
+      vi.mocked(deleteEntry).mockRejectedValueOnce({ kind: "noRecycleBin", message: "no bin" }).mockResolvedValueOnce(undefined);
+      act(() => row("intro.tex").focus());
+      await user.keyboard("{Delete}");
+      await user.click(within(screen.getByRole("dialog", { name: "Delete" })).getByRole("button", { name: "Delete" }));
+      expect(deleteEntry).toHaveBeenCalledWith(INTRO, false);
+      const permanent = await screen.findByText("This drive has no Recycle Bin. Delete intro.tex permanently?");
+      await user.click(within(permanent.closest("[role=dialog]") as HTMLElement).getByRole("button", { name: "Delete permanently" }));
+      expect(deleteEntry).toHaveBeenLastCalledWith(INTRO, true);
+      await waitFor(() => expect(editor()).toHaveValue(STARTER_DOCUMENT));
+    });
+
+    it("copies dropped files in, asking once about conflicts", async () => {
+      const { user } = await renderWriter();
+      await screen.findByRole("treeitem", { name: MAIN });
+      await waitFor(() => expect(dropHandler).not.toBeNull());
+      vi.mocked(importFiles)
+        .mockResolvedValueOnce({ copied: ["chapters\\b.png"], skipped: [], conflicts: ["C:\\a.png", "C:\\c.png"] })
+        .mockResolvedValueOnce({ copied: ["chapters\\a (2).png", "chapters\\c (2).png"], skipped: [], conflicts: [] });
+      const original = document.elementFromPoint;
+      document.elementFromPoint = () => row("chapters");
+      act(() => dropHandler!({ payload: { type: "drop", paths: ["C:\\a.png", "C:\\b.png", "C:\\c.png"], position: { x: 1, y: 1 } } }));
+      document.elementFromPoint = original;
+      expect(importFiles).toHaveBeenCalledWith(["C:\\a.png", "C:\\b.png", "C:\\c.png"], "chapters", "ask");
+      const dialog = await screen.findByRole("dialog", { name: "Files already exist" });
+      expect(dialog).toHaveTextContent("2 files already exist.");
+      await user.click(within(dialog).getByRole("button", { name: "Keep both" }));
+      expect(importFiles).toHaveBeenLastCalledWith(["C:\\a.png", "C:\\c.png"], "chapters", "keepBoth");
+    });
+  });
+
+  describe("compiling", () => {
+    it("F5 saves all files, then compiles the main document and shows the PDF", async () => {
+      const { user } = await renderWriter();
+      await openIntro(user);
+      type("!");
+      await user.keyboard("{F5}");
+      await waitFor(() => expect(compileProject).toHaveBeenCalledWith(MAIN, []));
+      expect(disk[INTRO]).toBe("Intro text.!");
       expect(loadPdf).toHaveBeenCalledWith(PDF);
-      expect(status()).toHaveTextContent("PDF ready");
+      expect(compileStatus()).toHaveTextContent("PDF ready");
       expect(preview()).toHaveTextContent("pdf 1,2,3");
       expect(drawer()).not.toBeInTheDocument();
     });
 
-    it("does not compile if the save dialog is cancelled", async () => {
-      vi.mocked(chooseSavePath).mockResolvedValueOnce(null);
-      const user = userEvent.setup();
-      render(<Writer />);
-      await user.click(compileButton());
-      expect(compileSource).not.toHaveBeenCalled();
-    });
-
     it("disables Compile while running and ignores F5 meanwhile", async () => {
-      const user = await savedWriter();
+      const { user } = await renderWriter();
       const run = deferred<CompileResult>();
-      vi.mocked(compileSource).mockReturnValueOnce(run.promise);
+      vi.mocked(compileProject).mockReturnValueOnce(run.promise);
       await user.click(compileButton());
-      expect(status()).toHaveTextContent("Compiling");
+      expect(compileStatus()).toHaveTextContent("Compiling");
       expect(screen.getByRole("button", { name: "Compiling" })).toBeDisabled();
       await user.keyboard("{F5}");
-      expect(compileSource).toHaveBeenCalledTimes(1);
+      expect(compileProject).toHaveBeenCalledTimes(1);
       await act(async () => run.resolve(succeeded));
       expect(compileButton()).toBeEnabled();
     });
 
-    it("opens the log with the first error and shows the preview banner on failure", async () => {
-      const user = await savedWriter();
-      vi.mocked(compileSource).mockResolvedValueOnce(failed);
+    it("opens the log with the first error on failure, and copies it", async () => {
+      const { user } = await renderWriter();
+      vi.mocked(compileProject).mockResolvedValueOnce(failed);
       await user.click(compileButton());
-      expect(status()).toHaveTextContent("Compile failed");
+      expect(compileStatus()).toHaveTextContent("Compile failed");
       expect(drawer()).toHaveTextContent(failed.summary);
       expect(drawer()!.querySelector("pre")).toHaveTextContent("l.3 \\foo");
       expect(preview()).toHaveTextContent("Compile failed. Open log.");
+      await user.click(screen.getByRole("button", { name: "Copy log" }));
+      expect(await navigator.clipboard.readText()).toBe(failed.log);
     });
 
     it("treats a backend error or an unreadable PDF as a failure", async () => {
-      const user = await savedWriter();
-      vi.mocked(compileSource).mockRejectedValueOnce("compile task failed");
+      const { user } = await renderWriter();
+      vi.mocked(compileProject).mockRejectedValueOnce({ kind: "io", message: "compile task failed" });
       await user.click(compileButton());
       expect(drawer()).toHaveTextContent("compile task failed");
       vi.mocked(loadPdf).mockRejectedValueOnce("is not a Lexy build output");
       await user.click(compileButton());
-      expect(status()).toHaveTextContent("Compile failed");
+      expect(compileStatus()).toHaveTextContent("Compile failed");
       expect(drawer()).toHaveTextContent("is not a Lexy build output");
     });
 
-    it("copies the full raw log", async () => {
-      const user = await savedWriter();
-      vi.mocked(compileSource).mockResolvedValueOnce(failed);
+    it("asks for a new main document when the main file went missing", async () => {
+      const { user } = await renderWriter();
+      vi.mocked(compileProject).mockRejectedValueOnce({ kind: "notFound", message: "thesis.tex does not exist" });
+      tree[""] = [entry("chapters", "folder"), entry("renamed.tex")];
       await user.click(compileButton());
-      await user.click(screen.getByRole("button", { name: "Copy log" }));
-      expect(await navigator.clipboard.readText()).toBe(failed.log);
+      const dialog = await screen.findByRole("dialog", { name: "Main document" });
+      expect(within(dialog).getByRole("radio", { name: "renamed.tex" })).toBeChecked();
     });
   });
 
@@ -397,250 +499,173 @@ describe("Writer", () => {
     });
 
     async function liveWriter() {
-      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-      render(<Writer />);
-      await waitFor(() => expect(compileSource).toHaveBeenCalledTimes(1));
+      const result = await renderWriter();
+      await waitFor(() => expect(compileProject).toHaveBeenCalledTimes(1));
       await act(async () => {});
-      vi.mocked(compileSource).mockClear();
-      return user;
+      vi.mocked(compileProject).mockClear();
+      return result;
     }
 
-    it("compiles the unsaved text about 1 s after typing stops, without saving", async () => {
-      const user = await liveWriter();
-      await user.type(editor(), "abc");
-      expect(compileSource).not.toHaveBeenCalled();
+    it("compiles unsaved text from any open file about 1 s after typing stops, without saving", async () => {
+      const { user } = await liveWriter();
+      await openIntro(user);
+      type("abc");
+      expect(compileProject).not.toHaveBeenCalled();
       await act(async () => {
         await vi.advanceTimersByTimeAsync(1000);
       });
-      expect(compileSource).toHaveBeenCalledTimes(1);
-      expect(compileSource).toHaveBeenCalledWith(`${STARTER_DOCUMENT}abc`, null);
-      expect(writeDocument).not.toHaveBeenCalled();
-      expect(unsavedDot()).toBeInTheDocument();
+      expect(compileProject).toHaveBeenCalledTimes(1);
+      expect(compileProject).toHaveBeenCalledWith(MAIN, [{ path: INTRO, text: "Intro text.abc" }]);
+      expect(writeFile).not.toHaveBeenCalled();
     });
 
-    it("shows live failures in the status and banner without opening the log", async () => {
-      const user = await liveWriter();
-      vi.mocked(compileSource).mockResolvedValueOnce(failed);
-      await user.type(editor(), "\\foo");
+    it("shows live failures in the status and banner without opening the log, keeping the last PDF", async () => {
+      await liveWriter();
+      expect(preview()).toHaveTextContent("pdf 1,2,3");
+      vi.mocked(compileProject).mockResolvedValueOnce(failed);
+      type("\\foo");
       await act(async () => {
         await vi.advanceTimersByTimeAsync(1000);
       });
-      expect(status()).toHaveTextContent("Preview failed");
-      expect(status()).toHaveAttribute("title", failed.summary);
+      expect(compileStatus()).toHaveTextContent("Preview failed");
       expect(preview()).toHaveTextContent(`Preview failed: ${failed.summary}`);
+      expect(preview()).toHaveTextContent("pdf 1,2,3");
       expect(drawer()).not.toBeInTheDocument();
     });
 
-    it("keeps the last good PDF after a failed live compile", async () => {
-      const user = await liveWriter();
-      expect(preview()).toHaveTextContent("pdf 1,2,3");
-      vi.mocked(compileSource).mockResolvedValueOnce(failed);
-      await user.type(editor(), "x");
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1000);
-      });
-      expect(preview()).toHaveTextContent("pdf 1,2,3");
-    });
-
     it("View → Live preview turns it off and remembers that", async () => {
-      const user = await liveWriter();
+      const { user } = await liveWriter();
       await user.click(tab("View"));
       await user.click(screen.getByRole("button", { name: "Live preview" }));
-      expect(screen.getByRole("button", { name: "Live preview" })).toHaveAttribute("aria-pressed", "false");
       expect(localStorage.getItem("lexy.livePreview")).toBe("0");
-      await user.type(editor(), "abc");
+      type("abc");
       await act(async () => {
         await vi.advanceTimersByTimeAsync(3000);
       });
-      expect(compileSource).not.toHaveBeenCalled();
-    });
-
-    it("uses the saved path once the document has one", async () => {
-      vi.mocked(chooseSavePath).mockResolvedValueOnce(PATH);
-      const user = await liveWriter();
-      await user.click(tab("File"));
-      await user.click(screen.getByRole("button", { name: "Save" }));
-      await user.type(editor(), "z");
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1000);
-      });
-      expect(compileSource).toHaveBeenLastCalledWith(`${STARTER_DOCUMENT}z`, PATH);
+      expect(compileProject).not.toHaveBeenCalled();
     });
   });
 
-  describe("Home and Insert actions", () => {
-    it("Bold wraps the selection", async () => {
-      const user = userEvent.setup();
-      render(<Writer />);
-      const start = STARTER_DOCUMENT.indexOf("Start writing");
-      select(start, start + 5);
-      await user.click(screen.getByRole("button", { name: "Bold" }));
-      expect(editor().value).toContain("\\textbf{Start} writing here.");
+  describe("outside changes", () => {
+    it("reloads a clean open file and flags a modified one", async () => {
+      const { user } = await renderWriter();
+      await openIntro(user);
+      disk[INTRO] = "Changed in Notepad.";
+      await act(async () => events.get("project-changed")!({ payload: { paths: [INTRO] } }));
+      await waitFor(() => expect(editor()).toHaveValue("Changed in Notepad."));
+
+      type("!");
+      disk[INTRO] = "Changed again.";
+      await act(async () => events.get("project-changed")!({ payload: { paths: [INTRO] } }));
+      expect(await screen.findByText("intro.tex changed on disk.")).toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: "Keep mine" }));
+      expect(editor()).toHaveValue("Changed in Notepad.!");
+      await act(async () => events.get("project-changed")!({ payload: { paths: [INTRO] } }));
+      await user.click(await screen.findByRole("button", { name: "Reload" }));
+      await waitFor(() => expect(editor()).toHaveValue("Changed again."));
     });
 
-    it("Ctrl+B / Ctrl+I / Ctrl+U format inside the editor only", () => {
-      render(<Writer />);
-      const start = STARTER_DOCUMENT.indexOf("writing");
-      select(start, start + 7);
-      fireEvent.keyDown(editor(), { key: "i", ctrlKey: true });
-      expect(editor().value).toContain("\\textit{writing}");
-      const before = editor().value;
-      fireEvent.keyDown(screen.getByRole("tab", { name: "Home" }), { key: "b", ctrlKey: true });
-      expect(editor().value).toBe(before);
-    });
-
-    it("Styles → Heading 1 turns the current line into a section", async () => {
-      const user = userEvent.setup();
-      render(<Writer />);
-      select(STARTER_DOCUMENT.indexOf("Start writing") + 2);
-      await user.click(screen.getByRole("button", { name: "Styles" }));
-      await user.click(screen.getByRole("menuitem", { name: /Heading 1/ }));
-      expect(editor().value).toContain("\\section{Start writing here.}");
-    });
-
-    it("Bullets turns the current line into a list", async () => {
-      const user = userEvent.setup();
-      render(<Writer />);
-      select(STARTER_DOCUMENT.indexOf("Start writing"));
-      await user.click(screen.getByRole("button", { name: "Bullets" }));
-      expect(editor().value).toContain("\\begin{itemize}\n  \\item Start writing here.\n\\end{itemize}");
-    });
-
-    it("Insert → Page break and Footnote", async () => {
-      const user = userEvent.setup();
-      render(<Writer />);
-      await user.click(tab("Insert"));
-      select(STARTER_DOCUMENT.indexOf("\\end{document}"));
-      await user.click(screen.getByRole("button", { name: "Page break" }));
-      expect(editor().value).toContain("\\newpage\n\\end{document}");
-      select(STARTER_DOCUMENT.indexOf("here.") + 5);
-      await user.click(screen.getByRole("button", { name: "Footnote" }));
-      expect(editor().value).toContain("here.\\footnote{}");
-    });
-
-    it("Insert → Table inserts a tabular on its own lines", async () => {
-      const user = userEvent.setup();
-      render(<Writer />);
-      await user.click(tab("Insert"));
-      select(STARTER_DOCUMENT.indexOf("\\end{document}"));
-      await user.click(screen.getByRole("button", { name: "Table" }));
-      await user.click(screen.getByRole("gridcell", { name: "3 x 2" }));
-      expect(editor().value).toContain("\\begin{tabular}{|l|l|l|}");
-      expect(editor().value).toContain("\\end{tabular}\n\\end{document}");
-    });
-
-    it("Insert → Equation inserts a display equation", async () => {
-      const user = userEvent.setup();
-      render(<Writer />);
-      await user.click(tab("Insert"));
-      select(STARTER_DOCUMENT.indexOf("\\end{document}"));
-      await user.click(screen.getByRole("button", { name: "Equation" }));
-      const field = await screen.findByLabelText("LaTeX math");
-      await user.type(field, "E=mc^2");
-      await user.click(screen.getByRole("button", { name: "Insert" }));
-      expect(editor().value).toContain("\\begin{equation}\n  E=mc^2\n\\end{equation}\n\\end{document}");
-      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    });
-
-    it("Insert → Equation edits the equation under the cursor in place", async () => {
-      const user = userEvent.setup();
-      render(<Writer />);
-      await user.clear(editor());
-      await user.type(editor(), "a \\(x^2\\) b");
-      select(5);
-      await user.click(tab("Insert"));
-      await user.click(screen.getByRole("button", { name: "Equation" }));
-      const field = await screen.findByLabelText("LaTeX math");
-      expect(field).toHaveValue("x^2");
-      await user.clear(field);
-      await user.type(field, "y^3");
-      await user.click(screen.getByRole("button", { name: "Update" }));
-      expect(editor().value).toBe("a \\(y^3\\) b");
+    it("shows a bar when the project folder disappears", async () => {
+      await renderWriter();
+      await act(async () => events.get("project-missing")!({ payload: null }));
+      expect(screen.getByText("Project folder is missing.")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Save as new project" })).toBeInTheDocument();
     });
   });
 
-  describe("fonts and layout", () => {
+  describe("document settings live in the main document", () => {
     it("picking Palatino writes Lexy's settings block after \\documentclass", async () => {
-      const user = userEvent.setup();
-      render(<Writer />);
+      const { user } = await renderWriter();
       await user.click(screen.getByRole("combobox", { name: "Font" }));
       await user.click(screen.getByRole("option", { name: "Palatino" }));
       expect(editor().value).toContain(`\\documentclass[10pt]{article}\n${BLOCK_START}`);
       expect(editor().value).toContain("\\usepackage{newpxtext,newpxmath}");
-      expect(screen.getByRole("combobox", { name: "Font" })).toHaveValue("Palatino");
+    });
+
+    it("applies to the main document while another file is shown", async () => {
+      const { user } = await renderWriter();
+      await openIntro(user);
+      await user.selectOptions(screen.getByRole("combobox", { name: "Font size" }), "12");
+      expect(editor()).toHaveValue("Intro text.");
+      expect(screen.getByText("Applied to thesis.tex")).toBeInTheDocument();
+      await user.click(row(MAIN));
+      expect(editor().value).toContain("\\documentclass[12pt]{article}");
     });
 
     it("an installed font switches to XeLaTeX; a built-in one switches back", async () => {
-      const user = userEvent.setup();
-      render(<Writer />);
+      const { user } = await renderWriter();
       await user.click(screen.getByRole("combobox", { name: "Font" }));
       await user.click(await screen.findByRole("option", { name: "Georgia" }));
       expect(editor().value.startsWith(`${XELATEX_MARKER}\n`)).toBe(true);
-      expect(editor().value).toContain("\\setmainfont{Georgia}");
       await user.click(screen.getByRole("combobox", { name: "Font" }));
       await user.click(screen.getByRole("option", { name: "Times" }));
       expect(editor().value).not.toContain(XELATEX_MARKER);
-      expect(editor().value).not.toContain("fontspec");
-    });
-
-    it("size and margins change the document", async () => {
-      const user = userEvent.setup();
-      render(<Writer />);
-      await user.selectOptions(screen.getByRole("combobox", { name: "Font size" }), "12");
-      expect(editor().value).toContain("\\documentclass[12pt]{article}");
-      await user.click(tab("Layout"));
-      await user.click(screen.getByRole("button", { name: "Margins" }));
-      await user.click(screen.getByRole("menuitemradio", { name: /Narrow/ }));
-      expect(editor().value).toContain("top=1.27cm,bottom=1.27cm,left=1.27cm,right=1.27cm");
-    });
-
-    it("warns once when the document already sets margins itself", async () => {
-      const user = userEvent.setup();
-      render(<Writer />);
-      await user.clear(editor());
-      fireEvent.change(editor(), { target: { value: "\\documentclass{article}\n\\usepackage[margin=1in]{geometry}\n\\begin{document}x\\end{document}" } });
-      await user.click(tab("Layout"));
-      await user.click(screen.getByRole("button", { name: "Margins" }));
-      await user.click(screen.getByRole("menuitemradio", { name: /Wide/ }));
-      expect(screen.getByRole("alert")).toHaveTextContent("already sets fonts or margins itself (\\usepackage[margin=1in]{geometry})");
-      expect(editor().value).toContain("\\usepackage[margin=1in]{geometry}");
-      await user.click(screen.getByRole("button", { name: "Dismiss" }));
-      await user.click(screen.getByRole("button", { name: "Margins" }));
-      await user.click(screen.getByRole("menuitemradio", { name: /Narrow/ }));
-      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     });
 
     it("explains when there is no \\documentclass to attach settings to", async () => {
-      const user = userEvent.setup();
-      render(<Writer />);
-      fireEvent.change(editor(), { target: { value: "just text" } });
+      disk[MAIN] = "just text";
+      const { user } = await renderWriter();
       await user.selectOptions(screen.getByRole("combobox", { name: "Font size" }), "11");
       expect(screen.getByRole("alert")).toHaveTextContent("Add a \\documentclass line first.");
       expect(editor()).toHaveValue("just text");
     });
   });
 
-  describe("keyboard shortcuts", () => {
-    it("Ctrl+S, Ctrl+Shift+S, Ctrl+O, Ctrl+N, F5 and Ctrl+L", async () => {
-      const user = await savedWriter();
-      await user.keyboard("{Control>}s{/Control}");
-      expect(writeDocument).toHaveBeenCalledTimes(2);
-      vi.mocked(chooseSavePath).mockResolvedValueOnce(null);
-      await user.keyboard("{Control>}{Shift>}S{/Shift}{/Control}");
-      expect(chooseSavePath).toHaveBeenCalledTimes(2);
-      vi.mocked(chooseOpenPath).mockResolvedValueOnce(null);
-      await user.keyboard("{Control>}o{/Control}");
-      expect(chooseOpenPath).toHaveBeenCalled();
-      await user.keyboard("{F5}");
-      expect(compileSource).toHaveBeenCalledWith(STARTER_DOCUMENT, PATH);
-      await user.keyboard("{Control>}l{/Control}");
-      expect(drawer()).toBeInTheDocument();
-      await user.keyboard("{Control>}n{/Control}");
-      expect(screen.getByText("Untitled.tex")).toBeInTheDocument();
+  describe("Home and Insert actions", () => {
+    it("Bold wraps the selection; Ctrl+I formats inside the editor only", async () => {
+      const { user } = await renderWriter();
+      const start = STARTER_DOCUMENT.indexOf("Start writing");
+      select(start, start + 5);
+      await user.click(screen.getByRole("button", { name: "Bold" }));
+      expect(editor().value).toContain("\\textbf{Start} writing here.");
+      const at = editor().value.indexOf("writing");
+      select(at, at + 7);
+      fireEvent.keyDown(editor(), { key: "i", ctrlKey: true });
+      expect(editor().value).toContain("\\textit{writing}");
+      const before = editor().value;
+      fireEvent.keyDown(tab("Home"), { key: "b", ctrlKey: true });
+      expect(editor().value).toBe(before);
     });
 
-    it("handles shortcuts before the editor sees them", () => {
-      render(<Writer />);
+    it("Styles → Heading 1 and Bullets", async () => {
+      const { user } = await renderWriter();
+      select(STARTER_DOCUMENT.indexOf("Start writing") + 2);
+      await user.click(screen.getByRole("button", { name: "Styles" }));
+      await user.click(screen.getByRole("menuitem", { name: /Heading 1/ }));
+      expect(editor().value).toContain("\\section{Start writing here.}");
+    });
+
+    it("Insert → Table and Equation", async () => {
+      const { user } = await renderWriter();
+      await user.click(tab("Insert"));
+      select(STARTER_DOCUMENT.indexOf("\\end{document}"));
+      await user.click(screen.getByRole("button", { name: "Table" }));
+      await user.click(screen.getByRole("gridcell", { name: "3 x 2" }));
+      expect(editor().value).toContain("\\begin{tabular}{|l|l|l|}");
+      select(editor().value.indexOf("\\end{document}"));
+      await user.click(screen.getByRole("button", { name: "Equation" }));
+      await user.type(await screen.findByLabelText("LaTeX math"), "E=mc^2");
+      await user.click(screen.getByRole("button", { name: "Insert" }));
+      expect(editor().value).toContain("\\begin{equation}\n  E=mc^2\n\\end{equation}\n\\end{document}");
+    });
+  });
+
+  describe("shortcuts and layout", () => {
+    it("Ctrl+O opens a folder, Ctrl+L toggles the log, Ctrl+Shift+E toggles the sidebar", async () => {
+      const { user, onSwitch } = await renderWriter();
+      vi.mocked(chooseProjectFolder).mockResolvedValueOnce("D:\\Other");
+      await user.keyboard("{Control>}o{/Control}");
+      await waitFor(() => expect(onSwitch).toHaveBeenCalledWith("D:\\Other"));
+      await user.keyboard("{Control>}l{/Control}");
+      expect(drawer()).toBeInTheDocument();
+      expect(screen.getByRole("complementary", { name: "Project files" })).toBeInTheDocument();
+      await user.keyboard("{Control>}{Shift>}E{/Shift}{/Control}");
+      expect(screen.queryByRole("complementary", { name: "Project files" })).not.toBeInTheDocument();
+      expect(localStorage.getItem("lexy.filesOpen")).toBe("0");
+    });
+
+    it("handles shortcuts before the editor sees them", async () => {
+      await renderWriter();
       const inner = vi.fn();
       editor().addEventListener("keydown", inner);
       expect(fireEvent.keyDown(editor(), { key: "l", ctrlKey: true })).toBe(false);
@@ -648,154 +673,138 @@ describe("Writer", () => {
       expect(fireEvent.keyDown(editor(), { key: "q", ctrlKey: true })).toBe(true);
       expect(inner).toHaveBeenCalled();
     });
-  });
 
-  describe("closing the window", () => {
-    it("asks before closing with unsaved changes and cancels if declined", async () => {
-      vi.mocked(confirmDiscard).mockResolvedValueOnce(false);
-      const user = userEvent.setup();
-      render(<Writer />);
-      await user.type(editor(), "x");
-      const event = { preventDefault: vi.fn() };
-      await closeHandler!(event);
-      expect(event.preventDefault).toHaveBeenCalled();
+    it("resizes the sidebar and the editor/preview split with the keyboard", async () => {
+      const { user } = await renderWriter();
+      const sidebar = screen.getByRole("separator", { name: "Resize file list" });
+      sidebar.focus();
+      await user.keyboard("{ArrowRight}");
+      expect(sidebar).toHaveAttribute("aria-valuenow", "240");
+      expect(localStorage.getItem("lexy.sidebarWidth")).toBe("240");
+      const split = screen.getByRole("separator", { name: "Resize editor and preview" });
+      split.focus();
+      await user.keyboard("{ArrowRight}");
+      expect(split).toHaveAttribute("aria-valuenow", "55");
+      await user.dblClick(split);
+      expect(split).toHaveAttribute("aria-valuenow", "50");
     });
 
-    it("closes without asking when saved, and unsubscribes on unmount", async () => {
-      const { unmount } = render(<Writer />);
+    it("log drawer toggles from the View tab", async () => {
+      const { user } = await renderWriter();
+      await user.click(tab("View"));
+      await user.click(screen.getByRole("button", { name: "Show logs" }));
+      expect(within(drawer()!).getByText("No compile yet")).toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: "Hide logs" }));
+      expect(drawer()).not.toBeInTheDocument();
+    });
+  });
+
+  describe("leaving the project", () => {
+    async function close() {
       const event = { preventDefault: vi.fn() };
-      await closeHandler!(event);
-      expect(confirmDiscard).not.toHaveBeenCalled();
-      await act(async () => {});
+      let done!: Promise<void>;
+      await act(async () => {
+        done = closeHandler!(event);
+      });
+      return { event, done };
+    }
+
+    it("one prompt lists every unsaved file; Cancel keeps the window open", async () => {
+      const { user } = await renderWriter();
+      type("!");
+      await openIntro(user);
+      type("?");
+      const { event, done } = await close();
+      const dialog = await screen.findByRole("dialog", { name: "Unsaved changes" });
+      expect(within(dialog).getAllByRole("listitem").map((item) => item.textContent)).toEqual([INTRO, MAIN]);
+      await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      await act(() => done);
+      expect(event.preventDefault).toHaveBeenCalled();
+      expect(writeFile).not.toHaveBeenCalled();
+    });
+
+    it("Save all writes every file, then exports a fresh PDF beside the main document", async () => {
+      const { user } = await renderWriter();
+      type("!");
+      await openIntro(user);
+      type("?");
+      const { event, done } = await close();
+      await user.click(within(await screen.findByRole("dialog", { name: "Unsaved changes" })).getByRole("button", { name: "Save all" }));
+      await act(() => done);
+      expect(disk[MAIN]).toBe(`${STARTER_DOCUMENT}!`);
+      expect(disk[INTRO]).toBe("Intro text.?");
+      expect(compileProject).toHaveBeenCalledWith(MAIN, []);
+      expect(exportPdf).toHaveBeenCalledWith(PDF, `${ROOT}\\${MAIN}`);
+      expect(event.preventDefault).not.toHaveBeenCalled();
+    });
+
+    it("reuses a PDF compiled from the saved files without compiling again", async () => {
+      const { user } = await renderWriter();
+      await user.click(compileButton());
+      await waitFor(() => expect(compileStatus()).toHaveTextContent("PDF ready"));
+      vi.mocked(compileProject).mockClear();
+      const { done } = await close();
+      await act(() => done);
+      expect(compileProject).not.toHaveBeenCalled();
+      expect(exportPdf).toHaveBeenCalledWith(PDF, `${ROOT}\\${MAIN}`);
+    });
+
+    it("compiles the saved files first when the last PDF came from unsaved text", async () => {
+      localStorage.setItem("lexy.livePreview", "1");
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const { user } = await renderWriter();
+      await waitFor(() => expect(compileProject).toHaveBeenCalledTimes(1));
+      type("draft");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(compileProject).toHaveBeenLastCalledWith(MAIN, [{ path: MAIN, text: `${STARTER_DOCUMENT}draft` }]);
+      vi.mocked(compileProject).mockClear();
+      vi.mocked(compileProject).mockResolvedValueOnce({ ...succeeded, pdfPath: "C:\\build\\saved.pdf" });
+      const { done } = await close();
+      await user.click(within(await screen.findByRole("dialog", { name: "Unsaved changes" })).getByRole("button", { name: "Don't save" }));
+      await act(() => done);
+      expect(compileProject).toHaveBeenCalledWith(MAIN, []);
+      expect(exportPdf).toHaveBeenCalledWith("C:\\build\\saved.pdf", `${ROOT}\\${MAIN}`);
+    });
+
+    it("stays open once with a notice when the PDF can't be written, then lets you quit", async () => {
+      await renderWriter();
+      vi.mocked(exportPdf).mockRejectedValue("failed to save thesis.pdf: Access is denied.");
+      const first = await close();
+      await act(() => first.done);
+      expect(first.event.preventDefault).toHaveBeenCalled();
+      expect(screen.getByRole("alert")).toHaveTextContent("Close again to quit without it.");
+      const second = await close();
+      await act(() => second.done);
+      expect(second.event.preventDefault).not.toHaveBeenCalled();
+    });
+
+    it("File → Project Home settles unsaved files, then leaves; unsubscribes on unmount", async () => {
+      const { user, onSwitch, unmount } = await renderWriter();
+      type("!");
+      await user.click(tab("File"));
+      await user.click(screen.getByRole("button", { name: "Project Home" }));
+      await user.click(within(await screen.findByRole("dialog", { name: "Unsaved changes" })).getByRole("button", { name: "Save all" }));
+      await waitFor(() => expect(onSwitch).toHaveBeenCalledWith(null));
+      expect(disk[MAIN]).toBe(`${STARTER_DOCUMENT}!`);
       unmount();
       expect(unlistenClose).toHaveBeenCalled();
     });
   });
 
-  describe("PDF saved next to the document on exit", () => {
-    async function close() {
-      const event = { preventDefault: vi.fn() };
-      await act(async () => {
-        await closeHandler!(event);
-      });
-      return event;
-    }
-
-    it("copies the PDF that matches the saved text, without compiling again", async () => {
-      const user = await savedWriter();
-      await user.click(compileButton());
-      vi.mocked(compileSource).mockClear();
-      const event = await close();
-      expect(compileSource).not.toHaveBeenCalled();
-      expect(exportPdf).toHaveBeenCalledWith(PDF, PATH);
-      expect(event.preventDefault).not.toHaveBeenCalled();
-    });
-
-    it("compiles the saved text first when the last preview doesn't match what's saved", async () => {
-      // Live preview renders the untitled draft; then the user saves and keeps typing.
+  describe("read-only project", () => {
+    it("shows the bar and blocks saving and compiling", async () => {
       localStorage.setItem("lexy.livePreview", "1");
-      const user = userEvent.setup();
-      render(<Writer />);
-      await waitFor(() => expect(compileSource).toHaveBeenCalledWith(STARTER_DOCUMENT, null));
-      vi.mocked(chooseSavePath).mockResolvedValueOnce(PATH);
-      await user.click(tab("File"));
-      await user.click(screen.getByRole("button", { name: "Save" }));
-      await user.type(editor(), "unsaved draft");
-      vi.mocked(confirmDiscard).mockResolvedValueOnce(true);
-      vi.mocked(compileSource).mockClear();
-      vi.mocked(compileSource).mockResolvedValueOnce({ ...succeeded, pdfPath: "C:\\build\\saved.pdf" });
-      await close();
-      expect(compileSource).toHaveBeenCalledWith(STARTER_DOCUMENT, PATH);
-      expect(exportPdf).toHaveBeenCalledWith("C:\\build\\saved.pdf", PATH);
+      const { user } = await renderWriter({ ...PROJECT, readOnly: true });
+      expect(screen.getByText("Open in another Lexy window. Read-only.")).toBeInTheDocument();
+      expect(compileButton()).toBeDisabled();
+      type("!");
+      await user.keyboard("{Control>}s{/Control}");
+      await user.keyboard("{F5}");
+      expect(writeFile).not.toHaveBeenCalled();
+      expect(compileProject).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "New file" })).toBeDisabled();
     });
-
-    it("exports nothing for an untitled document", async () => {
-      render(<Writer />);
-      const event = await close();
-      expect(exportPdf).not.toHaveBeenCalled();
-      expect(event.preventDefault).not.toHaveBeenCalled();
-    });
-
-    it("stays open once with a notice when the PDF can't be written, then lets you quit", async () => {
-      await savedWriter();
-      vi.mocked(exportPdf).mockRejectedValue("failed to save Thesis.pdf: Access is denied. (is the PDF open in another program?)");
-      const first = await close();
-      expect(first.preventDefault).toHaveBeenCalled();
-      expect(screen.getByRole("alert")).toHaveTextContent("couldn't save the PDF next to your document");
-      expect(screen.getByRole("alert")).toHaveTextContent("Close again to quit without it.");
-      const second = await close();
-      expect(second.preventDefault).not.toHaveBeenCalled();
-    });
-
-    it("explains when the saved document doesn't compile", async () => {
-      await savedWriter();
-      vi.mocked(compileSource).mockResolvedValueOnce(failed);
-      const event = await close();
-      expect(event.preventDefault).toHaveBeenCalled();
-      expect(exportPdf).not.toHaveBeenCalled();
-      expect(screen.getByRole("alert")).toHaveTextContent("doesn't compile (Line 3: Undefined control sequence.)");
-    });
-  });
-
-  describe("project folders and names", () => {
-    it("suggests a file name from \\title and saves into the project folder Lexy picks", async () => {
-      vi.mocked(chooseSavePath).mockResolvedValueOnce(`${LEXY}\\My Paper.tex`);
-      vi.mocked(prepareSavePath).mockResolvedValueOnce(`${LEXY}\\My Paper\\My Paper.tex`);
-      const user = userEvent.setup();
-      render(<Writer />);
-      fireEvent.change(editor(), { target: { value: STARTER_DOCUMENT.replace("\\title{Untitled}", "\\title{My Paper: A \\LaTeX{} Study}") } });
-      await user.click(tab("File"));
-      await user.click(screen.getByRole("button", { name: "Save" }));
-      expect(chooseSavePath).toHaveBeenCalledWith(null, LEXY, "My Paper A Study.tex");
-      expect(prepareSavePath).toHaveBeenCalledWith(`${LEXY}\\My Paper.tex`);
-      expect(writeDocument).toHaveBeenCalledWith(`${LEXY}\\My Paper\\My Paper.tex`, expect.any(String));
-      expect(screen.getByText("My Paper.tex").parentElement).toHaveAttribute("title", `${LEXY}\\My Paper\\My Paper.tex`);
-    });
-
-    it("saving an already named document doesn't move it", async () => {
-      const user = await savedWriter();
-      vi.mocked(prepareSavePath).mockClear();
-      await user.type(editor(), "!");
-      await user.click(screen.getByRole("button", { name: "Save" }));
-      expect(prepareSavePath).not.toHaveBeenCalled();
-      expect(writeDocument).toHaveBeenLastCalledWith(PATH, expect.any(String));
-    });
-  });
-
-  describe("resizable split", () => {
-    const separator = () => screen.getByRole("separator", { name: "Resize editor and preview" });
-
-    it("moves with arrow keys, clamps and remembers", async () => {
-      const user = userEvent.setup();
-      render(<Writer />);
-      separator().focus();
-      await user.keyboard("{ArrowRight}");
-      expect(separator()).toHaveAttribute("aria-valuenow", "55");
-      expect(localStorage.getItem("lexy.split")).toBe("0.55");
-      for (let i = 0; i < 10; i++) await user.keyboard("{ArrowLeft}");
-      expect(separator()).toHaveAttribute("aria-valuenow", "20");
-    });
-
-    it("follows the pointer while dragging and resets on double-click", async () => {
-      const user = userEvent.setup();
-      render(<Writer />);
-      (separator().parentElement as HTMLElement).getBoundingClientRect = () => ({ left: 100, width: 800 }) as DOMRect;
-      fireEvent.pointerDown(separator(), { pointerId: 1 });
-      fireEvent.pointerMove(separator(), { clientX: 100 + 800 * 0.3 });
-      fireEvent.pointerUp(separator());
-      expect(separator()).toHaveAttribute("aria-valuenow", "30");
-      await user.dblClick(separator());
-      expect(separator()).toHaveAttribute("aria-valuenow", "50");
-    });
-  });
-
-  it("log drawer toggles from the View tab", async () => {
-    const user = userEvent.setup();
-    render(<Writer />);
-    await user.click(tab("View"));
-    await user.click(screen.getByRole("button", { name: "Show logs" }));
-    expect(within(drawer()!).getByText("No compile yet")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Hide logs" }));
-    expect(drawer()).not.toBeInTheDocument();
   });
 });

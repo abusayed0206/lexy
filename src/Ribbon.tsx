@@ -14,13 +14,21 @@ const TAB_LABELS: Record<RibbonTab, string> = { file: "File", home: "Home", inse
 const TAB_KEY = "lexy.ribbonTab";
 
 export type RibbonActions = {
+  /** New file in the current folder. */
   onNew: () => void;
+  onNewProject: () => void;
+  /** Open folder… */
   onOpen: () => void;
+  onHome: () => void;
+  onRecent: (path: string) => void;
+  /** Save all modified files. */
   onSave: () => void;
+  /** Save the current file under another name in the project. */
   onSaveAs: () => void;
   onCompile: () => void;
   onToggleLogs: () => void;
   onToggleLive: () => void;
+  onToggleFiles: () => void;
   onFormat: (command: "textbf" | "textit" | "underline") => void;
   onList: (kind: "itemize" | "enumerate") => void;
   onHeading: (level: 0 | 1 | 2 | 3) => void;
@@ -37,12 +45,19 @@ export type RibbonState = {
   fileName: string;
   path: string | null;
   unsaved: boolean;
+  /** The shown file is the project's main document. */
+  isMain: boolean;
+  projectName: string;
+  mainName: string | null;
   statusLabel: string;
   statusClass: string;
   statusDetail: string | null;
   compiling: boolean;
+  readOnly: boolean;
   logsOpen: boolean;
   liveEnabled: boolean;
+  filesOpen: boolean;
+  recent: { path: string; name: string }[];
   settings: DocumentSettings;
   settingsManaged: boolean;
 };
@@ -120,8 +135,13 @@ export function Ribbon({ actions, state }: { actions: RibbonActions; state: Ribb
           ))}
         </div>
 
-        <div className="doc-title" title={state.path ?? "Not saved yet"}>
+        <div
+          className="doc-title"
+          title={[state.path, state.mainName ? `Main: ${state.mainName}` : null].filter(Boolean).join(" · ") || undefined}
+        >
+          <span className="doc-project">{state.projectName}</span>
           <span className="doc-name">{state.fileName}</span>
+          {state.isMain ? <span className="main-badge">Main</span> : null}
           {state.unsaved ? (
             <span className="unsaved-dot" role="img" aria-label="Unsaved changes" title="Unsaved changes" />
           ) : null}
@@ -139,7 +159,7 @@ export function Ribbon({ actions, state }: { actions: RibbonActions; state: Ribb
           className="primary compile-button"
           type="button"
           title="Compile (F5)"
-          disabled={state.compiling}
+          disabled={state.compiling || state.readOnly}
           onClick={actions.onCompile}
         >
           {state.compiling ? "Compiling" : "Compile"}
@@ -165,12 +185,27 @@ export function Ribbon({ actions, state }: { actions: RibbonActions; state: Ribb
     switch (name) {
       case "file":
         return (
-          <Group label="Document">
-            <RibbonButton icon="new" label="New" shortcut="Ctrl+N" onClick={actions.onNew} />
-            <RibbonButton icon="open" label="Open" shortcut="Ctrl+O" onClick={actions.onOpen} />
-            <RibbonButton icon="save" label="Save" shortcut="Ctrl+S" onClick={actions.onSave} />
-            <RibbonButton icon="saveAs" label="Save as" shortcut="Ctrl+Shift+S" onClick={actions.onSaveAs} />
-          </Group>
+          <>
+            <Group label="Project">
+              <RibbonButton icon="new" label="New project" onClick={actions.onNewProject} />
+              <RibbonButton icon="open" label="Open folder…" shortcut="Ctrl+O" onClick={actions.onOpen} />
+              <MenuButton
+                label="Recent projects"
+                icon="recent"
+                items={
+                  state.recent.length
+                    ? state.recent.map((project) => ({ label: project.name, detail: project.path, onSelect: () => actions.onRecent(project.path) }))
+                    : [{ label: "No other projects yet", onSelect: () => undefined }]
+                }
+              />
+              <RibbonButton icon="home" label="Project Home" onClick={actions.onHome} />
+            </Group>
+            <Group label="File">
+              <RibbonButton icon="new" label="New file" shortcut="Ctrl+N" disabled={state.readOnly} onClick={actions.onNew} />
+              <RibbonButton icon="save" label="Save" shortcut="Ctrl+S" disabled={state.readOnly} onClick={actions.onSave} />
+              <RibbonButton icon="saveAs" label="Save as" shortcut="Ctrl+Shift+S" disabled={state.readOnly} onClick={actions.onSaveAs} />
+            </Group>
+          </>
         );
       case "home":
         return (
@@ -244,9 +279,12 @@ export function Ribbon({ actions, state }: { actions: RibbonActions; state: Ribb
       case "view":
         return (
           <>
+            <Group label="Show">
+              <RibbonButton icon="files" label="Files" shortcut="Ctrl+Shift+E" pressed={state.filesOpen} onClick={actions.onToggleFiles} />
+            </Group>
             <Group label="Preview">
-              <RibbonButton icon="preview" label="Live preview" pressed={state.liveEnabled} onClick={actions.onToggleLive} />
-              <RibbonButton icon="compile" label="Compile now" shortcut="F5" disabled={state.compiling} onClick={actions.onCompile} />
+              <RibbonButton icon="preview" label="Live preview" pressed={state.liveEnabled} disabled={state.readOnly} onClick={actions.onToggleLive} />
+              <RibbonButton icon="compile" label="Compile now" shortcut="F5" disabled={state.compiling || state.readOnly} onClick={actions.onCompile} />
             </Group>
             <Group label="Output">
               <RibbonButton

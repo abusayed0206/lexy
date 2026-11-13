@@ -20,6 +20,10 @@ const PATHS = {
   compile: ["M8 5v14l11-7z"],
   logs: ["M4 6h16M4 12h16M4 18h10"],
   chevron: ["M6 9l6 6 6-6"],
+  home: ["M3 11l9-7 9 7", "M5 10v10h5v-6h4v6h5V10"],
+  files: ["M3 5h6l2 2h10v12H3z", "M7 12h10M7 16h6"],
+  newFolder: ["M3 5h6l2 2h10v12H3z", "M12 10v6M9 13h6"],
+  recent: ["M12 7v5l3 2", "M3 12a9 9 0 1 0 3-6.7L3 8", "M3 3v5h5"],
 } as const;
 
 export type IconName = keyof typeof PATHS;

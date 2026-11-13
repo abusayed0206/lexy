@@ -16,6 +16,7 @@ use std::{
 };
 use tauri::{ipc::Response, AppHandle, Emitter, Manager, State};
 
+mod project;
 mod setup;
 
 #[derive(Clone, Serialize)]
@@ -308,24 +309,6 @@ fn validate_tex_path(path: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-#[tauri::command]
-fn read_document(path: String) -> Result<String, String> {
-    let path = validate_tex_path(&path)?;
-    let metadata =
-        fs::metadata(&path).map_err(|error| format!("failed to open {}: {error}", path.display()))?;
-    if metadata.len() > MAX_DOCUMENT_BYTES {
-        return Err(format!("{} is larger than 10 MiB", path.display()));
-    }
-    // Refuse non-UTF-8 rather than silently mangling it on the next save.
-    fs::read_to_string(&path).map_err(|error| format!("failed to read {}: {error}", path.display()))
-}
-
-#[tauri::command]
-fn write_document(path: String, contents: String) -> Result<(), String> {
-    let path = validate_tex_path(&path)?;
-    write_atomic(&path, contents.as_bytes())
-}
-
 /// Write to a sibling temp file, flush it to disk, then rename over the target,
 /// so a crash mid-save never leaves a half-written document.
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
@@ -406,48 +389,112 @@ fn engine_from_marker(source: &str) -> Engine {
     Engine::Pdflatex
 }
 
+/// An open file's unsaved text, sent with each compile (contracts/backend-commands.md).
+#[derive(Clone, Debug, serde::Deserialize)]
+struct Buffer {
+    path: String,
+    text: String,
+}
+
 #[tauri::command]
-async fn compile_source(
-    source: String,
-    document_path: Option<String>,
+async fn compile_project(
+    main: String,
+    buffers: Vec<Buffer>,
     lock: State<'_, CompileLock>,
-) -> Result<CompileResult, String> {
-    let document = document_path.as_deref().map(validate_tex_path).transpose()?;
+    project: State<'_, project::ProjectState>,
+) -> Result<CompileResult, project::ProjectError> {
+    let root = project.with(|open| {
+        let expected = open.main.as_deref().unwrap_or_default();
+        if !expected.replace('/', "\\").eq_ignore_ascii_case(&main.replace('/', "\\")) {
+            return Err(project::ProjectError::new(project::ErrorKind::NotFound, format!("{main} is not the main document")));
+        }
+        Ok(open.root.clone())
+    })?;
     let lock = Arc::clone(&lock.0);
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        compile_snapshot(&build_root()?, &source, document.as_deref())
+        compile_project_at(&build_root()?, &root, &main, &buffers)
     })
     .await
     .map_err(|error| format!("compile task failed: {error}"))?
 }
 
-/// Build folder and file stem for a snapshot: per saved document, or a shared `untitled` one.
-fn snapshot_location(root: &Path, document: Option<&Path>) -> Result<(PathBuf, String), String> {
-    match document {
-        Some(path) => {
-            let stem = path
-                .file_stem()
-                .and_then(OsStr::to_str)
-                .ok_or("document name is not valid text")?;
-            Ok((root.join(build_key(path)), stem.to_string()))
+/// Overlay folder inside a build folder; its leading dot keeps it out of the mirrored tree.
+const OVERLAY: &str = ".lexy-overlay";
+
+/// Compile a project's main document without touching the user's files (research R1):
+/// the main text is written as a snapshot into the build folder, unsaved open files go into
+/// an overlay folder that TeX searches before the project, and saved files and images are
+/// read straight from the project folder.
+fn compile_project_at(build_root: &Path, root: &Path, main: &str, buffers: &[Buffer]) -> Result<CompileResult, project::ProjectError> {
+    use project::{resolve_in_project, ErrorKind, ProjectError};
+    let main_path = resolve_in_project(root, main)?;
+    let is_tex = main_path.extension().and_then(OsStr::to_str).is_some_and(|ext| ext.eq_ignore_ascii_case("tex"));
+    if !is_tex {
+        return Err(ProjectError::new(ErrorKind::InvalidName, format!("{main} is not a .tex file")));
+    }
+    let mut overlay_files = Vec::new();
+    for buffer in buffers {
+        let path = resolve_in_project(root, &buffer.path)?;
+        let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+        if !project::classify(name, false).0 {
+            return Err(ProjectError::new(ErrorKind::InvalidName, format!("{} can't be compiled", buffer.path)));
         }
-        None => Ok((root.join("untitled"), "Untitled".to_string())),
+        if buffer.text.len() as u64 > MAX_DOCUMENT_BYTES {
+            return Err(ProjectError::new(ErrorKind::Io, format!("{} is larger than 10 MiB", buffer.path)));
+        }
+        overlay_files.push((path, buffer.text.as_str()));
+    }
+    let main_text = match overlay_files.iter().find(|(path, _)| *path == main_path) {
+        Some((_, text)) => text.to_string(),
+        None if main_path.is_file() => project::read_file_at(root, main)?,
+        None => return Err(ProjectError::new(ErrorKind::NotFound, format!("{main} does not exist"))),
+    };
+
+    // Plain (non-`\\?\`) paths: TeX and latexmk don't understand verbatim paths.
+    let plain_root = PathBuf::from(project::display_path(root));
+    let main_abs = PathBuf::from(project::display_path(&main_path));
+    let stem = main_abs.file_stem().and_then(OsStr::to_str).ok_or_else(|| "document name is not valid text".to_string())?.to_string();
+    let out_dir = build_root.join(build_key(&main_abs));
+    fs::create_dir_all(&out_dir).map_err(|error| format!("failed to create build folder: {error}"))?;
+    write_atomic(&out_dir.join(format!("{stem}.tex")), main_text.as_bytes())?;
+
+    let overlay = out_dir.join(OVERLAY);
+    let _ = fs::remove_dir_all(&overlay);
+    for (path, text) in &overlay_files {
+        let Ok(rel) = path.strip_prefix(root) else { continue };
+        let target = overlay.join(rel);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|error| format!("failed to create overlay folder: {error}"))?;
+        }
+        write_atomic(&target, text.as_bytes())?;
+    }
+    // \include{chapters/x} writes chapters\x.aux next to the main .aux, so the folders must exist.
+    mirror_folders(root, &out_dir);
+
+    let inputs = env::join_paths([overlay, plain_root, PathBuf::new()])
+        .map_err(|error| format!("failed to build TEXINPUTS: {error}"))?;
+    Ok(run_latexmk(&out_dir, &stem, engine_from_marker(&main_text), &inputs)?)
+}
+
+/// Recreate the project's (non-hidden) folder tree inside `target`.
+fn mirror_folders(source: &Path, target: &Path) {
+    let Ok(entries) = fs::read_dir(source) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if !is_dir || name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let inner = target.join(&name);
+        if fs::create_dir_all(&inner).is_ok() {
+            mirror_folders(&entry.path(), &inner);
+        }
     }
 }
 
-/// Compile the editor text without touching the user's file: it is written as a
-/// snapshot into the build folder and latexmk runs there. Files beside a saved
-/// document stay reachable through TEXINPUTS.
-fn compile_snapshot(root: &Path, source: &str, document: Option<&Path>) -> Result<CompileResult, String> {
-    if source.len() as u64 > MAX_DOCUMENT_BYTES {
-        return Err("the document is larger than 10 MiB".into());
-    }
-    let engine = engine_from_marker(source);
-    let (out_dir, stem) = snapshot_location(root, document)?;
-    fs::create_dir_all(&out_dir).map_err(|error| format!("failed to create build folder: {error}"))?;
-    write_atomic(&out_dir.join(format!("{stem}.tex")), source.as_bytes())?;
-
+/// Run latexmk on `<out_dir>\<stem>.tex` with `inputs` as TEXINPUTS and BIBINPUTS.
+fn run_latexmk(out_dir: &Path, stem: &str, engine: Engine, inputs: &std::ffi::OsStr) -> Result<CompileResult, String> {
     // Always revalidate tool paths before compiling (docs/PLAN.md).
     let environment = detect_environment();
     if !environment.ready {
@@ -482,11 +529,10 @@ fn compile_snapshot(root: &Path, source: &str, document: Option<&Path>) -> Resul
     command
         .args([engine.latexmk_flag(), "-interaction=nonstopmode", "-halt-on-error", "-file-line-error"])
         .arg(format!("{stem}.tex"))
-        .current_dir(&out_dir)
-        .env("PATH", path_with_prefix(&tool_dirs)?);
-    if let Some(folder) = document.and_then(Path::parent) {
-        command.env("TEXINPUTS", texinputs_for(folder)?);
-    }
+        .current_dir(out_dir)
+        .env("PATH", path_with_prefix(&tool_dirs)?)
+        .env("TEXINPUTS", inputs)
+        .env("BIBINPUTS", inputs);
     let output = run_with_timeout(command, COMPILE_TIMEOUT)?;
 
     let pdf = out_dir.join(format!("{stem}.pdf"));
@@ -514,11 +560,6 @@ fn compile_snapshot(root: &Path, source: &str, document: Option<&Path>) -> Resul
     })
 }
 
-/// `<folder>;` — the trailing empty entry keeps TeX's default search path.
-fn texinputs_for(folder: &Path) -> Result<std::ffi::OsString, String> {
-    env::join_paths([folder.to_path_buf(), PathBuf::new()])
-        .map_err(|error| format!("failed to build TEXINPUTS: {error}"))
-}
 
 fn compose_log(output: &ProcessOutput, tex_log: &str) -> String {
     let mut log = String::new();
@@ -606,44 +647,6 @@ fn export_pdf_to(build_root: &Path, pdf_path: &str, document_path: &str) -> Resu
     let bytes = fs::read(&pdf).map_err(|error| format!("failed to read {}: {error}", pdf.display()))?;
     write_atomic(&target, &bytes).map_err(|error| format!("{error} (is the PDF open in another program?)"))?;
     Ok(target.display().to_string())
-}
-
-/// Where a Save/Save as really goes: a file chosen directly in `Documents\Lexy`
-/// gets its own project folder (`Documents\Lexy\Name\Name.tex`). The folder is created.
-#[tauri::command]
-fn prepare_save_path(app: AppHandle, path: String) -> Result<String, String> {
-    let chosen = validate_tex_path(&path)?;
-    let target = match app.path().document_dir() {
-        Ok(documents) => project_location(&chosen, &documents.join("Lexy")),
-        Err(_) => chosen,
-    };
-    if let Some(folder) = target.parent() {
-        fs::create_dir_all(folder).map_err(|error| format!("failed to create {}: {error}", folder.display()))?;
-    }
-    Ok(target.display().to_string())
-}
-
-fn same_folder(a: &Path, b: &Path) -> bool {
-    let normalize = |path: &Path| path.display().to_string().trim_end_matches(['\\', '/']).to_lowercase();
-    normalize(a) == normalize(b)
-}
-
-/// `Lexy\Name.tex` → `Lexy\Name\Name.tex`, or `Lexy\Name (2)\Name (2).tex` when that
-/// project already exists, so an existing project is never overwritten.
-/// Files chosen anywhere else are left exactly where the user put them.
-fn project_location(chosen: &Path, lexy_root: &Path) -> PathBuf {
-    if !chosen.parent().is_some_and(|parent| same_folder(parent, lexy_root)) {
-        return chosen.to_path_buf();
-    }
-    let stem = chosen.file_stem().and_then(OsStr::to_str).unwrap_or("Untitled");
-    for number in 1..1000 {
-        let name = if number == 1 { stem.to_string() } else { format!("{stem} ({number})") };
-        let candidate = lexy_root.join(&name).join(format!("{name}.tex"));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    chosen.to_path_buf()
 }
 
 // ---------------------------------------------------------------------------
@@ -808,18 +811,33 @@ pub fn run() {
         .manage(CompileLock(Arc::new(Mutex::new(()))))
         .manage(FontCache(Arc::new(OnceLock::new())))
         .manage(SetupGuard(Arc::new(AtomicBool::new(false))))
+        .manage(project::ProjectState::default())
         .invoke_handler(tauri::generate_handler![
             check_environment,
             start_initial_setup,
             read_setup_log,
-            read_document,
-            write_document,
-            compile_source,
+            compile_project,
             read_pdf,
             default_document_folder,
             list_system_fonts,
             export_pdf,
-            prepare_save_path
+            project::list_projects,
+            project::last_open_project,
+            project::create_project,
+            project::count_entries,
+            project::forget_project,
+            project::open_project,
+            project::close_project,
+            project::set_main_document,
+            project::list_dir,
+            project::read_file,
+            project::write_file,
+            project::create_file,
+            project::create_folder,
+            project::rename_entry,
+            project::delete_entry,
+            project::import_files,
+            project::open_entry_external
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1093,62 +1111,39 @@ mod tests {
     }
 
     #[test]
-    fn write_then_read_document_round_trips_exact_text() {
+    fn write_atomic_round_trips_exact_text() {
         let dir = TempDir::new("roundtrip");
-        let path = abs(&dir, "main.tex");
+        let path = dir.0.join("main.tex");
         let text = "\\section{Ünïcødé}\r\nline two\n\n% trailing\n";
-        write_document(path.clone(), text.to_string()).unwrap();
-        assert_eq!(read_document(path).unwrap(), text);
+        write_atomic(&path, text.as_bytes()).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
     }
 
     #[test]
-    fn write_document_replaces_existing_file_and_leaves_no_temp_file() {
+    fn write_atomic_replaces_existing_file_and_leaves_no_temp_file() {
         let dir = TempDir::new("replace");
-        let path = abs(&dir, "main.tex");
+        let path = dir.0.join("main.tex");
         fs::write(&path, "old content that is longer").unwrap();
-        write_document(path.clone(), "new".into()).unwrap();
+        write_atomic(&path, b"new").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");
         let leftovers: Vec<_> = fs::read_dir(&dir.0).unwrap().flatten().map(|e| e.file_name()).collect();
         assert_eq!(leftovers, vec![std::ffi::OsString::from("main.tex")]);
     }
 
     #[test]
-    fn write_document_fails_cleanly_when_folder_is_missing() {
+    fn write_atomic_fails_cleanly_when_folder_is_missing() {
         let dir = TempDir::new("nofolder");
-        let path = dir.0.join("missing").join("main.tex");
-        let error = write_document(path.display().to_string(), "x".into()).unwrap_err();
+        let error = write_atomic(&dir.0.join("missing").join("main.tex"), b"x").unwrap_err();
         assert!(error.contains("failed to write"), "{error}");
         assert!(!dir.0.join("missing").exists());
     }
 
     #[test]
-    fn write_document_rejects_non_tex_paths_without_touching_disk() {
-        let dir = TempDir::new("write-bad");
-        let path = abs(&dir, "evil.bat");
-        assert!(write_document(path.clone(), "x".into()).is_err());
-        assert!(!Path::new(&path).exists());
-    }
-
-    #[test]
-    fn read_document_reports_missing_file() {
-        let dir = TempDir::new("read-missing");
-        assert!(read_document(abs(&dir, "nope.tex")).unwrap_err().contains("failed to open"));
-    }
-
-    #[test]
-    fn read_document_refuses_files_over_ten_mib() {
+    fn project_read_refuses_files_over_ten_mib() {
         let dir = TempDir::new("read-big");
-        let path = abs(&dir, "big.tex");
-        File::create(&path).unwrap().set_len(MAX_DOCUMENT_BYTES + 1).unwrap();
-        assert!(read_document(path).unwrap_err().contains("larger than 10 MiB"));
-    }
-
-    #[test]
-    fn read_document_refuses_non_utf8_instead_of_mangling_it() {
-        let dir = TempDir::new("read-latin1");
-        let path = abs(&dir, "latin1.tex");
-        fs::write(&path, [b'c', b'a', b'f', 0xe9]).unwrap();
-        assert!(read_document(path).unwrap_err().contains("failed to read"));
+        File::create(dir.0.join("big.tex")).unwrap().set_len(MAX_DOCUMENT_BYTES + 1).unwrap();
+        let root = fs::canonicalize(&dir.0).unwrap();
+        assert!(project::read_file_at(&root, "big.tex").unwrap_err().message.contains("larger than 10 MiB"));
     }
 
     // ----- compile helpers -----
@@ -1219,45 +1214,6 @@ mod tests {
         let joined = path_with_prefix(&dirs).unwrap();
         let parts: Vec<PathBuf> = env::split_paths(&joined).collect();
         assert_eq!(&parts[..2], dirs.as_slice());
-    }
-
-    #[test]
-    fn project_location_puts_a_document_saved_in_lexy_into_its_own_folder() {
-        let root = TempDir::new("projects");
-        let chosen = root.0.join("My Paper.tex");
-        assert_eq!(project_location(&chosen, &root.0), root.0.join("My Paper").join("My Paper.tex"));
-        // Case and a trailing separator on the root don't matter on Windows.
-        let shouted = PathBuf::from(root.0.display().to_string().to_uppercase() + "\\");
-        assert_eq!(project_location(&chosen, &shouted), shouted.join("My Paper").join("My Paper.tex"));
-    }
-
-    #[test]
-    fn project_location_never_overwrites_an_existing_project() {
-        let root = TempDir::new("projects-taken");
-        fs::create_dir_all(root.0.join("Thesis")).unwrap();
-        fs::write(root.0.join("Thesis").join("Thesis.tex"), "mine").unwrap();
-        fs::create_dir_all(root.0.join("Thesis (2)")).unwrap();
-        fs::write(root.0.join("Thesis (2)").join("Thesis (2).tex"), "also mine").unwrap();
-        assert_eq!(
-            project_location(&root.0.join("Thesis.tex"), &root.0),
-            root.0.join("Thesis (3)").join("Thesis (3).tex")
-        );
-    }
-
-    #[test]
-    fn project_location_reuses_an_empty_project_folder() {
-        let root = TempDir::new("projects-empty");
-        fs::create_dir_all(root.0.join("Notes")).unwrap();
-        assert_eq!(project_location(&root.0.join("Notes.tex"), &root.0), root.0.join("Notes").join("Notes.tex"));
-    }
-
-    #[test]
-    fn project_location_respects_files_saved_anywhere_else() {
-        let root = TempDir::new("projects-other");
-        let elsewhere = root.0.join("Thesis").join("chapter.tex");
-        assert_eq!(project_location(&elsewhere, &root.0), elsewhere);
-        let desktop = PathBuf::from(r"C:\Users\me\Desktop\draft.tex");
-        assert_eq!(project_location(&desktop, &root.0), desktop);
     }
 
     #[test]
@@ -1352,7 +1308,7 @@ mod tests {
         assert!(error.contains("failed to start"), "{error}");
     }
 
-    // ----- compile_source / snapshots -----
+    // ----- compile -----
 
     #[test]
     fn engine_from_marker_reads_texworks_convention() {
@@ -1378,48 +1334,58 @@ mod tests {
         assert_eq!(Engine::Lualatex.latexmk_flag(), "-lualatex");
     }
 
-    #[test]
-    fn snapshot_location_is_per_document_or_untitled() {
-        let root = Path::new(r"C:\build");
-        let (dir, stem) = snapshot_location(root, Some(Path::new(r"C:\Docs\Thesis.tex"))).unwrap();
-        assert_eq!(stem, "Thesis");
-        assert_eq!(dir, root.join(build_key(Path::new(r"c:\docs\thesis.tex"))));
-        let (dir, stem) = snapshot_location(root, None).unwrap();
-        assert_eq!((dir, stem.as_str()), (root.join("untitled"), "Untitled"));
+    /// A canonical project folder with `main.tex` and a `chapters` subfolder.
+    fn project_dir(label: &str, main: &str) -> (TempDir, PathBuf) {
+        let dir = TempDir::new(label);
+        fs::create_dir_all(dir.0.join("chapters")).unwrap();
+        fs::write(dir.0.join("main.tex"), main).unwrap();
+        let root = fs::canonicalize(&dir.0).unwrap();
+        (dir, root)
+    }
+
+    fn buffer(path: &str, text: &str) -> Buffer {
+        Buffer { path: path.into(), text: text.into() }
     }
 
     #[test]
-    fn compile_snapshot_writes_into_build_folder_and_never_touches_the_document() {
-        let root = TempDir::new("snap-root");
-        let docs = TempDir::new("snap-docs");
-        let document = docs.0.join("main.tex");
-        fs::write(&document, "saved on disk").unwrap();
-        let before = fs::metadata(&document).unwrap().modified().unwrap();
+    fn compile_project_writes_snapshot_and_overlay_and_never_touches_the_project() {
+        let build = TempDir::new("proj-build");
+        let (dir, root) = project_dir("proj-src", "saved main");
+        fs::write(dir.0.join("chapters").join("intro.tex"), "saved intro").unwrap();
+        fs::create_dir_all(dir.0.join(".git")).unwrap();
+        let before = fs::metadata(dir.0.join("main.tex")).unwrap().modified().unwrap();
 
-        // Runs latexmk if tools exist; either way the snapshot is written first.
-        let _ = compile_snapshot(&root.0, "\\documentclass{article}\\begin{document}x\\end{document}", Some(&document));
+        // Runs latexmk if tools exist; either way the files are written first.
+        let _ = compile_project_at(&build.0, &root, "main.tex", &[buffer("chapters/intro.tex", "unsaved intro")]);
 
-        assert_eq!(fs::read_to_string(&document).unwrap(), "saved on disk");
-        assert_eq!(fs::metadata(&document).unwrap().modified().unwrap(), before);
-        let snapshot = root.0.join(build_key(&document)).join("main.tex");
-        assert!(fs::read_to_string(snapshot).unwrap().contains("\\begin{document}x"));
-        assert_eq!(fs::read_dir(&docs.0).unwrap().count(), 1, "nothing new beside the document");
+        assert_eq!(fs::read_to_string(dir.0.join("main.tex")).unwrap(), "saved main");
+        assert_eq!(fs::metadata(dir.0.join("main.tex")).unwrap().modified().unwrap(), before);
+        assert_eq!(fs::read_to_string(dir.0.join("chapters").join("intro.tex")).unwrap(), "saved intro");
+        let out = build.0.join(build_key(&PathBuf::from(project::display_path(&root.join("main.tex")))));
+        assert_eq!(fs::read_to_string(out.join("main.tex")).unwrap(), "saved main");
+        assert_eq!(fs::read_to_string(out.join(OVERLAY).join("chapters").join("intro.tex")).unwrap(), "unsaved intro");
+        assert!(out.join("chapters").is_dir(), "folders are mirrored for \\include");
+        assert!(!out.join(".git").exists(), "hidden folders are not mirrored");
+
+        // A later compile without buffers clears the overlay; an unsaved main wins over disk.
+        let _ = compile_project_at(&build.0, &root, "main.tex", &[buffer("main.tex", "unsaved main")]);
+        assert!(!out.join(OVERLAY).join("chapters").exists());
+        assert_eq!(fs::read_to_string(out.join("main.tex")).unwrap(), "unsaved main");
     }
 
     #[test]
-    fn compile_snapshot_refuses_huge_sources() {
-        let root = TempDir::new("snap-huge");
+    fn compile_project_validates_paths_and_sizes() {
+        let build = TempDir::new("proj-bad");
+        let (_dir, root) = project_dir("proj-bad-src", "x");
+        let kind = |result: Result<CompileResult, project::ProjectError>| result.unwrap_err().kind;
+        assert_eq!(kind(compile_project_at(&build.0, &root, "..\\main.tex", &[])), project::ErrorKind::OutsideProject);
+        assert_eq!(kind(compile_project_at(&build.0, &root, "notes.txt", &[])), project::ErrorKind::InvalidName);
+        assert_eq!(kind(compile_project_at(&build.0, &root, "gone.tex", &[])), project::ErrorKind::NotFound);
+        assert_eq!(kind(compile_project_at(&build.0, &root, "main.tex", &[buffer("..\\x.tex", "")])), project::ErrorKind::OutsideProject);
+        assert_eq!(kind(compile_project_at(&build.0, &root, "main.tex", &[buffer("run.bat", "")])), project::ErrorKind::InvalidName);
         let huge = "x".repeat(MAX_DOCUMENT_BYTES as usize + 1);
-        assert!(compile_snapshot(&root.0, &huge, None).unwrap_err().contains("larger than 10 MiB"));
-        assert_eq!(fs::read_dir(&root.0).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn texinputs_keeps_the_default_search_path() {
-        let value = texinputs_for(Path::new(r"C:\Docs")).unwrap();
-        let text = value.to_string_lossy();
-        assert!(text.starts_with(r"C:\Docs"));
-        assert!(text.ends_with(if cfg!(windows) { ';' } else { ':' }));
+        assert_eq!(kind(compile_project_at(&build.0, &root, "main.tex", &[buffer("main.tex", &huge)])), project::ErrorKind::Io);
+        assert_eq!(fs::read_dir(&build.0).unwrap().count(), 0, "nothing written for rejected compiles");
     }
 
     /// Real end-to-end compiles; skipped on machines without MiKTeX + latexmk + Perl.
@@ -1429,34 +1395,53 @@ mod tests {
             eprintln!("skipping: LaTeX tools not installed");
             return;
         }
-        let root = TempDir::new("e2e-root");
-        let docs = TempDir::new("e2e-docs");
+        let build = TempDir::new("e2e-build");
 
-        let good = docs.0.join("good.tex");
-        let result = compile_snapshot(&root.0, "\\documentclass{article}\\begin{document}Hi\\end{document}\n", Some(&good)).unwrap();
+        let (_good, root) = project_dir("e2e-good", "\\documentclass{article}\\begin{document}Hi\\end{document}\n");
+        let result = compile_project_at(&build.0, &root, "main.tex", &[]).unwrap();
         assert!(result.ok, "{}\n{}", result.summary, result.log);
         assert_eq!(result.engine, Engine::Pdflatex);
         assert!(fs::read(result.pdf_path.expect("pdf path")).unwrap().starts_with(b"%PDF"));
 
-        let result = compile_snapshot(&root.0, "\\documentclass{article}\n\\begin{document}\n\\foo\n\\end{document}\n", None).unwrap();
+        let (_bad, root) = project_dir("e2e-bad", "\\documentclass{article}\n\\begin{document}\n\\foo\n\\end{document}\n");
+        let result = compile_project_at(&build.0, &root, "main.tex", &[]).unwrap();
         assert!(!result.ok);
         assert_eq!(result.summary, "Line 3: Undefined control sequence.");
         assert!(result.pdf_path.is_none());
 
-        // \input of a file next to the (saved) document resolves through TEXINPUTS.
-        fs::write(docs.0.join("chapter.tex"), "Included chapter text.\n").unwrap();
-        let main = docs.0.join("main.tex");
-        let result = compile_snapshot(&root.0, "\\documentclass{article}\\begin{document}\\input{chapter}\\end{document}\n", Some(&main)).unwrap();
-        assert!(result.ok, "TEXINPUTS route failed: {}\n{}", result.summary, result.log);
+        // Multi-file project: unsaved \input buffer, saved \include, an image and a .bib, all
+        // read from the project (research R1); nothing copied, nothing written beside the files.
+        let main = "\\documentclass{article}\n\\usepackage{graphicx}\n\\begin{document}\n\\input{chapters/intro}\n\\include{chapters/two}\n\\includegraphics[width=1cm]{fig.png}\n\\cite{knuth}\n\\bibliographystyle{plain}\n\\bibliography{refs}\n\\end{document}\n";
+        let (dir, root) = project_dir("e2e-multi", main);
+        fs::write(dir.0.join("chapters").join("intro.tex"), "SAVEDINTRO\n").unwrap();
+        fs::write(dir.0.join("chapters").join("two.tex"), "Chapter two.\n").unwrap();
+        fs::write(dir.0.join("refs.bib"), "@book{knuth, author={Knuth}, title={TeX}, year={1984}, publisher={AW}}\n").unwrap();
+        // 1x1 PNG.
+        let png: [u8; 67] = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49,
+            0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00,
+            0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        fs::write(dir.0.join("fig.png"), png).unwrap();
+        let before: Vec<_> = fs::read_dir(&dir.0).unwrap().flatten().map(|e| e.file_name()).collect();
+        let result = compile_project_at(&build.0, &root, "main.tex", &[buffer("chapters\\intro.tex", "UNSAVEDINTRO\n")]).unwrap();
+        assert!(result.ok, "multi-file compile failed: {}\n{}", result.summary, result.log);
+        let out = Path::new(result.pdf_path.as_deref().unwrap()).parent().unwrap().to_path_buf();
+        // TeX wraps log lines at 79 characters, so join them before searching.
+        let log = fs::read_to_string(out.join("main.log")).unwrap_or_default().replace(['\r', '\n'], "");
+        assert!(log.contains(".lexy-overlay"), "the unsaved intro must come from the overlay:\n{log}");
+        assert!(!out.join("fig.png").exists(), "images are read from the project, not copied");
+        assert_eq!(fs::read_to_string(dir.0.join("chapters").join("intro.tex")).unwrap(), "SAVEDINTRO\n");
+        let after: Vec<_> = fs::read_dir(&dir.0).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(before, after, "aux files must not land in the project");
 
         // System font through XeLaTeX + fontspec.
         let xe = "% !TEX program = xelatex\n\\documentclass{article}\n\\usepackage{fontspec}\n\\setmainfont{Arial}\n\\begin{document}Arial text\\end{document}\n";
-        let result = compile_snapshot(&root.0, xe, Some(&docs.0.join("xe.tex"))).unwrap();
+        let (_xe, root) = project_dir("e2e-xe", xe);
+        let result = compile_project_at(&build.0, &root, "main.tex", &[]).unwrap();
         assert_eq!(result.engine, Engine::Xelatex);
         assert!(result.ok, "XeLaTeX failed: {}\n{}", result.summary, result.log);
-
-        let names: Vec<_> = fs::read_dir(&docs.0).unwrap().flatten().map(|e| e.file_name()).collect();
-        assert_eq!(names, vec![std::ffi::OsString::from("chapter.tex")], "aux files must not land next to documents");
     }
 
     // ----- default folder -----

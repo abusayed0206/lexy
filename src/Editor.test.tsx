@@ -109,6 +109,63 @@ describe("Editor", () => {
       });
       expect(view.state.doc.toString()).toBe("0123456789");
     });
+
+  describe("project files", () => {
+    it("switchTo keeps each file's text, selection and undo history", () => {
+      const { handle, view, onChange } = mountWithHandle("");
+      act(() => handle.switchTo("main.tex", "main text"));
+      act(() => view.dispatch({ changes: { from: 4, insert: "!" }, selection: { anchor: 5 } }));
+      act(() => handle.switchTo("chapters\\intro.tex", "intro"));
+      expect(view.state.doc.toString()).toBe("intro");
+      expect(undo(view)).toBe(false);
+      act(() => handle.switchTo("main.tex", "ignored once shown"));
+      expect(view.state.doc.toString()).toBe("main! text");
+      expect(handle.getSelection()).toEqual({ from: 5, to: 5 });
+      act(() => {
+        undo(view);
+      });
+      expect(view.state.doc.toString()).toBe("main text");
+      expect(onChange).toHaveBeenCalledTimes(2); // the typed "!" and its undo, never the switches
+    });
+
+    it("textOf reads shown and hidden files", () => {
+      const { handle } = mountWithHandle("");
+      act(() => handle.switchTo("a.tex", "A"));
+      act(() => handle.switchTo("b.tex", "B"));
+      expect(handle.textOf("a.tex")).toBe("A");
+      expect(handle.textOf("b.tex")).toBe("B");
+      expect(handle.textOf("c.tex")).toBeNull();
+    });
+
+    it("applyTo edits a hidden file as one undo step there, without onChange", () => {
+      const { handle, view, onChange } = mountWithHandle("");
+      act(() => handle.switchTo("main.tex", "abc"));
+      act(() => handle.switchTo("intro.tex", "intro"));
+      onChange.mockClear();
+      expect(handle.applyTo("main.tex", { from: 0, to: 0, insert: "X", selectFrom: 1, selectTo: 1 })).toBe("Xabc");
+      expect(onChange).not.toHaveBeenCalled();
+      expect(view.state.doc.toString()).toBe("intro");
+      act(() => handle.switchTo("main.tex", ""));
+      expect(view.state.doc.toString()).toBe("Xabc");
+      act(() => {
+        undo(view);
+      });
+      expect(view.state.doc.toString()).toBe("abc");
+    });
+
+    it("forget and rename manage stored states", () => {
+      const { handle } = mountWithHandle("");
+      act(() => handle.switchTo("chapters\\a.tex", "A"));
+      act(() => handle.switchTo("main.tex", "M"));
+      handle.rename("chapters", "parts");
+      expect(handle.textOf("parts\\a.tex")).toBe("A");
+      expect(handle.textOf("chapters\\a.tex")).toBeNull();
+      handle.forget("parts\\a.tex");
+      expect(handle.textOf("parts\\a.tex")).toBeNull();
+      handle.rename("main.tex", "thesis.tex");
+      expect(handle.textOf("thesis.tex")).toBe("M");
+    });
+  });
   });
 
   it("cleans up the editor on unmount", () => {

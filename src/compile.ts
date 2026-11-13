@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-/** Mirrors `CompileResult` in src-tauri/src/lib.rs. */
+/** Mirrors `CompileResult` in src-tauri/src/lib.rs. Compiles go through `compileProject` in projects.ts. */
 export type CompileResult = {
   ok: boolean;
   summary: string;
@@ -8,15 +8,6 @@ export type CompileResult = {
   pdfPath: string | null;
   engine: "pdflatex" | "xelatex" | "lualatex";
 };
-
-/**
- * Compile the given text. The backend writes a snapshot into Lexy's build folder and
- * never touches `documentPath`; the path only names the build folder and lets files
- * beside the saved document be found.
- */
-export function compileSource(source: string, documentPath: string | null): Promise<CompileResult> {
-  return invoke<CompileResult>("compile_source", { source, documentPath });
-}
 
 /** Copy a build PDF next to the document as `<name>.pdf`; returns where it was written. */
 export function exportPdf(pdfPath: string, documentPath: string): Promise<string> {
