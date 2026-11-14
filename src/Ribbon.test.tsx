@@ -7,6 +7,8 @@ import { Ribbon, type RibbonActions, type RibbonState } from "./Ribbon";
 vi.mock("./latex/fonts", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./latex/fonts")>()),
   listSystemFonts: vi.fn(() => Promise.resolve(["Arial", "Georgia"])),
+  listKritiFonts: vi.fn(() => Promise.resolve([{ family: "Kalpurush", designer: "", license: "OFL", styles: ["Regular"] }])),
+  installKritiFont: vi.fn(() => Promise.resolve({ family: "Kalpurush", regular: "Kalpurush.ttf", bold: null, italic: null, boldItalic: null })),
 }));
 
 function makeActions(): RibbonActions {

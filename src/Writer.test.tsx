@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { exportPdf, loadPdf, syncToPdf, syncToSource, type CompileResult } from "./compile";
+import { exportPdf, installBanglaFont, loadPdf, syncToPdf, syncToSource, type CompileResult } from "./compile";
 import type { EditorHandle } from "./Editor";
 import { BLOCK_START, XELATEX_MARKER } from "./latex/settings";
 import { chooseProjectFolder } from "./ProjectDialogs";
@@ -80,7 +80,7 @@ vi.mock("./PdfView", async () => {
     },
   };
 });
-vi.mock("./compile", () => ({ loadPdf: vi.fn(), exportPdf: vi.fn(), syncToSource: vi.fn(), syncToPdf: vi.fn() }));
+vi.mock("./compile", () => ({ loadPdf: vi.fn(), exportPdf: vi.fn(), syncToSource: vi.fn(), syncToPdf: vi.fn(), installBanglaFont: vi.fn() }));
 vi.mock("./projects", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./projects")>()),
   compileProject: vi.fn(),
@@ -104,6 +104,8 @@ vi.mock("./ProjectDialogs", async (importOriginal) => ({
 vi.mock("./latex/fonts", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./latex/fonts")>()),
   listSystemFonts: vi.fn(() => Promise.resolve(["Arial", "Georgia"])),
+  listKritiFonts: vi.fn(() => Promise.resolve([{ family: "Kalpurush", designer: "", license: "OFL", styles: ["Regular"] }])),
+  installKritiFont: vi.fn(() => Promise.resolve({ family: "Kalpurush", regular: "Kalpurush.ttf", bold: null, italic: null, boldItalic: null })),
 }));
 type DropHandler = (event: { payload: { type: string; paths?: string[]; position?: { x: number; y: number } } }) => void;
 let dropHandler: DropHandler | null = null;
@@ -634,6 +636,17 @@ describe("Writer", () => {
       expect(editor().value).toContain("\\usepackage{newpxtext,newpxmath}");
     });
 
+    it("picking a kriti.app font copies it into the project and sets it with Bengali shaping", async () => {
+      const { user } = await renderWriter();
+      await user.click(screen.getByRole("combobox", { name: "Font" }));
+      await user.click(await screen.findByRole("option", { name: "Kalpurush" }));
+      const { installKritiFont } = await import("./latex/fonts");
+      await waitFor(() => expect(installKritiFont).toHaveBeenCalledWith(MAIN, "Kalpurush"));
+      await waitFor(() => expect(editor().value).toContain("\\setmainfont{Kalpurush.ttf}[Path=fonts/, Script=Bengali]"));
+      expect(editor().value.startsWith(XELATEX_MARKER)).toBe(true);
+      expect(await screen.findByText("Kalpurush copied to fonts and set as the document font.")).toBeInTheDocument();
+    });
+
     it("applies to the main document while another file is shown", async () => {
       const { user } = await renderWriter();
       await openIntro(user);
@@ -869,6 +882,37 @@ describe("Writer", () => {
       expect(screen.getByText("1 change")).toBeInTheDocument();
       await user.keyboard("{Control>}{Shift>}g{/Shift}{/Control}");
       await waitFor(() => expect(screen.queryByRole("complementary", { name: "Version history" })).toBeNull());
+    });
+  });
+
+  describe("Bangla font", () => {
+    it("offers BCC Purno once after a compile that needed a font, and adds it to the main document", async () => {
+      const { user } = await renderWriter();
+      vi.mocked(compileProject).mockResolvedValueOnce({ ...succeeded, engine: "xelatex", autoFont: "Nirmala UI" });
+      vi.mocked(installBanglaFont).mockResolvedValueOnce(["fonts/BCCPurno-Regular.ttf"]);
+      await user.keyboard("{F5}");
+      await user.click(await screen.findByRole("button", { name: "Add font" }));
+      await waitFor(() => expect(installBanglaFont).toHaveBeenCalledWith(MAIN));
+      await waitFor(() => expect(editor().value).toContain("\\setmainfont{BCCPurno}"));
+      expect(editor().value.startsWith("% !TEX program = xelatex")).toBe(true);
+      expect(await screen.findByText(/BCC Purno added to fonts/)).toBeInTheDocument();
+
+      // Not offered again for this project.
+      vi.mocked(compileProject).mockResolvedValueOnce({ ...succeeded, autoFont: "Nirmala UI" });
+      await user.keyboard("{F5}");
+      await waitFor(() => expect(compileProject).toHaveBeenCalledTimes(2));
+      expect(screen.queryByRole("button", { name: "Add font" })).toBeNull();
+    });
+
+    it("Don't ask again is remembered; read-only windows never offer", async () => {
+      const { user } = await renderWriter();
+      vi.mocked(compileProject).mockResolvedValue({ ...succeeded, autoFont: "Nirmala UI" });
+      await user.keyboard("{F5}");
+      await user.click(await screen.findByRole("button", { name: "Don't ask again" }));
+      await user.keyboard("{F5}");
+      await waitFor(() => expect(compileProject).toHaveBeenCalledTimes(2));
+      expect(screen.queryByRole("button", { name: "Add font" })).toBeNull();
+      expect(installBanglaFont).not.toHaveBeenCalled();
     });
   });
 

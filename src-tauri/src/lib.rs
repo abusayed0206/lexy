@@ -18,6 +18,8 @@ use tauri::{ipc::Response, AppHandle, Emitter, Manager, State};
 
 mod git;
 mod project;
+mod bangla;
+mod kriti;
 mod setup;
 mod sync;
 
@@ -366,6 +368,8 @@ struct CompileResult {
     pdf_path: Option<String>,
     engine: Engine,
     problems: Vec<sync::Problem>,
+    /// Set when Lexy added a font to the compile copy because Bangla text had none.
+    auto_font: Option<String>,
     /// Where `pdf_path` and its SyncTeX data live, for the lookups (spec 003).
     #[serde(skip)]
     shown: Option<sync::Shown>,
@@ -637,7 +641,33 @@ fn compile_project_at(build_root: &Path, root: &Path, main: &str, buffers: &[Buf
             }
         })
         .collect();
-    let (engine, reason) = choose_engine(&main_text, &included);
+    let (mut engine, mut reason) = choose_engine(&main_text, &included);
+
+    // Bangla text with no font setup would fail on pdfLaTeX: compile a copy with XeLaTeX and a
+    // Windows font instead (the user's file is untouched; the UI offers a portable fix).
+    let mut main_text = main_text;
+    let mut auto_font = None;
+    if reason == "default" {
+        let body_files: Vec<String> = ["input", "include"]
+            .into_iter()
+            .flat_map(|command| command_args(&bangla::without_comments(&main_text), command))
+            .filter_map(|name| {
+                let rel = if name.to_ascii_lowercase().ends_with(".tex") { name } else { format!("{name}.tex") };
+                let path = resolve_in_project(root, &rel).ok()?;
+                match overlay_files.iter().find(|(buffered, _)| *buffered == path) {
+                    Some((_, text)) => Some(text.to_string()),
+                    None => project::read_file_at(root, &rel).ok(),
+                }
+            })
+            .collect();
+        let bangla = std::iter::once(&main_text).chain(&body_files).any(|text| bangla::has_bangla(&bangla::without_comments(text)));
+        if let Some(patched) = bangla.then(|| bangla::with_system_font(&main_text)).flatten() {
+            main_text = patched;
+            engine = Engine::Xelatex;
+            reason = format!("Bangla text without a font setup; using {} for this compile", bangla::SYSTEM_FONT);
+            auto_font = Some(bangla::SYSTEM_FONT.to_string());
+        }
+    }
 
     // Plain (non-`\\?\`) paths: TeX and latexmk don't understand verbatim paths.
     let plain_root = PathBuf::from(project::display_path(root));
@@ -677,6 +707,8 @@ fn compile_project_at(build_root: &Path, root: &Path, main: &str, buffers: &[Buf
     if let Some(note) = note {
         result.log = format!("{note}\n{}", result.log);
     }
+
+    result.auto_font = auto_font;
 
     // Problems with project-relative files, and the shown slot for click-to-jump (spec 003).
     let mut roots = vec![plain_root.clone()];
@@ -744,6 +776,7 @@ fn run_latexmk_inner(out_dir: &Path, stem: &str, engine: Engine, inputs: &std::f
             pdf_path: None,
             engine,
             problems: Vec::new(),
+            auto_font: None,
             shown: None,
             tools_dir: None,
         });
@@ -808,6 +841,7 @@ fn run_latexmk_inner(out_dir: &Path, stem: &str, engine: Engine, inputs: &std::f
         pdf_path: ok.then(|| pdf.display().to_string()),
         engine,
         problems: Vec::new(),
+        auto_font: None,
         shown: None,
         tools_dir: environment.miktex.path.as_deref().and_then(|path| Path::new(path).parent()).map(Path::to_path_buf),
     })
@@ -1125,7 +1159,10 @@ pub fn run() {
             git::git_resolve,
             git::git_abort_merge,
             sync::sync_to_source,
-            sync::sync_to_pdf
+            sync::sync_to_pdf,
+            bangla::install_bangla_font,
+            kriti::kriti_fonts,
+            kriti::install_kriti_font
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1846,6 +1883,93 @@ mod tests {
     }
 
     #[test]
+    fn bangla_without_setup_compiles_and_purno_makes_it_portable() {
+        if !detect_environment().ready {
+            eprintln!("skipping: LaTeX tools not installed");
+            return;
+        }
+        // The user's document from the bug report: Bangla text, no font packages.
+        let doc = "\\documentclass{article}\n\n\\title{Untitled}\n\\author{fsdfsdfsdfs}\n\\date{\\today}\n\n\\begin{document}\n\n\\maketitle\n\n\\section{Intrxzczxcoduction}\n\nStart writing here. sdvvsdvsdv svsddsfds fdsfsadfsdfsadফসদফদফ দ্ভস্ফাস্ফদ \n\n\\end{document}\n";
+        let build = TempDir::new("bangla-build");
+        let (dir, root) = project_dir("bangla-auto", doc);
+        let result = compile_project_at(&build.0, &root, "main.tex", &[]).unwrap();
+        assert!(result.ok, "{}\n{}", result.summary, result.log);
+        assert_eq!(result.engine, Engine::Xelatex);
+        assert_eq!(result.auto_font.as_deref(), Some(bangla::SYSTEM_FONT));
+        assert!(result.log.contains("Bangla text without a font setup"), "{}", &result.log[..200.min(result.log.len())]);
+        assert_eq!(fs::read_to_string(dir.0.join("main.tex")).unwrap(), doc, "the user's file is untouched");
+
+        // Portable setup: BCC Purno in fonts/ plus the block the UI writes (src/latex/scriptFont.ts).
+        let local = env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap();
+        let cache = local.join("Lexy").join("Fonts").join("BCCPurno");
+        fs::create_dir_all(&cache).unwrap();
+        for (name, remote, sha) in bangla::PURNO_FILES {
+            // Fails loudly: a silent skip once hid a TLS bug. Set LEXY_OFFLINE=1 to skip without a network.
+            if let Err(error) = setup::download(&format!("https://kriti.app/fonts/{remote}"), &cache.join(name), Some(sha), &mut |_, _| {}) {
+                if env::var_os("LEXY_OFFLINE").is_some() {
+                    eprintln!("skipping the portable part: {error}");
+                    return;
+                }
+                panic!("downloading {name} failed: {error}");
+            }
+        }
+        bangla::copy_purno(&cache, &dir.0).unwrap();
+        let portable = doc.replacen(
+            "\\documentclass{article}\n",
+            "% !TEX program = xelatex\n\\documentclass{article}\n% --- Lexy Bangla font (BCC Purno in fonts/) ---\n\\usepackage{fontspec}\n\\setmainfont{BCCPurno}[Path=fonts/, Extension=.ttf, Script=Bengali, UprightFont=*-Regular, BoldFont=*-Bold, ItalicFont=*-Italic, BoldItalicFont=*-BoldItalic]\n% --- end Lexy Bangla font ---\n",
+            1,
+        );
+        fs::write(dir.0.join("main.tex"), &portable).unwrap();
+        let result = compile_project_at(&build.0, &root, "main.tex", &[]).unwrap();
+        assert!(result.ok, "{}\n{}", result.summary, result.log);
+        assert_eq!((result.engine, result.auto_font.as_deref()), (Engine::Xelatex, None));
+        let log = fs::read_to_string(Path::new(result.pdf_path.as_deref().unwrap()).parent().and_then(Path::parent).unwrap().join("main.log")).unwrap();
+        assert!(log.contains("BCCPurno-Regular.ttf"), "the project font must be used");
+        assert!(!log.contains("Missing character"), "every Bangla glyph must be in the font");
+    }
+
+    /// Conjuncts must be shaped: the width of ক্ষ is less than ক + ্ + ষ drawn separately.
+    #[test]
+    fn bangla_conjuncts_are_shaped_with_both_font_setups() {
+        if !detect_environment().ready {
+            eprintln!("skipping: LaTeX tools not installed");
+            return;
+        }
+        let probe = "\\setbox0\\hbox{ক্ষ}\\setbox2\\hbox{ক}\\setbox4\\hbox{্}\\setbox6\\hbox{ষ}\\typeout{LEXYW \\the\\wd0 \\the\\wd2 \\the\\wd4 \\the\\wd6 LEXYW}\nবাংলা ক্ষমা\n";
+        let auto = format!("\\documentclass{{article}}\n\\begin{{document}}\n{probe}\\end{{document}}\n");
+        let local = env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap();
+        let cache = local.join("Lexy").join("Fonts").join("BCCPurno");
+        let build = TempDir::new("shape-build");
+        let mut cases = vec![("shape-auto", auto.clone(), false)];
+        let portable = auto.replacen(
+            "\\documentclass{article}\n",
+            "\\documentclass{article}\n\\usepackage{fontspec}\n\\setmainfont{BCCPurno}[Path=fonts/, Extension=.ttf, Script=Bengali, UprightFont=*-Regular, BoldFont=*-Bold, ItalicFont=*-Italic, BoldItalicFont=*-BoldItalic]\n",
+            1,
+        );
+        if cache.join("BCCPurno-Regular.ttf").is_file() {
+            cases.push(("shape-purno", portable, true));
+        } else {
+            eprintln!("BCC Purno not cached; checking the automatic font only");
+        }
+        for (label, text, purno) in cases {
+            let (dir, root) = project_dir(label, &text);
+            if purno {
+                bangla::copy_purno(&cache, &dir.0).unwrap();
+            }
+            let result = compile_project_at(&build.0, &root, "main.tex", &[]).unwrap();
+            assert!(result.ok, "{label}: {}\n{}", result.summary, result.log);
+            let out = Path::new(result.pdf_path.as_deref().unwrap()).parent().and_then(Path::parent).unwrap().to_path_buf();
+            let log = fs::read_to_string(out.join("main.log")).unwrap().replace(['\r', '\n'], "");
+            let start = log.find("LEXYW ").expect("width probe in the log") + 6;
+            let end = start + log[start..].find("LEXYW").unwrap();
+            // TeX eats the spaces after each \the\wd, so the values arrive as 10.0pt8.7pt…
+            let widths: Vec<f64> = log[start..end].split("pt").map(str::trim).filter(|w| !w.is_empty()).map(|w| w.parse().unwrap()).collect();
+            let separate = widths[1] + widths[2] + widths[3];
+            assert!(widths[0] + 0.5 < separate, "{label}: ক্ষ is {}pt, separate letters {separate}pt: conjunct not shaped", widths[0]);
+        }
+    }
+
+    #[test]
     fn compile_end_to_end_when_tools_are_installed() {
         if !detect_environment().ready {
             eprintln!("skipping: LaTeX tools not installed");
@@ -2033,6 +2157,7 @@ mod tests {
             pdf_path: Some("C:\\x.pdf".into()),
             engine: Engine::Xelatex,
             problems: vec![sync::Problem { severity: sync::Severity::Error, file: Some("a.tex".into()), line: Some(2), message: "x".into() }],
+            auto_font: None,
             shown: None,
             tools_dir: None,
         })

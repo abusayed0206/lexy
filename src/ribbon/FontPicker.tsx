@@ -1,5 +1,5 @@
 import { useId, useMemo, useRef, useState } from "react";
-import { BUILTIN_FONTS, fontLabel, listSystemFonts, sameFont, type FontChoice } from "../latex/fonts";
+import { BUILTIN_FONTS, fontLabel, listKritiFonts, listSystemFonts, sameFont, type FontChoice, type KritiFamily } from "../latex/fonts";
 
 type Props = {
   value: FontChoice;
@@ -8,14 +8,16 @@ type Props = {
   onChange: (font: FontChoice) => void;
 };
 
-type Option = { key: string; label: string; font: FontChoice; group: "builtin" | "system" };
+type Option = { key: string; label: string; font: FontChoice; group: "builtin" | "kriti" | "system"; title?: string };
 
-/** ARIA combobox: built-in fonts first, then filterable installed fonts (loaded on first open). */
+/** ARIA combobox: built-in fonts, then Bangla fonts from kriti.app, then installed fonts (both loaded on first open). */
 export function FontPicker({ value, managed, onChange }: Props) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [installed, setInstalled] = useState<string[] | null>(null);
   const [loadError, setLoadError] = useState(false);
+  const [kriti, setKriti] = useState<KritiFamily[] | null>(null);
+  const [kritiError, setKritiError] = useState(false);
   const [active, setActive] = useState(0);
   const input = useRef<HTMLInputElement>(null);
   const listId = useId();
@@ -35,14 +37,30 @@ export function FontPicker({ value, managed, onChange }: Props) {
       font: { kind: "system", family },
       group: "system",
     }));
-    return [...builtin, ...system];
-  }, [query, installed]);
+    const bangla: Option[] = (kriti ?? [])
+      .filter((family) => matches(family.family))
+      .map((family) => ({
+        key: `k:${family.family}`,
+        label: family.family,
+        font: { kind: "kriti", family: family.family },
+        group: "kriti",
+        title: [family.designer, family.license, family.styles.join(", ")].filter(Boolean).join(" · "),
+      }));
+    return [...builtin, ...bangla, ...system];
+  }, [query, installed, kriti]);
 
   function openList() {
     if (open) return;
     setOpen(true);
     setQuery("");
     setActive(Math.max(0, options.findIndex((option) => sameFont(option.font, value))));
+    if (kriti === null) {
+      setKritiError(false);
+      listKritiFonts().then(setKriti, () => {
+        setKriti([]);
+        setKritiError(true);
+      });
+    }
     if (installed === null) {
       listSystemFonts().then(setInstalled, () => {
         setInstalled([]);
@@ -61,6 +79,7 @@ export function FontPicker({ value, managed, onChange }: Props) {
   const shown = managed ? fontLabel(value) : "Default";
   const builtinOptions = options.filter((option) => option.group === "builtin");
   const systemOptions = options.filter((option) => option.group === "system");
+  const kritiOptions = options.filter((option) => option.group === "kriti");
   const optionId = (index: number) => `${listId}-${index}`;
 
   return (
@@ -112,6 +131,14 @@ export function FontPicker({ value, managed, onChange }: Props) {
               {builtinOptions.map((option) => renderOption(option, options.indexOf(option)))}
             </div>
           ) : null}
+          <div role="group" aria-label="Bangla fonts from kriti.app">
+            <div className="font-group" aria-hidden="true">
+              Bangla fonts (kriti.app, copied into the project)
+            </div>
+            {kriti === null ? <div className="font-note">Loading the kriti.app catalog</div> : null}
+            {kritiError ? <div className="font-note">Could not load the kriti.app catalog (offline?)</div> : null}
+            {kritiOptions.map((option) => renderOption(option, options.indexOf(option)))}
+          </div>
           <div role="group" aria-label="Installed fonts">
             <div className="font-group" aria-hidden="true">
               Installed fonts (XeLaTeX)
@@ -120,7 +147,7 @@ export function FontPicker({ value, managed, onChange }: Props) {
             {loadError ? <div className="font-note">Could not list installed fonts</div> : null}
             {systemOptions.map((option) => renderOption(option, options.indexOf(option)))}
           </div>
-          {!options.length && installed !== null ? <div className="font-note">No matching fonts</div> : null}
+          {!options.length && installed !== null && kriti !== null ? <div className="font-note">No matching fonts</div> : null}
         </div>
       ) : null}
     </div>
@@ -134,6 +161,7 @@ export function FontPicker({ value, managed, onChange }: Props) {
         role="option"
         aria-selected={index === active}
         className={index === active ? "font-option active" : "font-option"}
+        title={option.title}
         style={option.group === "system" ? { fontFamily: `"${option.label}"` } : undefined}
         onMouseDown={(event) => event.preventDefault()}
         onMouseEnter={() => setActive(index)}

@@ -77,4 +77,19 @@ describe("listSystemFonts", () => {
     await expect(listSystemFonts()).rejects.toBe("boom");
     await expect(listSystemFonts()).resolves.toEqual(["Arial"]);
   });
+
+  it("round-trips a project font from kriti.app with Bengali shaping", async () => {
+    const { fontLines, fontFromLines, fontLabel } = await import("./fonts");
+    const font = { kind: "project" as const, family: "BCC Purno", regular: "BCC-Purno-Regular.ttf", bold: "BCC-Purno-Bold.ttf", italic: null, boldItalic: "BCC-Purno-Bold-Italic.ttf" };
+    const lines = fontLines(font);
+    expect(lines).toEqual([
+      "% kriti.app font: BCC Purno",
+      "\\usepackage{fontspec}",
+      "\\setmainfont{BCC-Purno-Regular.ttf}[Path=fonts/, Script=Bengali, BoldFont=BCC-Purno-Bold.ttf, BoldItalicFont=BCC-Purno-Bold-Italic.ttf]",
+    ]);
+    expect(fontFromLines(lines)).toEqual(font);
+    expect(fontLabel(font)).toBe("BCC Purno");
+    expect(() => fontLines({ ...font, regular: "bad}name.ttf" })).toThrow();
+    expect(() => fontLines({ kind: "kriti", family: "Kalpurush" })).toThrow();
+  });
 });

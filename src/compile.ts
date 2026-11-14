@@ -9,7 +9,12 @@ export type CompileResult = {
   engine: "pdflatex" | "xelatex" | "lualatex";
   /** Errors and warnings with project-relative files (spec 003). */
   problems?: Problem[];
+  /** Set when Lexy compiled a copy with this font because Bangla text had no font setup. */
+  autoFont?: string | null;
 };
+
+/** Copy BCC Purno into the `fonts` folder next to the main document; returns the files written. */
+export const installBanglaFont = (main: string) => invoke<string[]>("install_bangla_font", { main });
 
 /** Mirrors `sync::Problem`. `file` is project-relative with `/`, null when outside the project. */
 export type Problem = { severity: "error" | "warning"; file: string | null; line: number | null; message: string };

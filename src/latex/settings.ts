@@ -151,7 +151,7 @@ export function applySettings(source: string, settings: DocumentSettings): strin
   else lines.splice(classIndex + 1, 0, ...block);
 
   const hasMarker = lines[0]?.trim() === XELATEX_MARKER;
-  const wantsMarker = settings.font.kind === "system";
+  const wantsMarker = settings.font.kind !== "builtin";
   if (hasMarker && !wantsMarker) lines.shift();
   if (!hasMarker && wantsMarker) lines.unshift(XELATEX_MARKER);
 

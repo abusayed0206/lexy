@@ -377,7 +377,14 @@ pub(crate) fn download(
     let _ = fs::remove_file(destination);
 
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .tls_config(ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::NativeTls).build())
+        // Windows' own certificate store (like the browser): the bundled Mozilla list misses
+        // some current chains, such as kriti.app's.
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
         .timeout_connect(Some(Duration::from_secs(30)))
         .timeout_per_read(Some(Duration::from_secs(60)))
         .build()

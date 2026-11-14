@@ -1,10 +1,11 @@
 import { lazy, Suspense, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { exportPdf, loadPdf, syncToPdf, syncToSource, type CompileResult, type Problem } from "./compile";
+import { exportPdf, installBanglaFont, loadPdf, syncToPdf, syncToSource, type CompileResult, type Problem } from "./compile";
+import { addPurnoSetup, hasOutdatedPurnoSetup } from "./latex/scriptFont";
 import { Editor, type EditorHandle } from "./Editor";
 import { findEquationAt, wrapEquation, type FoundEquation } from "./latex/equations";
-import type { FontChoice } from "./latex/fonts";
+import { installKritiFont, type FontChoice } from "./latex/fonts";
 import { footnote, insertBlock, pageBreak, replaceWith, setHeading, toList, wrap, type TextEdit } from "./latex/format";
 import { applySettings, conflicts, hasSettingsBlock, parseSettings, type DocumentSettings, type FontSize } from "./latex/settings";
 import { tableLatex, type TableSpec } from "./latex/tables";
@@ -199,6 +200,10 @@ export function Writer({ project, onSwitch }: Props) {
   const [problems, setProblems] = useState<Problem[]>([]);
   const [drawerTab, setDrawerTab] = useState<"problems" | "log">("problems");
   const [zoom, setZoom] = useState<Zoom>("fit");
+  /** One-time offer to put a Bangla font into the project (Lexy compiles with Nirmala UI meanwhile). */
+  const [banglaOffer, setBanglaOffer] = useState(false);
+  const banglaDismissed = useRef(false);
+  const banglaKey = `lexy.banglaFont:${project.root.toLowerCase()}`;
   const dragging = useRef<"split" | "sidebar" | null>(null);
   const editor = useRef<EditorHandle>(null);
   const live = useRef<LivePreview | null>(null);
@@ -224,6 +229,18 @@ export function Writer({ project, onSwitch }: Props) {
   const currentFile = current !== null ? files.files.get(current) : undefined;
   const main = files.main;
   const mainText = main !== null ? (files.files.get(keyOf(files, main) ?? main)?.text ?? null) : null;
+
+  // Lexy owns its marked Bangla block: an older version (no Script=Bengali, broken conjuncts)
+  // is updated in place once, as one undo step.
+  useEffect(() => {
+    if (readOnly || mainText === null || main === null || !hasOutdatedPurnoSetup(mainText)) return;
+    const key = keyOf(filesRef.current, main);
+    const updated = addPurnoSetup(mainText);
+    if (key === undefined || updated === null) return;
+    replaceMainText(key, mainText, updated);
+    setInfo("Updated Lexy's Bangla font block so conjuncts render correctly.");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mainText]);
   const dirty = useMemo(() => dirtyFiles(files), [files]);
   const dirtySet = useMemo(() => new Set(dirty.map((path) => path.toLowerCase())), [dirty]);
 
@@ -294,6 +311,7 @@ export function Writer({ project, onSwitch }: Props) {
       result = failure(error);
     }
     await showResult(result, origin, sent.length === 0, version);
+    if (result.autoFont && !readOnly && !banglaDismissed.current && readStorage(banglaKey) === null) setBanglaOffer(true);
     return result;
   }
   const compileRef = useRef(compileNow);
@@ -780,17 +798,69 @@ export function Writer({ project, onSwitch }: Props) {
         setNotice(`This document already sets fonts or margins itself (${clashes[0]}). Lexy's settings may conflict with it.`);
       }
       const key = keyOf(filesRef.current, target)!;
-      if (key === filesRef.current.current) {
-        editor.current?.replaceAll(updated);
-        return;
-      }
-      const result = editor.current?.applyTo(key, { from: 0, to: text.length, insert: updated, selectFrom: 0, selectTo: 0 }) ?? null;
-      if (result === null) editor.current?.forget(key);
-      applyFiles({ type: "edited", path: key, text: result ?? updated });
-      afterEdit();
-      setInfo(`Applied to ${baseName(key)}`);
+      const shown = key === filesRef.current.current;
+      replaceMainText(key, text, updated);
+      if (!shown) setInfo(`Applied to ${baseName(key)}`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  /** Copy BCC Purno into the project and add its setup block to the main document. */
+  async function addBanglaFont() {
+    setBanglaOffer(false);
+    const target = filesRef.current.main;
+    const key = target === null ? undefined : keyOf(filesRef.current, target);
+    const text = key === undefined ? undefined : filesRef.current.files.get(key)?.text;
+    if (target === null || key === undefined || text === undefined) {
+      setNotice("Open the main document first.");
+      return;
+    }
+    setInfo("Adding BCC Purno…");
+    try {
+      await installBanglaFont(target);
+    } catch (error) {
+      setNotice(`Could not add BCC Purno. ${errorText(error)}`);
+      return;
+    }
+    writeStorage(banglaKey, "added");
+    const updated = addPurnoSetup(text);
+    if (updated !== null) replaceMainText(key, text, updated);
+    setTreeVersion((v) => v + 1);
+    setInfo("BCC Purno added to fonts. The document now compiles anywhere with XeLaTeX.");
+  }
+
+  /** Replace the main document's text as one undo step, whether or not it is on screen. */
+  function replaceMainText(key: string, text: string, updated: string) {
+    if (key === filesRef.current.current) {
+      editor.current?.replaceAll(updated);
+      return;
+    }
+    const result = editor.current?.applyTo(key, { from: 0, to: text.length, insert: updated, selectFrom: 0, selectTo: 0 }) ?? null;
+    if (result === null) editor.current?.forget(key);
+    applyFiles({ type: "edited", path: key, text: result ?? updated });
+    afterEdit();
+  }
+
+  /** Built-in and installed fonts apply at once; a kriti.app family is copied into the project first. */
+  async function chooseFont(font: FontChoice) {
+    if (font.kind !== "kriti") {
+      changeSettings({ ...settings, font });
+      return;
+    }
+    const target = filesRef.current.main;
+    if (target === null || readOnly) {
+      setNotice("Open the main document first. Lexy keeps page and font settings there.");
+      return;
+    }
+    setInfo(`Adding ${font.family} from kriti.app…`);
+    try {
+      const added = await installKritiFont(target, font.family);
+      setTreeVersion((v) => v + 1);
+      changeSettings({ ...settings, font: { kind: "project", ...added } });
+      setInfo(`${font.family} copied to fonts and set as the document font.`);
+    } catch (error) {
+      setNotice(`Could not add ${font.family}. ${errorText(error)}`);
     }
   }
 
@@ -845,7 +915,7 @@ export function Writer({ project, onSwitch }: Props) {
       setEquation({ found });
     },
     onTable: insertTable,
-    onFont: (font: FontChoice) => changeSettings({ ...settings, font }),
+    onFont: (font: FontChoice) => void chooseFont(font),
     onSize: (size: FontSize) => changeSettings({ ...settings, size }),
     onLayout: changeSettings,
     onGit,
@@ -996,6 +1066,37 @@ export function Writer({ project, onSwitch }: Props) {
             </button>
             <button type="button" onClick={() => applyFiles({ type: "keptMine", path: current! })}>
               Keep mine
+            </button>
+          </span>
+        </div>
+      ) : null}
+      {banglaOffer ? (
+        <div className="notice info" role="status">
+          <span>
+            Bangla text without a Bangla font: the preview uses Nirmala UI. Add BCC Purno (Bangladesh Computer Council, 0.8 MB) to this
+            project so it compiles on any computer and on Overleaf (choose XeLaTeX there)?
+          </span>
+          <span className="notice-actions">
+            <button type="button" onClick={() => void addBanglaFont()}>
+              Add font
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                banglaDismissed.current = true;
+                setBanglaOffer(false);
+              }}
+            >
+              Not now
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                writeStorage(banglaKey, "never");
+                setBanglaOffer(false);
+              }}
+            >
+              Don't ask again
             </button>
           </span>
         </div>
