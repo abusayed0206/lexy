@@ -62,54 +62,64 @@ Some Rust tests run real compiles with MiKTeX, `latexmk` and Perl, and skip them
 Lexy is a [Tauri 2](https://tauri.app) app: a React 19 + TypeScript front end (CodeMirror 6 editor, pdf.js preview) and a Rust back end that owns everything that touches files or runs programs.
 
 ```mermaid
-flowchart LR
+flowchart TB
   subgraph UI["Front end · React (presentation only)"]
-    direction TB
-    Ribbon["Ribbon<br/>edits = pure functions in src/latex"]
-    Editor["Editor · CodeMirror 6<br/>one state per file, lint markers"]
-    Preview["PdfView · pdf.js<br/>zoom + scroll anchor"]
+    direction LR
+    Ribbon["Ribbon<br/>LaTeX edits from src/latex"]
+    Editor["Editor<br/>CodeMirror 6 · problem markers"]
+    Preview["PDF preview<br/>pdf.js · zoom kept"]
     GitPanel["Git panel"]
   end
 
   subgraph Rust["Back end · Rust (owns files and processes)"]
-    direction TB
-    Gate["project.rs<br/>path gate: project-relative only"]
-    Compile["compile_project<br/>engine choice, snapshot, overlay"]
-    Sync["sync.rs<br/>SyncTeX lookups, log → problems"]
+    direction LR
+    Gate["project.rs<br/>path gate"]
+    Compile["compile_project<br/>engine · snapshot · overlay"]
+    Sync["sync.rs<br/>SyncTeX · log → problems"]
     Fonts["bangla.rs · kriti.rs<br/>Bangla fonts"]
-    GitRs["git.rs"]
     Setup["setup.rs<br/>first-run install"]
+    GitRs["git.rs"]
   end
 
-  Project[("Project folder<br/>.tex, chapters, images, .bib, fonts/")]
-  Build[("%LOCALAPPDATA%\Lexy\Build\‹hash›<br/>snapshot · .lexy-overlay · .lexy-shown")]
-  TeX["latexmk → pdfLaTeX / XeLaTeX<br/>MiKTeX · synctex.exe"]
-  GitExe["Git for Windows · GitHub CLI"]
-  Net["kriti.app · MiKTeX / Perl downloads"]
+  subgraph Ext["Programs and services"]
+    direction LR
+    TeX["latexmk · MiKTeX<br/>pdfLaTeX / XeLaTeX · synctex"]
+    Net["kriti.app · MiKTeX / Perl<br/>downloads"]
+    GitExe["Git for Windows<br/>GitHub CLI"]
+  end
 
-  Ribbon -- "text edit, one undo step" --> Editor
-  Editor -- "save: invoke write_file" --> Gate
-  Gate -- "reads / writes" --> Project
-  Project -. "watcher: project-changed" .-> Editor
-  Editor -- "~1 s pause: main + unsaved buffers" --> Compile
-  Compile -- "writes snapshot + overlay" --> Build
-  Compile -- "runs, TEXINPUTS = overlay; project" --> TeX
-  TeX -- "reads saved files, images, fonts" --> Project
-  TeX -- "PDF, .synctex.gz, .log" --> Build
-  Compile -- "CompileResult: PDF path, problems" --> Preview
-  Build -- "read_pdf (build folder only)" --> Preview
-  Preview -- "double-click page,x,y" --> Sync
-  Editor -- "Ctrl+J file,line" --> Sync
-  Sync -- "synctex edit / view" --> Build
-  Fonts -- "copy font + notice into fonts/" --> Project
-  Fonts -- "verified download" --> Net
-  GitPanel -- "invoke git_*" --> GitRs
-  GitRs -- "git / gh, hidden console" --> GitExe
-  GitExe -- "commits, push, pull" --> Project
-  Setup -- "pinned SHA-256" --> Net
+  subgraph Disk["On disk"]
+    direction LR
+    Project[("Your project folder<br/>.tex · chapters · images · .bib · fonts/")]
+    Build[("Build folder in %LOCALAPPDATA%\Lexy<br/>snapshot · overlay · last good PDF")]
+  end
+
+  Ribbon -->|"one undo step"| Editor
+  Editor -->|"save"| Gate
+  Editor -->|"1 s after typing: text + unsaved files"| Compile
+  Editor -->|"Ctrl+J: file, line"| Sync
+  Preview -->|"double-click: page, x, y"| Sync
+  GitPanel -->|"git_* commands"| GitRs
+
+  Gate -->|"read / write (inside the project only)"| Project
+  Compile -->|"snapshot + overlay"| Build
+  Compile -->|"runs latexmk"| TeX
+  Sync -->|"synctex edit / view"| TeX
+  Fonts -->|"verified download"| Net
+  Setup -->|"pinned SHA-256"| Net
+  Fonts -->|"font files + notice"| Project
+  GitRs -->|"git / gh"| GitExe
+
+  TeX -->|"reads sources"| Project
+  TeX -->|"PDF · SyncTeX · log"| Build
+  GitExe -->|"history"| Project
+
+  Compile -.->|"result: PDF path, problems"| Preview
+  Build -.->|"read_pdf"| Preview
+  Project -.->|"file watcher"| Editor
 ```
 
-*Every arrow into Rust is a typed `invoke` command; React never touches the disk or starts a process. Compiles read your project but only write into the build folder, and the last good PDF and its SyncTeX data sit in `.lexy-shown`, which a failed compile never overwrites.*
+*Solid arrows are requests and writes; dotted arrows bring results back to the screen. Every arrow out of the front end is a typed `invoke` command, so React never touches the disk or starts a process. Compiles read your project but write only into the build folder, where the last good PDF and its SyncTeX data are kept; a failed compile never overwrites them.*
 
 - **Compiling never touches your files.** The main document is written to a snapshot in `%LOCALAPPDATA%\Lexy\Build\…`, unsaved open files go into an overlay folder that TeX searches first, and everything else (chapters, images, `.bib`, fonts) is read straight from the project. `latexmk` runs with pdfLaTeX, or XeLaTeX when the document needs it (a `% !TEX program` line, packages like `fontspec`/`polyglossia`/`latexbangla`, or Bangla text). Every compile also writes SyncTeX data for the PDF ↔ source jumps.
 - **Paths are checked in one place.** Every file command takes a project-relative path and goes through one gate that refuses `..`, other drives, reserved names and links that lead out of the project.
