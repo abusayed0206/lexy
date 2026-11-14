@@ -86,4 +86,8 @@ Ideas go into the "Manual Feature Intake" table in `docs/TRACKER.md` first. Each
 
 ## License
 
-No license has been chosen yet, so the code is "all rights reserved" for now: you can read it, but reuse needs the author's permission until a `LICENSE` file is added.
+Lexy is free software under the **GNU General Public License v3.0 or later** ([`LICENSE`](LICENSE)), copyright © 2026 MD. ABU SAYED.
+
+In short: you may use, study, change and share Lexy. If you distribute Lexy or a modified version, you must keep the copyright and license notices (credit the original project), release your complete source code under the same license, and state what you changed. See [`LICENSE`](LICENSE) for the exact terms.
+
+Third-party fonts and tools keep their own licenses (see "Fonts and third-party notices" above); the bundled BCC Purno font is not covered by the GPL.
