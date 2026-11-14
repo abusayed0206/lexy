@@ -45,7 +45,9 @@ export function useChoice() {
   return { ask, dialog };
 }
 
-type NamePending = { title: string; label: string; initial: string; resolve: (value: string | null) => void };
+/** Returns an error message, or null when the value is fine. */
+export type Validate = (value: string) => string | null;
+type NamePending = { title: string; label: string; initial: string; validate?: Validate; resolve: (value: string | null) => void };
 
 /** Promise-based single-name prompt with Windows name validation. */
 export function useNamePrompt() {
@@ -55,11 +57,11 @@ export function useNamePrompt() {
   const input = useRef<HTMLInputElement>(null);
 
   const prompt = useCallback(
-    (title: string, label: string, initial: string) =>
+    (title: string, label: string, initial: string, validate?: Validate) =>
       new Promise<string | null>((resolve) => {
         setValue(initial);
         setError(null);
-        setPending({ title, label, initial, resolve });
+        setPending({ title, label, initial, validate, resolve });
       }),
     [],
   );
@@ -69,6 +71,12 @@ export function useNamePrompt() {
   };
   const submit = () => {
     const name = value.trim();
+    if (pending?.validate) {
+      const problem = pending.validate(name);
+      if (problem) setError(problem);
+      else finish(name);
+      return;
+    }
     // Paths like chapters\intro.tex are allowed in Save as; every part must be a valid name.
     if (!name || !name.split(/[\\/]/).every(validName)) {
       setError(INVALID_NAME_MESSAGE);

@@ -22,6 +22,7 @@ function makeActions(): RibbonActions {
     onToggleLogs: vi.fn(),
     onToggleLive: vi.fn(),
     onToggleFiles: vi.fn(),
+    onGit: vi.fn(),
     onFormat: vi.fn(),
     onList: vi.fn(),
     onHeading: vi.fn(),
@@ -50,6 +51,8 @@ const baseState: RibbonState = {
   logsOpen: false,
   liveEnabled: true,
   filesOpen: true,
+  git: null,
+  gitOpen: false,
   recent: [{ path: "D:\\Papers\\Survey", name: "Survey" }],
   settings: DEFAULT_SETTINGS,
   settingsManaged: true,
@@ -70,7 +73,7 @@ describe("Ribbon tabs", () => {
   it("shows File, Home, Insert, Layout, View with Home selected by default", () => {
     setup();
     expect(screen.getByRole("tablist", { name: "Ribbon" })).toBeInTheDocument();
-    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual(["File", "Home", "Insert", "Layout", "View"]);
+    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual(["File", "Home", "Insert", "Layout", "View", "Git"]);
     expect(tab("Home")).toHaveAttribute("aria-selected", "true");
     expect(screen.getByRole("tabpanel", { name: "Home" })).toBeVisible();
   });
@@ -84,11 +87,11 @@ describe("Ribbon tabs", () => {
     expect(tab("Insert")).toHaveAttribute("tabindex", "0");
     expect(tab("Home")).toHaveAttribute("tabindex", "-1");
     await user.keyboard("{End}");
-    expect(tab("View")).toHaveFocus();
+    expect(tab("Git")).toHaveFocus();
     await user.keyboard("{ArrowRight}");
     expect(tab("File")).toHaveFocus();
     await user.keyboard("{ArrowLeft}");
-    expect(tab("View")).toHaveFocus();
+    expect(tab("Git")).toHaveFocus();
     await user.keyboard("{Home}");
     expect(tab("File")).toHaveFocus();
   });

@@ -16,6 +16,7 @@ use std::{
 };
 use tauri::{ipc::Response, AppHandle, Emitter, Manager, State};
 
+mod git;
 mod project;
 mod setup;
 
@@ -188,7 +189,7 @@ fn verify_sha256(path: &Path, expected_sha256: Option<&str>) -> Result<(), Strin
     Ok(())
 }
 
-fn find_on_path(command_name: &str) -> Option<PathBuf> {
+pub(crate) fn find_on_path(command_name: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     for entry in env::split_paths(&path) {
         let candidate = entry.join(command_name);
@@ -932,7 +933,7 @@ async fn list_system_fonts(cache: State<'_, FontCache>) -> Result<Vec<String>, S
 // ---------------------------------------------------------------------------
 
 /// No console window flashes up when Lexy runs a tool (docs/PLAN.md principle 3).
-fn hide_console(command: &mut Command) -> &mut Command {
+pub(crate) fn hide_console(command: &mut Command) -> &mut Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -942,15 +943,15 @@ fn hide_console(command: &mut Command) -> &mut Command {
     command
 }
 
-struct ProcessOutput {
-    success: bool,
-    code: Option<i32>,
-    stdout: String,
-    stderr: String,
-    timed_out: bool,
+pub(crate) struct ProcessOutput {
+    pub(crate) success: bool,
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+    pub(crate) timed_out: bool,
 }
 
-fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<ProcessOutput, String> {
+pub(crate) fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<ProcessOutput, String> {
     let mut child = hide_console(&mut command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -997,7 +998,7 @@ fn read_to_end_in_background<R: Read + Send + 'static>(mut reader: R) -> JoinHan
 }
 
 /// latexmk spawns pdflatex; killing only latexmk would leave the child holding our pipes.
-fn kill_tree(child: &mut std::process::Child) {
+pub(crate) fn kill_tree(child: &mut std::process::Child) {
     #[cfg(windows)]
     {
         let mut taskkill = Command::new("taskkill");
@@ -1020,6 +1021,7 @@ pub fn run() {
         .manage(FontCache(Arc::new(OnceLock::new())))
         .manage(SetupGuard(Arc::new(AtomicBool::new(false))))
         .manage(project::ProjectState::default())
+        .manage(git::GitLock::default())
         .invoke_handler(tauri::generate_handler![
             check_environment,
             start_initial_setup,
@@ -1045,7 +1047,23 @@ pub fn run() {
             project::rename_entry,
             project::delete_entry,
             project::import_files,
-            project::open_entry_external
+            project::open_entry_external,
+            git::git_status,
+            git::git_init,
+            git::git_set_identity,
+            git::git_commit,
+            git::git_ignore,
+            git::git_diff,
+            git::git_log,
+            git::git_log_files,
+            git::git_show_file,
+            git::git_restore,
+            git::git_connect_remote,
+            git::git_publish_github,
+            git::git_push,
+            git::git_pull,
+            git::git_resolve,
+            git::git_abort_merge
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

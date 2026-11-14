@@ -7,10 +7,12 @@ import { Icon, type IconName } from "./ribbon/icons";
 import { LayoutMenu } from "./ribbon/LayoutMenu";
 import { MenuButton } from "./ribbon/Menu";
 import { TablePicker } from "./ribbon/TablePicker";
+import type { GitState } from "./git";
+import type { GitAction } from "./GitPanel";
 
-export const RIBBON_TABS = ["file", "home", "insert", "layout", "view"] as const;
+export const RIBBON_TABS = ["file", "home", "insert", "layout", "view", "git"] as const;
 export type RibbonTab = (typeof RIBBON_TABS)[number];
-const TAB_LABELS: Record<RibbonTab, string> = { file: "File", home: "Home", insert: "Insert", layout: "Layout", view: "View" };
+const TAB_LABELS: Record<RibbonTab, string> = { file: "File", home: "Home", insert: "Insert", layout: "Layout", view: "View", git: "Git" };
 const TAB_KEY = "lexy.ribbonTab";
 
 export type RibbonActions = {
@@ -39,6 +41,7 @@ export type RibbonActions = {
   onFont: (font: FontChoice) => void;
   onSize: (size: FontSize) => void;
   onLayout: (settings: DocumentSettings) => void;
+  onGit: (action: GitAction) => void;
 };
 
 export type RibbonState = {
@@ -60,6 +63,8 @@ export type RibbonState = {
   recent: { path: string; name: string }[];
   settings: DocumentSettings;
   settingsManaged: boolean;
+  git: GitState | null;
+  gitOpen: boolean;
 };
 
 function loadTab(): RibbonTab {
@@ -81,7 +86,7 @@ function saveTab(tab: RibbonTab) {
 
 export function Ribbon({ actions, state }: { actions: RibbonActions; state: RibbonState }) {
   const [tab, setTab] = useState<RibbonTab>(loadTab);
-  const tabRefs = useRef<Record<RibbonTab, HTMLButtonElement | null>>({ file: null, home: null, insert: null, layout: null, view: null });
+  const tabRefs = useRef<Record<RibbonTab, HTMLButtonElement | null>>({ file: null, home: null, insert: null, layout: null, view: null, git: null });
   const baseId = useId();
 
   function select(next: RibbonTab, focus = false) {
@@ -297,6 +302,32 @@ export function Ribbon({ actions, state }: { actions: RibbonActions; state: Ribb
             </Group>
           </>
         );
+      case "git": {
+        const git = state.git;
+        const repo = !!git?.installed && git.repo !== "none";
+        const write = repo && !state.readOnly;
+        const remote = write && !!git?.remoteUrl;
+        return (
+          <>
+            <Group label="History">
+              {repo ? (
+                <RibbonButton icon="commit" label="Commit" shortcut="Ctrl+Shift+K" disabled={!write} onClick={() => actions.onGit("commit")} />
+              ) : (
+                <RibbonButton icon="git" label="Start version history" disabled={!git?.installed || state.readOnly} onClick={() => actions.onGit("init")} />
+              )}
+              <RibbonButton icon="recent" label="History" disabled={!repo} onClick={() => actions.onGit("history")} />
+              <RibbonButton icon="git" label="Git panel" shortcut="Ctrl+Shift+G" pressed={state.gitOpen} onClick={() => actions.onGit("changes")} />
+            </Group>
+            <Group label="Online">
+              <RibbonButton icon="publish" label="Publish to GitHub" disabled={!write || !!git?.remoteUrl} onClick={() => actions.onGit("publish")} />
+              <RibbonButton icon="link" label="Connect…" disabled={!write} onClick={() => actions.onGit("connect")} />
+              <RibbonButton icon="push" label="Push" disabled={!remote} onClick={() => actions.onGit("push")} />
+              <RibbonButton icon="pull" label="Pull" disabled={!remote} onClick={() => actions.onGit("pull")} />
+              <RibbonButton icon="sync" label="Sync" disabled={!remote} onClick={() => actions.onGit("sync")} />
+            </Group>
+          </>
+        );
+      }
     }
   }
 }

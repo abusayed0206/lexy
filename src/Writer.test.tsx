@@ -95,6 +95,24 @@ vi.mock("@tauri-apps/api/webview", () => ({
 }));
 
 const events = new Map<string, (event: { payload: unknown }) => void>();
+vi.mock("./git", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./git")>()),
+  gitStatus: vi.fn(() =>
+    Promise.resolve({
+      installed: true,
+      repo: "own",
+      repoRoot: null,
+      branch: "main",
+      remoteUrl: null,
+      ahead: 0,
+      behind: 0,
+      changes: [{ path: "thesis.tex", oldPath: null, status: "modified", size: 1 }],
+      merging: false,
+      readOnly: false,
+    }),
+  ),
+}));
+vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn((name: string, handler: (event: { payload: unknown }) => void) => {
     events.set(name, handler);
@@ -815,6 +833,18 @@ describe("Writer", () => {
       expect(writeFile).not.toHaveBeenCalled();
       expect(compileProject).not.toHaveBeenCalled();
       expect(screen.getByRole("button", { name: "New file" })).toBeDisabled();
+    });
+  });
+
+  describe("git", () => {
+    it("Ctrl+Shift+G opens the Git panel and the sidebar marks changed files", async () => {
+      const { user } = await renderWriter();
+      expect(await screen.findByLabelText("Git: M")).toBeInTheDocument();
+      await user.keyboard("{Control>}{Shift>}g{/Shift}{/Control}");
+      expect(await screen.findByRole("complementary", { name: "Version history" })).toBeInTheDocument();
+      expect(screen.getByText("1 change")).toBeInTheDocument();
+      await user.keyboard("{Control>}{Shift>}g{/Shift}{/Control}");
+      await waitFor(() => expect(screen.queryByRole("complementary", { name: "Version history" })).toBeNull());
     });
   });
 });

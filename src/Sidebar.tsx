@@ -25,6 +25,8 @@ type Props = {
   main: string | null;
   /** Lower-cased paths with unsaved edits. */
   dirty: ReadonlySet<string>;
+  /** Git status letter per lower-cased `/`-separated path changed since the last commit. */
+  changes?: ReadonlyMap<string, string>;
   readOnly: boolean;
   actions: SidebarActions;
 };
@@ -46,7 +48,7 @@ function readHidden(): boolean {
 const folderOf = (entry: Entry | null) => (entry === null ? "" : entry.kind === "folder" ? entry.path : parentOf(entry.path));
 
 /** Lazy project tree (contracts/ui.md): one folder listed at a time, tree keyboard pattern, context menu, drop target. */
-export function Sidebar({ projectName, version, current, main, dirty, readOnly, actions }: Props) {
+export function Sidebar({ projectName, version, current, main, dirty, changes, readOnly, actions }: Props) {
   const [children, setChildren] = useState<ReadonlyMap<string, Entry[]>>(new Map());
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set([""]));
   const [focused, setFocused] = useState<string | null>(null);
@@ -306,6 +308,7 @@ export function Sidebar({ projectName, version, current, main, dirty, readOnly, 
           const isFolder = entry.kind === "folder";
           const open = isFolder && expanded.has(entry.path);
           const unsaved = dirty.has(entry.path.toLowerCase()) || (isFolder && [...dirty].some((path) => isWithin(path, entry.path.toLowerCase())));
+          const gitLetter = isFolder ? undefined : changes?.get(entry.path.replace(/\\/g, "/").toLowerCase());
           const classes = [
             "tree-row",
             sameRel(entry.path, current) ? "current" : "",
@@ -362,6 +365,11 @@ export function Sidebar({ projectName, version, current, main, dirty, readOnly, 
               )}
               {sameRel(entry.path, main) ? <span className="main-badge">Main</span> : null}
               {unsaved ? <span className="unsaved-dot" role="img" aria-label="Unsaved changes" /> : null}
+              {gitLetter ? (
+                <span className="git-badge" title="Changed since the last commit" aria-label={`Git: ${gitLetter}`}>
+                  {gitLetter}
+                </span>
+              ) : null}
             </div>
           );
         })}

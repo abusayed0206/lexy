@@ -10,6 +10,8 @@ import { applySettings, conflicts, hasSettingsBlock, parseSettings, type Documen
 import { tableLatex, type TableSpec } from "./latex/tables";
 import { createLivePreview, type LivePreview } from "./livePreview";
 import { dirtyFiles, emptyOpenFiles, isDirty, keyOf, openFilesReducer, type OpenFilesEvent } from "./openFiles";
+import { gitStatus, STATUS_LETTER, type GitState } from "./git";
+import { GitPanel, type GitAction } from "./GitPanel";
 import { PdfView } from "./PdfView";
 import { chooseProjectFolder, useChoice, useNamePrompt } from "./ProjectDialogs";
 import {
@@ -187,6 +189,9 @@ export function Writer({ project, onSwitch }: Props) {
   const [treeVersion, setTreeVersion] = useState(0);
   const [recent, setRecent] = useState<ProjectSummary[]>([]);
   const [mainChooser, setMainChooser] = useState<string[] | null>(null);
+  const [git, setGit] = useState<GitState | null>(null);
+  const [gitOpen, setGitOpen] = useState(false);
+  const [gitRequest, setGitRequest] = useState<{ action: GitAction; seq: number } | null>(null);
   const panes = useRef<HTMLDivElement>(null);
   const dragging = useRef<"split" | "sidebar" | null>(null);
   const editor = useRef<EditorHandle>(null);
@@ -379,8 +384,58 @@ export function Writer({ project, onSwitch }: Props) {
       }
     }
     if (ok) setNotice((current) => (current?.startsWith("Could not save") ? null : current));
+    void refreshGit();
     return ok;
   }
+
+  // ----- Git (spec 006) -----
+
+  async function refreshGit() {
+    try {
+      setGit(await gitStatus());
+    } catch {
+      setGit(null);
+    }
+  }
+
+  function onGit(action: GitAction) {
+    if (action === "changes" && gitOpen) {
+      setGitOpen(false);
+      return;
+    }
+    setGitOpen(true);
+    setGitRequest((last) => ({ action, seq: (last?.seq ?? 0) + 1 }));
+  }
+
+  /** Before Git overwrites a file: unsaved edits in it need a yes, then they are dropped. */
+  async function confirmRestoreFile(path: string): Promise<boolean> {
+    const key = keyOf(filesRef.current, path);
+    const file = key === undefined ? undefined : filesRef.current.files.get(key);
+    if (key === undefined || !file || !isDirty(file)) return true;
+    const choice = await ask("Discard unsaved edits?", `${baseName(key)} has unsaved edits. Restoring replaces them.`, [
+      { label: "Restore", value: "yes", primary: true },
+      { label: "Cancel", value: "no" },
+    ]);
+    if (choice !== "yes") return false;
+    applyFiles({ type: "reloaded", path: key, text: file.savedText });
+    return true;
+  }
+
+  useEffect(() => {
+    void refreshGit();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Opening the panel checks the server for new commits (research R8).
+  useEffect(() => {
+    if (gitOpen && git?.remoteUrl) void gitStatus(true).then(setGit, () => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gitOpen]);
+
+  const gitChanges = useMemo(
+    () => new Map((git?.changes ?? []).map((change) => [change.path.toLowerCase(), STATUS_LETTER[change.status]])),
+    [git],
+  );
 
   async function saveCurrentAs() {
     const from = filesRef.current.current;
@@ -574,6 +629,7 @@ export function Writer({ project, onSwitch }: Props) {
 
   async function onDiskChange(paths: string[]) {
     diskVersion.current++;
+    void refreshGit();
     setTreeVersion((v) => v + 1);
     const state = filesRef.current;
     for (const changed of paths) {
@@ -728,6 +784,7 @@ export function Writer({ project, onSwitch }: Props) {
     onFont: (font: FontChoice) => changeSettings({ ...settings, font }),
     onSize: (size: FontSize) => changeSettings({ ...settings, size }),
     onLayout: changeSettings,
+    onGit,
   };
   const actionsRef = useRef(actions);
   actionsRef.current = actions;
@@ -743,6 +800,8 @@ export function Writer({ project, onSwitch }: Props) {
       if (event.key === "F5" && !event.ctrlKey) action = run.onCompile;
       else if (ctrl && key === "s") action = event.shiftKey ? run.onSaveAs : run.onSave;
       else if (ctrl && event.shiftKey && key === "e") action = run.onToggleFiles;
+      else if (ctrl && event.shiftKey && key === "g") action = () => run.onGit("changes");
+      else if (ctrl && event.shiftKey && key === "k") action = () => run.onGit("focus");
       else if (ctrl && !event.shiftKey) {
         action =
           { n: run.onNew, o: run.onOpen, l: run.onToggleLogs, b: () => run.onFormat("textbf"), i: () => run.onFormat("textit"), u: () => run.onFormat("underline") }[key] ??
@@ -845,6 +904,8 @@ export function Writer({ project, onSwitch }: Props) {
           recent: recent.filter((item) => !item.missing && !sameRel(item.path, project.root)).slice(0, 10),
           settings,
           settingsManaged,
+          git,
+          gitOpen,
         }}
       />
 
@@ -890,7 +951,9 @@ export function Writer({ project, onSwitch }: Props) {
 
       <div
         className="workspace"
-        style={{ gridTemplateColumns: filesOpen ? `${sidebarWidth}px 4px minmax(0, 1fr)` : "minmax(0, 1fr)" }}
+        style={{
+          gridTemplateColumns: `${filesOpen ? `${sidebarWidth}px 4px ` : ""}minmax(0, 1fr)${gitOpen ? " var(--git-panel-width)" : ""}`,
+        }}
         onPointerMove={(event) => {
           if (dragging.current === "sidebar") updateSidebar(event.clientX - event.currentTarget.getBoundingClientRect().left);
         }}
@@ -906,6 +969,7 @@ export function Writer({ project, onSwitch }: Props) {
               current={current}
               main={main}
               dirty={dirtySet}
+              changes={gitChanges}
               readOnly={readOnly}
               actions={{
                 onOpen: onEntryOpen,
@@ -1007,6 +1071,20 @@ export function Writer({ project, onSwitch }: Props) {
             <PdfView bytes={pdfBytes} busy={compiling} onError={setNotice} />
           </section>
         </div>
+        {gitOpen ? (
+          <GitPanel
+            state={git}
+            projectName={project.name}
+            request={gitRequest}
+            refresh={refreshGit}
+            saveAll={saveAll}
+            confirmRestoreFile={confirmRestoreFile}
+            reloadFiles={(paths) => onDiskChange(paths === "all" ? [...filesRef.current.files.keys()] : paths)}
+            ask={ask}
+            prompt={prompt}
+            onClose={() => setGitOpen(false)}
+          />
+        ) : null}
       </div>
 
       {logsOpen ? (
