@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SETTINGS, MARGIN_PRESETS } from "./latex/settings";
@@ -37,6 +37,19 @@ function makeActions(): RibbonActions {
     onFont: vi.fn(),
     onSize: vi.fn(),
     onLayout: vi.fn(),
+    onTidy: vi.fn(),
+    onGrammar: vi.fn(),
+    onToggleFocus: vi.fn(),
+    onHistory: vi.fn(),
+    onCitation: vi.fn(),
+    onImage: vi.fn(),
+    onNewNote: vi.fn(),
+    onShowNotes: vi.fn(),
+    onCompareLast: vi.fn(),
+    onCompareWith: vi.fn(),
+    onExportNotes: vi.fn(),
+    onSettings: vi.fn(),
+    onExport: vi.fn(),
   };
 }
 
@@ -75,10 +88,10 @@ const tab = (name: string) => screen.getByRole("tab", { name });
 describe("Ribbon tabs", () => {
   beforeEach(() => localStorage.clear());
 
-  it("shows File, Home, Insert, Layout, View with Home selected by default", () => {
+  it("shows File, Home, Insert, Layout, Review, View with Home selected by default", () => {
     setup();
     expect(screen.getByRole("tablist", { name: "Ribbon" })).toBeInTheDocument();
-    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual(["File", "Home", "Insert", "Layout", "View", "Git"]);
+    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual(["File", "Home", "Insert", "Layout", "Review", "View", "Git"]);
     expect(tab("Home")).toHaveAttribute("aria-selected", "true");
     expect(screen.getByRole("tabpanel", { name: "Home" })).toBeVisible();
   });
@@ -122,6 +135,46 @@ describe("Ribbon tabs", () => {
       await user.click(tab(name));
       expect(screen.getByRole("tabpanel", { name })).toBeVisible();
     }
+  });
+});
+
+describe("Ribbon access keys (Windows design alignment)", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("Alt shows key tips and the next letter opens that tab", () => {
+    setup();
+    expect(tab("Review")).toHaveAttribute("aria-keyshortcuts", "Alt+R");
+    fireEvent.keyDown(window, { key: "Alt" });
+    fireEvent.keyUp(window, { key: "Alt" });
+    expect(document.querySelectorAll(".key-tip")).toHaveLength(7);
+    fireEvent.keyDown(window, { key: "n" });
+    expect(tab("Insert")).toHaveAttribute("aria-selected", "true");
+    expect(tab("Insert")).toHaveFocus();
+    expect(document.querySelector(".key-tip")).toBeNull();
+  });
+
+  it("Escape or Alt with another key does not open anything", () => {
+    setup();
+    fireEvent.keyDown(window, { key: "Alt" });
+    fireEvent.keyUp(window, { key: "Alt" });
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(document.querySelector(".key-tip")).toBeNull();
+    fireEvent.keyDown(window, { key: "Alt" });
+    fireEvent.keyDown(window, { key: "ArrowLeft", altKey: true });
+    fireEvent.keyUp(window, { key: "Alt" });
+    expect(document.querySelector(".key-tip")).toBeNull();
+    expect(tab("Home")).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("Alt+letter opens a tab directly, but not while typing in a field", () => {
+    setup();
+    fireEvent.keyDown(document.body, { key: "w", altKey: true });
+    expect(tab("View")).toHaveAttribute("aria-selected", "true");
+    const field = document.createElement("input");
+    document.body.append(field);
+    fireEvent.keyDown(field, { key: "r", altKey: true });
+    expect(tab("Review")).toHaveAttribute("aria-selected", "false");
+    field.remove();
   });
 });
 

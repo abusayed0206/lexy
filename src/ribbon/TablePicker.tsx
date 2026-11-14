@@ -114,9 +114,6 @@ export function TableDialog({ onInsert, onCancel }: { onInsert: (spec: TableSpec
       onClose={onCancel}
       actions={
         <>
-          <button type="button" onClick={onCancel}>
-            Cancel
-          </button>
           <button
             type="button"
             className="primary"
@@ -124,6 +121,9 @@ export function TableDialog({ onInsert, onCancel }: { onInsert: (spec: TableSpec
             onClick={() => onInsert({ cols: Number(cols), rows: Number(rows), header, borders, align, caption: caption.trim() })}
           >
             Insert
+          </button>
+          <button type="button" onClick={onCancel}>
+            Cancel
           </button>
         </>
       }

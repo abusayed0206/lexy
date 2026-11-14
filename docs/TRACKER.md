@@ -1,6 +1,6 @@
 # Lexy Feature Tracker
 
-Last updated: 2026-11-13
+Last updated: 2026-11-14
 
 This tracker is the source of truth for implementation status. Any contributor working here for the first time must read this file, `docs/PLAN.md`, and `docs/DESIGN.md` before making changes.
 
@@ -20,82 +20,156 @@ This tracker is the source of truth for implementation status. Any contributor w
 | --- | --- | --- |
 | Tauri 2 scaffold | Done | `src-tauri`, `tauri.conf.json`, `package.json` exist. |
 | React/Vite scaffold | Done | `src`, `vite.config.ts`, React dependencies exist. |
-| Lexy product identity | In Progress | Package/app name is `lexy`; README and UI still use template copy. |
-| Minimal LaTeX writer UI | In Progress | M1 writer shell implemented (`src/Writer.tsx`): editor, blank preview, status, log drawer; compile is a stub. Live app check pending. |
-| Rust LaTeX commands | In Progress | Initial setup and environment detection commands exist; compile command not implemented. |
-| MiKTeX integration | In Progress | Detection and initial unattended setup flow exist; VM validation still required. |
-| Strawberry Perl integration | In Progress | Detection and silent MSI setup flow exist; portable option not implemented. |
-| Windows installer polish | Not Started | Tauri bundling is enabled, but no installer strategy is configured. |
+| Lexy product identity | In Progress | README, HTML title, Cargo/package metadata and license done; `tauri.conf.json` `productName` and window `title` are still `lexy`. |
+| Minimal LaTeX writer UI | In Progress | Writer, ribbon, sidebar, CodeMirror editor, pdf.js preview, log drawer, Git panel (specs 001–006). Native-window checks pending. |
+| Rust LaTeX commands | Done | `compile_project`, engine choice, SyncTeX, problems, PDF export; real latexmk e2e tests pass. |
+| MiKTeX integration | In Progress | Detection, per-user standalone setup, per-run package install; fresh-VM validation pending; setup hash unpinned. |
+| Strawberry Perl integration | In Progress | Portable ZIP (pinned SHA-256) install and detection; fresh-VM validation pending. |
+| Windows installer polish | Not Started | Tauri bundling is enabled, but no installer strategy is configured (F-028–F-030). |
+| Writing toolkit (spec 007) | In Progress | All 88 tasks built and passing their gates (F-066–F-073); native-window quickstarts A–G and W pending. |
 
 ## Feature Tracker
 
+Grouped by area; rows in ID order within a group. "Native check pending" means built and passing automated tests but not yet walked in the running app (see "Open verification items").
+
+### Release and installer (M5)
+
+Blocks a public release.
+
 | ID | Feature | Priority | Status | Owner | Verification | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
-| F-001 | Replace template README with Lexy onboarding | P0 | Done | Codex | File review | Links plan, design, tracker, and setup commands. |
-| F-002 | Remove default Tauri greeting UI | P0 | Done | Codex | `npm run build` | Replaced by initial setup screen. |
-| F-003 | Set app metadata and window title to Lexy | P0 | In Progress | Codex | `npm run tauri dev` | HTML title updated; Tauri/package metadata still needs polish. |
-| F-004 | Minimal split editor/preview layout | P0 | In Progress | Claude | Browser visual check | Implemented in `src/Writer.tsx` (spec `specs/001-writer-shell`); 800x600/scaling check pending. |
-| F-005 | Starter LaTeX document | P0 | In Progress | Claude | App launch | `src/starter.ts` loaded into the editor; live launch check pending. |
-| F-006 | Manual compile button | P0 | In Progress | Claude | Compile smoke test | Compile (and F5) saves, then runs `compile_document`; real latexmk compile verified by Rust e2e test; native-window click-through pending. |
-| F-007 | Debounced auto compile toggle | P1 | In Progress | Claude | UI interaction test | Live preview (View tab, default on): compiles a snapshot ~1 s after typing, one running + one queued. Unit/UI-tested; native check pending. |
-| F-008 | Compile status indicator | P0 | In Progress | Claude | UI state review | Idle/Changed/Compiling/PDF ready/Compile failed via reducer in `src/Writer.tsx`; compile is an M1 stub. |
-| F-009 | Collapsible log panel | P0 | In Progress | Claude | Compile failure test | Collapsed by default, Ctrl+L toggle, opens on failed compile, Copy log. Live check pending. |
-| F-010 | Open `.tex` file | P0 | Superseded | Claude | — | Replaced by Open folder (F-046): projects are folders; files open from the sidebar via `read_file` (project-relative, 10 MiB cap, UTF-8 only). |
-| F-011 | Save current `.tex` file | P0 | In Progress | Claude | Manual file test | Ctrl+S saves every modified project file via `write_file` (atomic temp + fsync + rename). Unit-tested; native check pending. |
-| F-012 | Save as `.tex` file | P0 | In Progress | Claude | Manual file test | Save as writes the current file under a new name inside the project (Ctrl+Shift+S). Unit-tested; native check pending. |
-| F-013 | Dirty state tracking | P0 | In Progress | Claude | UI state test | Per-file unsaved state (`src/openFiles.ts`); unsaved dots in title and sidebar; one Save all / Don't save / Cancel prompt on close, Project Home or project switch. Unit-tested; native close check pending. |
-| F-014 | Recent files | P2 | Superseded | Claude | — | Replaced by recent projects (F-046): Project Home list and File → Recent projects, stored in `%LOCALAPPDATA%\Lexy\projects.json`. |
-| F-015 | Rust workspace service | P0 | Done | Claude | Rust tests | `src-tauri/src/project.rs`: project-relative file commands behind one path gate (`resolve_in_project`); `cargo test` covers escapes, junctions, limits, CRUD, import. |
-| F-016 | Rust compiler service | P0 | Done | Claude | Rust tests + smoke test | `compile_project`: latexmk in the build folder, unsaved buffers in an overlay first on TEXINPUTS/BIBINPUTS, tool PATH, hidden console, 180 s tree-kill timeout, first-error summary. Real multi-file e2e (input, include, image, bib) passed on dev machine. |
-| F-017 | Compile job cancellation/queue | P1 | In Progress | Claude | Rapid edit test | Compile disabled while running (F5 ignored) and timed out after 180 s; no user-facing cancel yet. |
-| F-018 | PDF preview refresh | P0 | In Progress | Claude | Successful compile test | pdf.js canvases, double-buffered, scroll kept; last good PDF kept on failure. Unit-tested; native WebView2 check pending. |
-| F-019 | MiKTeX detection | P0 | In Progress | Codex | Machine with MiKTeX | Detects `miktex`; package behavior check still needed. |
-| F-020 | Strawberry Perl detection | P0 | In Progress | Claude | Machine with Perl | Detects Lexy's portable Perl first, then `C:\Strawberry`, then PATH. |
-| F-021 | `latexmk` detection | P0 | In Progress | Codex | Machine with MiKTeX | Detects `latexmk --version`. |
-| F-022 | Dependency setup screen | P0 | In Progress | Codex | Fresh machine UI test | Initial screen exists; needs browser and VM validation. |
-| F-023 | App-managed dependency install | P0 | In Progress | Claude | Fresh VM test | Per-user, no admin: portable Strawberry Perl ZIP + MiKTeX standalone setup (`src-tauri/src/setup.rs`). Fixes MSI exit 1603. Native run pending. |
-| F-024 | Dependency hash verification | P0 | In Progress | Claude | Unit/integration test | Perl ZIP pinned (SHA-256, streamed check). MiKTeX setup has only a rolling URL, so unpinned. |
-| F-025 | Setup progress reporting | P1 | In Progress | Claude | Setup test | Per-step states, byte progress with speed/ETA, live MiKTeX output, overall bar. Unit-tested; native run pending. |
-| F-026 | Setup log access | P1 | In Progress | Claude | Failure test | `setup.log` + Show details / Copy log on the setup screen. |
-| F-027 | Tauri capabilities for shell/files | P0 | Done | Claude | Capability review | Added only `dialog:default` and `core:window:allow-destroy`; file and process work stays in Rust commands, no fs/shell plugins. |
+| F-003 | Set app metadata and window title to Lexy | P0 | In Progress | Codex | `npm run tauri dev` | HTML title, README, Cargo/package metadata done; `tauri.conf.json` `productName` and window `title` still `lexy`. |
 | F-028 | Windows installer target decision | P0 | Blocked | Product | Decision recorded | NSIS vs MSI vs both. |
 | F-029 | Bundle dependency resource decision | P0 | Blocked | Product/Engineering | Decision recorded | Bundle installers or download on demand. |
 | F-030 | WebView2 installer mode decision | P1 | Blocked | Engineering | Build review | Tauri supports download/offline/fixed runtime modes. |
 | F-031 | App update strategy | P2 | Not Started | Unassigned | Release plan review | Decide after MVP installer works. |
-| F-032 | Keyboard shortcuts | P1 | In Progress | Claude | Manual shortcut test | Ctrl+N new file, Ctrl+O open folder, Ctrl+S save all, Ctrl+Shift+S save as, Ctrl+Shift+E sidebar, F5 compile, Ctrl+L logs; capture-phase so they beat CodeMirror. Unit-tested; native check pending. |
-| F-033 | Minimal settings screen | P2 | Not Started | Unassigned | UI review | Dependency paths, auto compile, theme. |
-| F-034 | Accessibility pass | P1 | In Progress | Claude | Keyboard/display scaling test | Named icon buttons with shortcut tooltips, focus order, keyboard-resizable splitter, text status labels. 125/150% scaling check pending. |
 | F-035 | Fresh Windows VM smoke test | P0 | Not Started | Unassigned | VM checklist | No MiKTeX/Perl preinstalled. |
 | F-036 | Release checklist | P1 | Not Started | Unassigned | File review | Build, install, setup, compile, uninstall. |
+
+### Setup and dependencies (M4)
+
+| ID | Feature | Priority | Status | Owner | Verification | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| F-019 | MiKTeX detection | P0 | Done | Codex | Machine with MiKTeX | Detects Lexy's per-user MiKTeX, common locations, then PATH; every real e2e compile resolves it. Package install behavior is F-056. |
+| F-020 | Strawberry Perl detection | P0 | Done | Claude | Machine with Perl | Detects Lexy's portable Perl first, then `C:\Strawberry`, then PATH; real e2e compiles run latexmk through it. |
+| F-021 | `latexmk` detection | P0 | Done | Codex | Machine with MiKTeX | Detects `latexmk --version`; real e2e compiles use the resolved path. |
+| F-022 | Dependency setup screen | P0 | In Progress | Codex | Fresh machine UI test | `src/SetupScreen.tsx`: step plan, live progress, failure + Try again, log details; Vitest + browser pane (mocked). Fresh-VM run pending. |
+| F-023 | App-managed dependency install | P0 | In Progress | Claude | Fresh VM test | Per-user, no admin: portable Strawberry Perl ZIP + MiKTeX standalone setup (`src-tauri/src/setup.rs`). Fixes MSI exit 1603. Native run pending. |
+| F-024 | Dependency hash verification | P0 | In Progress | Claude | Unit/integration test | Perl ZIP pinned (SHA-256, streamed check). MiKTeX setup has only a rolling URL, so unpinned; pinning is a pre-release requirement. |
+| F-025 | Setup progress reporting | P1 | In Progress | Claude | Setup test | Per-step states, byte progress with speed/ETA, live MiKTeX output, overall bar. Unit-tested; native run pending. |
+| F-026 | Setup log access | P1 | Done | Claude | Failure test | `setup.log` + Show details / Copy log on the setup screen. |
+| F-027 | Tauri capabilities for shell/files | P0 | Done | Claude | Capability review | Added only `dialog:default` and `core:window:allow-destroy`; file and process work stays in Rust commands, no fs/shell plugins. |
+
+### Writer and editing (specs 001, 002)
+
+| ID | Feature | Priority | Status | Owner | Verification | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| F-004 | Minimal split editor/preview layout | P0 | In Progress | Claude | Browser visual check | Implemented in `src/Writer.tsx` (spec `specs/001-writer-shell`); 800x600/scaling check pending. |
+| F-005 | Starter LaTeX document | P0 | In Progress | Claude | App launch | `src/starter.ts` loaded into the editor; live launch check pending. |
+| F-011 | Save current `.tex` file | P0 | In Progress | Claude | Manual file test | Ctrl+S saves every modified project file via `write_file` (atomic temp + fsync + rename). Unit-tested; native check pending. |
+| F-012 | Save as `.tex` file | P0 | In Progress | Claude | Manual file test | Save as writes the current file under a new name inside the project (Ctrl+Shift+S). Unit-tested; native check pending. |
+| F-013 | Dirty state tracking | P0 | In Progress | Claude | UI state test | Per-file unsaved state (`src/openFiles.ts`); unsaved dots in title and sidebar; one Save all / Don't save / Cancel prompt on close, Project Home or project switch. Unit-tested; native close check pending. |
+| F-032 | Keyboard shortcuts | P1 | In Progress | Claude | Manual shortcut test | Ctrl+N new file, Ctrl+O open folder, Ctrl+S save all, Ctrl+Shift+S save as, Ctrl+Shift+E sidebar, F5 compile, Ctrl+L logs; capture-phase so they beat CodeMirror. Unit-tested; native check pending. |
+| F-034 | Accessibility pass | P1 | In Progress | Claude | Keyboard/display scaling test | Named icon buttons with shortcut tooltips, focus order, keyboard-resizable splitter, text status labels. 125/150% scaling check pending. |
 | F-037 | Word-style ribbon (File/Home/Insert/Layout/View) | P1 | In Progress | Claude | UI tests + native check | `src/Ribbon.tsx`; tablist keyboard pattern; icon-only below 900 px. Native check pending. |
 | F-038 | Document font and size (built-in + installed fonts) | P1 | In Progress | Claude | Settings round-trip tests + XeLaTeX e2e | Lexy settings block; installed fonts via fontdb + XeLaTeX marker. Native check pending. |
 | F-039 | Equation editor with live math preview | P1 | In Progress | Claude | Dialog tests | KaTeX preview, palette, inline/display, edit existing equation. Native check pending. |
 | F-040 | Insert table (grid + dialog) | P2 | In Progress | Claude | Generator + dialog tests | Empty cells (no placeholders) so live preview keeps compiling. Native check pending. |
 | F-041 | Page layout: margins, paper, orientation | P1 | In Progress | Claude | Settings tests | Word presets + custom 0.5–6 cm. Native check pending. |
-| F-042 | Default save folder Documents\Lexy | P1 | In Progress | Claude | Rust + UI tests | `default_document_folder` (FOLDERID_Documents, created on demand, home fallback). Native check pending. |
 | F-043 | Formatting commands (bold/italic/underline, headings, lists, page break, footnote) | P2 | In Progress | Claude | Generator + UI tests | One undo step each; Ctrl+B/I/U. Native check pending. |
-| F-044 | Project folders and file names | P1 | Superseded | Claude | — | Replaced by New project (F-046): `Documents\Lexy\Name\Name.tex`, `Name (2)` when taken. |
+
+### Compile and preview (specs 001, 003, 004)
+
+| ID | Feature | Priority | Status | Owner | Verification | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| F-006 | Manual compile button | P0 | In Progress | Claude | Compile smoke test | Compile (and F5) saves all modified files, then runs `compile_project`; real latexmk compile verified by Rust e2e test; native-window click-through pending. |
+| F-007 | Debounced auto compile toggle | P1 | In Progress | Claude | UI interaction test | Live preview (View tab, default on): compiles a snapshot ~1 s after typing, one running + one queued. Unit/UI-tested; native check pending. |
+| F-008 | Compile status indicator | P0 | In Progress | Claude | UI state review | Idle/Changed/Compiling/PDF ready/Compile failed via reducer in `src/Writer.tsx`, driven by the real `compile_project`; engine shown in the tooltip. Native check pending. |
+| F-009 | Collapsible log panel | P0 | In Progress | Claude | Compile failure test | Collapsed by default, Ctrl+L toggle, opens on failed compile, Copy log. Live check pending. |
+| F-015 | Rust workspace service | P0 | Done | Claude | Rust tests | `src-tauri/src/project.rs`: project-relative file commands behind one path gate (`resolve_in_project`); `cargo test` covers escapes, junctions, limits, CRUD, import. |
+| F-016 | Rust compiler service | P0 | Done | Claude | Rust tests + smoke test | `compile_project`: latexmk in the build folder, unsaved buffers in an overlay first on TEXINPUTS/BIBINPUTS, tool PATH, hidden console, 180 s tree-kill timeout, first-error summary. Real multi-file e2e (input, include, image, bib) passed on dev machine. |
+| F-017 | Compile job cancellation/queue | P1 | In Progress | Claude | Rapid edit test | Compile disabled while running (F5 ignored) and timed out after 180 s; no user-facing cancel yet. |
+| F-018 | PDF preview refresh | P0 | In Progress | Claude | Successful compile test | pdf.js canvases, double-buffered, scroll kept; last good PDF kept on failure. Unit-tested; native WebView2 check pending. |
+| F-045 | PDF saved next to the document on exit | P1 | In Progress | Claude | Rust + UI tests | PDF lives in the build folder while editing; on close it is written as `<name>.pdf` beside the saved `.tex` (recompiled first if the preview doesn't match the saved text). Native check pending. |
+| F-049 | Multi-file compile with unsaved buffers | P1 | Done | Claude | Rust e2e + UI tests | Live preview and F5 compile the main document from any file; unsaved files go to an overlay in the build folder, never to disk; images/bib read from the project. |
+| F-060 | Click-to-jump PDF ↔ source (SyncTeX, both directions, sub-files) | P1 | In Progress | Claude | Rust e2e (pdfLaTeX + XeLaTeX round trip) + Vitest | `src-tauri/src/sync.rs`, double-click / Ctrl+J. Manual quickstart B pending. |
+| F-061 | Actionable problems (inline markers + Problems list) | P1 | Done | Claude | Rust parser tests + e2e + Vitest | `CompileResult.problems`, `src/Problems.tsx`, `@codemirror/lint`. |
+| F-062 | Stable preview: zoom, position keeping, last good PDF note | P1 | In Progress | Claude | Vitest | `src/pdfView/zoom.ts`; eager page rendering kept (shortcut). |
+
+### Projects (spec 004)
+
+| ID | Feature | Priority | Status | Owner | Verification | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| F-042 | Default save folder Documents\Lexy | P1 | In Progress | Claude | Rust + UI tests | `default_document_folder` (FOLDERID_Documents, created on demand, home fallback). Native check pending. |
 | F-046 | Project Home and recent projects | P1 | In Progress | Claude | UI + Rust tests | `src/ProjectHome.tsx`; lists `Documents\Lexy` folders + recent projects (max 20, Missing rows removable), New project, Open folder… (warns above 5,000 entries), reopens the last project on start. Native check pending. |
 | F-047 | File sidebar | P1 | In Progress | Claude | UI tests | `src/Sidebar.tsx`: lazy tree, keyboard tree pattern, F2 rename, Recycle Bin delete (permanent fallback asks), context menu, drag-in import from Explorer with Replace / Keep both / Skip, Ctrl+Shift+E. Native drag-drop check pending. |
-| F-048 | Main document per project | P1 | In Progress | Claude | Rust + UI tests | Auto-detected when one top-level `.tex` has `\documentclass`, else chosen once and remembered in `projects.json`; Set as main document in the sidebar; settings ribbon always edits it. |
-| F-049 | Multi-file compile with unsaved buffers | P1 | In Progress | Claude | Rust e2e + UI tests | Live preview and F5 compile the main document from any file; unsaved files go to an overlay in the build folder, never to disk; images/bib read from the project. |
+| F-048 | Main document per project | P1 | Done | Claude | Rust + UI tests | Auto-detected when one top-level `.tex` has `\documentclass`, else chosen once and remembered in `projects.json`; Set as main document in the sidebar; settings ribbon always edits it. |
 | F-050 | Outside changes and missing folder | P1 | In Progress | Claude | Rust + UI tests | `notify-debouncer-full` watcher (500 ms); clean files reload, modified ones get Reload / Keep mine; Lexy's own writes ignored; "Project folder is missing" bar. Native check pending. |
 | F-051 | Same project in two windows | P2 | In Progress | Claude | Rust + UI tests | Exclusive lock file per project; the second window opens read-only (no save, compile or file actions). Native two-window check pending. |
+
+### Scripts and fonts (spec 005)
+
+| ID | Feature | Priority | Status | Owner | Verification | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
 | F-052 | Unicode engine auto-choice | P1 | In Progress | Claude | Rust unit + real e2e | `choose_engine`: marker, else XeLaTeX for latexbangla/fontspec/polyglossia/unicode-math/xeCJK… in the preamble (or its `\input` files), else pdfLaTeX. Fixes the LaTeXbangla example failing on pdfLaTeX. Engine shown in the status tooltip and the log. Native check pending. |
-| F-053 | Project and per-user fonts | P1 | In Progress | Claude | Real e2e | `TTFONTS`/`OPENTYPEFONTS` point at the project, so `\setbanglamainfont{X.ttf}[Path=fonts/]` works; per-user Windows fonts already in MiKTeX's fontconfig. `Font "X" not found` summary. |
+| F-053 | Project and per-user fonts | P1 | Done | Claude | Real e2e | `TTFONTS`/`OPENTYPEFONTS` point at the project, so `\setbanglamainfont{X.ttf}[Path=fonts/]` works; per-user Windows fonts already in MiKTeX's fontconfig. `Font "X" not found` summary. |
 | F-054 | Multiscript editor | P2 | In Progress | Claude | Vitest + browser pane | Windows script-font fallbacks, `dir="auto"` lines for RTL, `src/indicKeys.ts` (conjunct-aware arrows, code-point Backspace). Native typing with Avro / Windows Bangla keyboard pending. |
-| F-055 | Non-Latin project and file names | P2 | In Progress | Claude | Rust unit + real e2e | ASCII snapshot stem, `.lexy-root` junction for non-ASCII roots, ProgramData build-root fallback; latexmk never sees non-ASCII. |
+| F-055 | Non-Latin project and file names | P2 | Done | Claude | Rust unit + real e2e | ASCII snapshot stem, `.lexy-root` junction for non-ASCII roots, ProgramData build-root fallback; latexmk never sees non-ASCII. |
 | F-056 | Missing packages install per compile | P3 | In Progress | Claude | Rust unit + e2e | MiKTeX `-enable-installer` on every engine run (no config change); `Package "X" could not be found or installed (offline?)`. Offline/fresh-machine check pending. |
+| F-063 | Bangla without setup: automatic XeLaTeX + Nirmala UI for the compile copy; one-time offer to add BCC Purno to the project | P1 | Done | Claude | Real e2e with the reported document + Vitest | `src-tauri/src/bangla.rs`, `src/latex/scriptFont.ts`. |
+| F-064 | kriti.app Bangla catalog in the font menu (family copied into the project with a notice) | P1 | Done | Claude | Rust unit + live e2e (Kalpurush compile, shaped conjuncts) + Vitest | `src-tauri/src/kriti.rs`, `src/ribbon/FontPicker.tsx`. |
+| F-065 | Bundled Bangla editor font (BCC Purno via @font-face, Bengali range only) | P2 | In Progress | Claude | Build | `src/assets/fonts/`, `src/App.css`. |
+
+### Git (spec 006)
+
+| ID | Feature | Priority | Status | Owner | Verification | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
 | F-057 | Git local history: start history, commit, ignore list, identity, large-file warning, sidebar marks | P1 | In Progress | Claude | Rust e2e (real git) + Vitest | `src-tauri/src/git.rs`, `src/GitPanel.tsx`, Git ribbon tab, Ctrl+Shift+G / Ctrl+Shift+K. Manual quickstart A pending. |
 | F-058 | Git diff, history, view/compare/restore | P1 | In Progress | Claude | Rust e2e + Vitest | Inline diff (`src/git/diff.ts`), paged history, restore as uncommitted changes. Manual quickstart B pending. |
 | F-059 | Git remote: connect, publish to GitHub, push, pull, sync, conflicts | P2 | In Progress | Claude | Rust e2e with local bare remote + Vitest | Publish uses GitHub CLI browser sign-in; push/pull use Git Credential Manager. Real GitHub run (quickstart C) pending. |
-| F-060 | Click-to-jump PDF ↔ source (SyncTeX, both directions, sub-files) | P1 | In Progress | Claude | Rust e2e (pdfLaTeX + XeLaTeX round trip) + Vitest | `src-tauri/src/sync.rs`, double-click / Ctrl+J. Manual quickstart B pending. |
-| F-061 | Actionable problems (inline markers + Problems list) | P1 | In Progress | Claude | Rust parser tests + e2e + Vitest | `CompileResult.problems`, `src/Problems.tsx`, `@codemirror/lint`. |
-| F-062 | Stable preview: zoom, position keeping, last good PDF note | P1 | In Progress | Claude | Vitest | `src/pdfView/zoom.ts`; eager page rendering kept (shortcut). |
-| F-063 | Bangla without setup: automatic XeLaTeX + Nirmala UI for the compile copy; one-time offer to add BCC Purno to the project | P1 | In Progress | Claude | Real e2e with the reported document + Vitest | `src-tauri/src/bangla.rs`, `src/latex/scriptFont.ts`. |
-| F-064 | kriti.app Bangla catalog in the font menu (family copied into the project with a notice) | P1 | In Progress | Claude | Rust unit + live e2e (Kalpurush compile, shaped conjuncts) + Vitest | `src-tauri/src/kriti.rs`, `src/ribbon/FontPicker.tsx`. |
-| F-065 | Bundled Bangla editor font (BCC Purno via @font-face, Bengali range only) | P2 | In Progress | Claude | Build | `src/assets/fonts/`, `src/App.css`. |
-| F-045 | PDF saved next to the document on exit | P1 | In Progress | Claude | Rust + UI tests | PDF lives in the build folder while editing; on close it is written as `<name>.pdf` beside the saved `.tex` (recompiled first if the preview doesn't match the saved text). Native check pending. |
+
+### Writing toolkit (spec 007)
+
+Plan, research, contracts and tasks: `specs/007-writing-toolkit/`. Order: F-066 → F-067 → F-070 → F-068 → F-069 → F-071 → F-072; F-073 any time after Phase 2.
+
+| ID | Feature | Priority | Status | Owner | Verification | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| F-066 | Writing aids: suggestions, `\end` auto-close, spell check, grammar (opt-in), word count, hover math, tidy | P1 | In Progress | Claude | Gate A + quickstart A | `specs/007-writing-toolkit` US1, tasks T016–T029. Phase 1–2 and US1 (T001–T029) done 2026-11-14: suggestions (commands, project macros, labels, citations, environments), `\begin`→`\end` auto-close + rename sync, offline spell check (right-click fixes, personal dictionary), opt-in grammar check (F7), word count, hover math, Tidy (Shift+Alt+F). Native quickstart A pending. |
+| F-067 | Navigation: outline, editor tabs, folding, command palette, find/replace in project, focus mode, Vim | P1 | In Progress | Claude | Gate B + quickstart B | US2, T030–T041 done 2026-11-14: side panel Files / Outline / Search, editor tabs (Ctrl+Tab, Ctrl+W, drag), section and environment folding, Ctrl+Shift+P palette, Ctrl+Shift+F find/replace (unsaved edits only), F11 focus mode, Vim via the palette. Native quickstart B pending. |
+| F-068 | Content: citation picker, add by DOI, insert/drop image, template gallery | P2 | In Progress | Claude | Gate D + quickstart D | US3, T050–T059 done 2026-11-14: Insert → Citation (search, multi-select, create references.bib), Add by DOI (only the DOI goes to doi.org; unique key; appended as an unsaved edit), Insert → Image and editor drop (copied to `figures/`, never overwriting; figure block; one `graphicx` line), New project templates (Blank, Article, Report, Letter, CV, Slides; all compile). Native quickstart D pending. |
+| F-069 | Review: notes, PDF with notes, compare with commit/date | P2 | In Progress | Claude | Gate E + quickstart E | US4, T060–T067 done 2026-11-14: Review ribbon tab; notes on selections (Ctrl+Alt+M) saved in `.lexy\notes.json`, highlighted, re-found by quote, Notes side tab with resolve/reopen/delete; Export PDF with notes → `<name> (notes).pdf` via todonotes (preview untouched); word-level comparison with the last commit/snapshot or a chosen one. Native quickstart E pending. |
+| F-070 | Files and safety: duplicate/copy/paste, auto-save, local snapshots | P2 | In Progress | Claude | Gate C + quickstart C | US5, T042–T049 done 2026-11-14: sidebar Duplicate / Copy / Paste (never overwrites), auto-save (off by default, palette toggle until Settings), snapshots for projects without Git (one per file per 10 min, 30 days, under `%LOCALAPPDATA%\Lexy\Snapshots`), File → Earlier versions with Restore as an unsaved change. Native quickstart C pending. |
+| F-071 | Settings screen | P3 | In Progress | Claude | Gate F + quickstart F | US6, T068–T071 done 2026-11-14: File → Settings / Ctrl+, — Appearance (theme, editor font size), Editing (Vim, auto-save + delay, spelling + language), Preview (delay, hide PDF in focus), Grammar (on/off, https server), Files (image folder), About; changes apply at once and persist. Replaces F-033. Native quickstart F pending. |
+| F-072 | Export to Word and HTML (Pandoc on demand, with consent) | P3 | In Progress | Claude | Gate G + quickstart G | US7, T072–T076 done 2026-11-14: File → Export → Word document / Web page; first use asks before downloading Pandoc 3.13 (43 MB, SHA-256 pinned) into `%LOCALAPPDATA%\Lexy\Tools\Pandoc` with progress; saves first, writes `<name>.docx/.html` beside the main document, reports approximated parts. Real download and conversion not yet run. |
+| F-073 | Windows design alignment: type ramp, dialog order, InfoBar, F6/Esc, tabs, high contrast, contrast test, access keys | P1 | In Progress | Claude | Gate W + quickstart W | `docs/DESIGN.md` "Windows design alignment"; T077–T085 done 2026-11-14: 14 px type ramp tokens, primary-first dialogs with verb buttons and safe focus for destructive actions, InfoBars for every notice, F6 pane cycling, `forced-colors` styles, a contrast test (fixed line-number and text-field contrast), Alt key tips on the ribbon. Native check in a Windows contrast theme pending. |
+
+### Archive (early scaffolding and superseded)
+
+| ID | Feature | Priority | Status | Owner | Verification | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| F-001 | Replace template README with Lexy onboarding | P0 | Done | Codex | File review | Links plan, design, tracker, and setup commands. |
+| F-002 | Remove default Tauri greeting UI | P0 | Done | Codex | `npm run build` | Replaced by initial setup screen. |
+| F-010 | Open `.tex` file | P0 | Superseded | Claude | — | Replaced by Open folder (F-046): projects are folders; files open from the sidebar via `read_file` (project-relative, 10 MiB cap, UTF-8 only). |
+| F-014 | Recent files | P2 | Superseded | Claude | — | Replaced by recent projects (F-046): Project Home list and File → Recent projects, stored in `%LOCALAPPDATA%\Lexy\projects.json`. |
+| F-033 | Minimal settings screen | P2 | Superseded | Unassigned | — | Replaced by F-071 (`specs/007-writing-toolkit` US6). |
+| F-044 | Project folders and file names | P1 | Superseded | Claude | — | Replaced by New project (F-046): `Documents\Lexy\Name\Name.tex`, `Name (2)` when taken. |
+
+## Open verification items
+
+Collected from the unchecked or "pending" tasks in `specs/001`–`006`, so they are tracked in one place. Close them here (and tick the task) when done.
+
+| Source | Item | Blocks |
+| --- | --- | --- |
+| `specs/001-writer-shell` T024 | Run all quickstart scenarios in the native window, 800x600 at 100/125/150 % scaling | F-004, F-005, F-008, F-009, F-034 |
+| `specs/002-word-style-editor` T055 | Run every quickstart scenario in the native window, incl. dark mode and a OneDrive-redirected Documents folder | F-037–F-043 |
+| `specs/003-pdf-source-sync` T013/T026/T037 | Walk quickstarts A–C in the native window | F-060–F-062 |
+| `specs/003-pdf-source-sync` T039 | Measure compile time with and without `-synctex=1` on a 10-page document (SC-004 ≤ +10 %) | F-060 |
+| `specs/003-pdf-source-sync` analysis 2026-11-14 | SC-002 jump timing (< 300 ms, 50 pages); SC-001 10-page accuracy; SC-005 seeded mistakes (missing `}`, missing file, missing citation, multiply defined label); outdated "Untitled documents" edge case in spec.md | F-060, F-061 |
+| `specs/004-project-workspace` | Native checks: Explorer drag-drop, two windows, outside changes, close prompt | F-046–F-051 |
+| `specs/005-bangla-multilingual` | Native typing with Avro / Windows Bangla keyboard; editor font visual check | F-054, F-065 |
+| `specs/006-git-integration` T023/T034/T046 | Manual quickstarts A–C, including a real private GitHub publish | F-057–F-059 |
+| Setup | Fresh Windows VM run (no MiKTeX/Perl) | F-022, F-023, F-025, F-035 |
+| Setup | Pin the MiKTeX setup SHA-256 (rolling URL today) | F-024, release |
 
 ## Manual Feature Intake
 
@@ -103,39 +177,40 @@ Add new ideas here first. During triage, either move them into the feature track
 
 | Date | Author | Manual Feature | Why It Matters | Triage |
 | --- | --- | --- | --- | --- |
-| 2026-06-10 | Codex | Choose installer target: NSIS, MSI, or both. | Affects packaging, enterprise install behavior, and setup UX. | Needs decision |
+| 2026-06-10 | Codex | Choose installer target: NSIS, MSI, or both. | Affects packaging, enterprise install behavior, and setup UX. | Needs decision (F-028) |
 | 2026-06-10 | Codex | Choose editor engine: textarea, CodeMirror, or Monaco. | Affects app weight and LaTeX editing capability. | Resolved 2026-11-13: CodeMirror 6 |
 | 2026-06-10 | Codex | Choose PDF preview strategy. | Affects file permissions, refresh behavior, and app size. | Resolved 2026-11-13: blob URL iframe |
 | 2026-06-10 | Codex | Decide whether to switch Strawberry Perl from MSI to portable. | Portable may better match no-GUI app-managed setup, but asset URL and extraction flow need confirmation. | Resolved 2026-11-13: portable ZIP |
 | 2026-11-13 | User | Click-to-jump between PDF and source (SyncTeX). | Standard in TeXstudio, Overleaf, LaTeX Workshop; fastest way to find preview text in source. | Specced: `specs/003-pdf-source-sync` |
-| 2026-11-13 | User | Document outline sidebar (sections, figures, tables). | Navigate long documents. | Specced: `specs/007-writing-toolkit` |
-| 2026-11-13 | User | Smart autocomplete (commands, environments, `\ref`/`\cite` keys). | Fewer typos, discoverability for new users. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-13 | User | Document outline sidebar (sections, figures, tables). | Navigate long documents. | Planned as F-067 (`specs/007-writing-toolkit`) |
+| 2026-11-13 | User | Smart autocomplete (commands, environments, `\ref`/`\cite` keys). | Fewer typos, discoverability for new users. | Planned as F-066 (`specs/007-writing-toolkit`) |
 | 2026-11-13 | User | Friendly compile errors with "Go to line". | Raw latexmk logs are hard for non-experts. | Specced: `specs/003-pdf-source-sync` (US3) |
-| 2026-11-13 | User | Citations / bibliography (.bib, citation picker, add by DOI). | Core need for academic writing. | Specced: `specs/007-writing-toolkit` |
-| 2026-11-13 | User | Insert image (ribbon + drag-and-drop, copied into project folder). | Word-style users expect it. | Specced: `specs/007-writing-toolkit` |
-| 2026-11-13 | User | Template gallery for New (article, report, letter, CV, beamer). | Faster start than the single starter document. | Specced: `specs/007-writing-toolkit` |
-| 2026-11-13 | User | Spell check (LaTeX-aware) and word count. | Basic writing aids every word processor has. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-13 | User | Citations / bibliography (.bib, citation picker, add by DOI). | Core need for academic writing. | Planned as F-068 (`specs/007-writing-toolkit`) |
+| 2026-11-13 | User | Insert image (ribbon + drag-and-drop, copied into project folder). | Word-style users expect it. | Planned as F-068 (`specs/007-writing-toolkit`) |
+| 2026-11-13 | User | Template gallery for New (article, report, letter, CV, beamer). | Faster start than the single starter document. | Planned as F-068 (`specs/007-writing-toolkit`) |
+| 2026-11-13 | User | Spell check (LaTeX-aware) and word count. | Basic writing aids every word processor has. | Planned as F-066 (`specs/007-writing-toolkit`) |
 | 2026-11-13 | User | Project workspace: Project Home, open folder, file sidebar, main document. | Multi-file documents (chapters, .bib, images); replaces single-file model and F-014 Recent files. | Implemented as F-046…F-051 (`specs/004-project-workspace`) |
-| 2026-11-13 | Claude | Local version history (automatic snapshots per project, restore any version). | Undo across sessions; safety net without Git. | Specced: `specs/007-writing-toolkit` |
-| 2026-11-13 | Claude | Command palette (Ctrl+Shift+P) to run any ribbon action by name. | Fast keyboard access as features grow. | Specced: `specs/007-writing-toolkit` |
-| 2026-11-13 | Claude | Find and replace across the whole project. | Needed once documents span several files. | Specced: `specs/007-writing-toolkit` |
-| 2026-11-13 | Claude | Export to Word (.docx) and HTML. | Share with people who do not use LaTeX. | Specced: `specs/007-writing-toolkit` |
-| 2026-11-13 | Claude | Auto-save (optional, every few seconds). | Word-style users expect it; pairs with version history. | Specced: `specs/007-writing-toolkit` |
-| 2026-11-13 | Claude | Settings screen (theme, editor font size, live preview delay, auto-save). | Covers F-033; needed as options multiply. | Specced: `specs/007-writing-toolkit` |
-| 2026-11-13 | Claude | Layout revamp: three panes (sidebar with Files/Outline tabs, editor, PDF) plus focus mode. | Gives the outline and the project tree one home; focus mode for distraction-free writing. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-13 | Claude | Local version history (automatic snapshots per project, restore any version). | Undo across sessions; safety net without Git. | Planned as F-070 (`specs/007-writing-toolkit`) |
+| 2026-11-13 | Claude | Command palette (Ctrl+Shift+P) to run any ribbon action by name. | Fast keyboard access as features grow. | Planned as F-067 (`specs/007-writing-toolkit`) |
+| 2026-11-13 | Claude | Find and replace across the whole project. | Needed once documents span several files. | Planned as F-067 (`specs/007-writing-toolkit`) |
+| 2026-11-13 | Claude | Export to Word (.docx) and HTML. | Share with people who do not use LaTeX. | Planned as F-072 (`specs/007-writing-toolkit`) |
+| 2026-11-13 | Claude | Auto-save (optional, every few seconds). | Word-style users expect it; pairs with version history. | Planned as F-070 (`specs/007-writing-toolkit`) |
+| 2026-11-13 | Claude | Settings screen (theme, editor font size, live preview delay, auto-save). | Covers F-033; needed as options multiply. | Planned as F-071 (`specs/007-writing-toolkit`) |
+| 2026-11-13 | Claude | Layout revamp: three panes (sidebar with Files/Outline tabs, editor, PDF) plus focus mode. | Gives the outline and the project tree one home; focus mode for distraction-free writing. | Planned as F-067 (`specs/007-writing-toolkit`) |
 | 2026-11-13 | User | Seamless Bangla and other languages: auto Unicode engine for latexbangla/fontspec/polyglossia, custom fonts (installed or in the project folder), editor display of all scripts, non-Latin file names. | The LaTeXbangla example failed: Lexy compiled it with pdfLaTeX because there was no `% !TEX program` line. | Implemented as F-052…F-056 (`specs/005-bangla-multilingual`) |
 | 2026-11-13 | User | Git integration: init, commit and push from a Git ribbon tab or menu with visual status. | Version control and backup for projects without leaving Lexy. | Implemented as F-057–F-059 (`specs/006-git-integration`) |
-| 2026-11-14 | User (from upvote research) | Grammar check that skips LaTeX commands (LanguageTool-style). | TeXstudio "Grammarly integration" 40👍. | Specced: `specs/007-writing-toolkit` |
-| 2026-11-14 | User (from upvote research) | Optional Vim keybindings in the editor. | TeXstudio's top request: "Vim keybindings" 47👍 + "vim editing" 24👍. | Specced: `specs/007-writing-toolkit` |
-| 2026-11-14 | User (from upvote research) | Editor tabs for open files. | Overleaf "Latex Editor with Tabs" 55👍. | Specced: `specs/007-writing-toolkit` |
-| 2026-11-14 | User (from upvote research) | Fold sections and environments. | LaTeX Workshop "Folding of sections" 8👍. | Specced: `specs/007-writing-toolkit` |
-| 2026-11-14 | User (from upvote research) | Comments / notes on text, resolve them, optional PDF export with comments. | Overleaf: comments 108👍, export PDF with comments 85👍, mentions 59👍. | Specced: `specs/007-writing-toolkit` |
-| 2026-11-14 | User (from upvote research) | Hover math preview in the source. | LaTeX Workshop "Real-time math preview" 24👍. | Specced: `specs/007-writing-toolkit` |
-| 2026-11-14 | User (from upvote research) | Auto-close `\begin{…}` with `\end{…}`, and a tidy-indentation command. | LaTeX Workshop: auto-closing environments, code formatter. | Specced: `specs/007-writing-toolkit` |
-| 2026-11-14 | User (from upvote research) | Compare versions (track-changes style view since a commit or date). | Overleaf track changes is paid; partly covered by `specs/006` diff/history. | Specced: `specs/007-writing-toolkit` |
-| 2026-11-14 | User (from upvote research) | Copy / duplicate files and folders in the sidebar. | Overleaf "Copy Files and Folders" 54👍. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-14 | User (from upvote research) | Grammar check that skips LaTeX commands (LanguageTool-style). | TeXstudio "Grammarly integration" 40👍. | Planned as F-066 (`specs/007-writing-toolkit`) |
+| 2026-11-14 | User (from upvote research) | Optional Vim keybindings in the editor. | TeXstudio's top request: "Vim keybindings" 47👍 + "vim editing" 24👍. | Planned as F-067 (`specs/007-writing-toolkit`) |
+| 2026-11-14 | User (from upvote research) | Editor tabs for open files. | Overleaf "Latex Editor with Tabs" 55👍. | Planned as F-067 (`specs/007-writing-toolkit`) |
+| 2026-11-14 | User (from upvote research) | Fold sections and environments. | LaTeX Workshop "Folding of sections" 8👍. | Planned as F-067 (`specs/007-writing-toolkit`) |
+| 2026-11-14 | User (from upvote research) | Comments / notes on text, resolve them, optional PDF export with comments. | Overleaf: comments 108👍, export PDF with comments 85👍, mentions 59👍. | Planned as F-069 (`specs/007-writing-toolkit`) |
+| 2026-11-14 | User (from upvote research) | Hover math preview in the source. | LaTeX Workshop "Real-time math preview" 24👍. | Planned as F-066 (`specs/007-writing-toolkit`) |
+| 2026-11-14 | User (from upvote research) | Auto-close `\begin{…}` with `\end{…}`, and a tidy-indentation command. | LaTeX Workshop: auto-closing environments, code formatter. | Planned as F-066 (`specs/007-writing-toolkit`) |
+| 2026-11-14 | User (from upvote research) | Compare versions (track-changes style view since a commit or date). | Overleaf track changes is paid; partly covered by `specs/006` diff/history. | Planned as F-069 (`specs/007-writing-toolkit`) |
+| 2026-11-14 | User (from upvote research) | Copy / duplicate files and folders in the sidebar. | Overleaf "Copy Files and Folders" 54👍. | Planned as F-070 (`specs/007-writing-toolkit`) |
 | 2026-11-14 | User (from upvote research) | Select and copy text in the PDF preview. | TeXstudio 16👍. | Declined by user (2026-11-14) |
 | 2026-11-14 | User (from upvote research) | Zotero / Mendeley citation insert. | LaTeX Workshop "Mendeley API support" 10👍. | Declined by user for now; citations intake row covers .bib |
+| 2026-11-14 | User | Follow the Windows app design guidelines (learn.microsoft.com/windows/apps/design) for the UI. | Lexy should feel native on Windows. | Planned as F-073 (`docs/DESIGN.md` "Windows design alignment") |
 
 ## Decision Log
 
@@ -170,6 +245,12 @@ Add new ideas here first. During triage, either move them into the feature track
 | 2026-11-13 | Tauri crates aligned to the npm minors (tauri 2.12.5, tauri-plugin-dialog 2.8.0). | Removes the CLI's version-mismatch error at launch. |
 | 2026-11-13 | Strawberry Perl installs from the portable ZIP (pinned SHA-256) into `%LOCALAPPDATA%\Lexy\Setup\StrawberryPerl`; downloads and unzipping move from PowerShell to Rust (`ureq` with native-tls, `zip`). | The silent per-machine MSI needs admin and failed with exit 1603 and no output; Rust gives real byte progress and readable errors. |
 | 2026-11-13 | One project folder per document under Documents\Lexy; the PDF is exported beside the `.tex` only on exit. | User request; keeps the project folder free of aux files and stale PDFs while editing, and the exported PDF always matches the saved text. |
+| 2026-11-14 | Spec 007: Rust returns project text (`project_texts`); all LaTeX parsing (index, outline, labels, bib keys, search, word count) is pure TypeScript in `src/latex/`. | One tested parser; editor and search share JS regex semantics; Rust keeps sole file access. |
+| 2026-11-14 | Spec 007: project-wide Replace all edits open editor buffers (unsaved, one undo step per file), never the disk directly. | No silent disk writes; undo per file; unsaved files handled by construction. |
+| 2026-11-14 | Spec 007: offline spell check with the Rust `spellbook` crate and a bundled `en_US` Hunspell dictionary; grammar via LanguageTool, off until the user turns it on. | Offline and private by default (FR-024). |
+| 2026-11-14 | Spec 007: Word/HTML export via Pandoc downloaded on first use (pinned version + SHA-256, consent, progress). | Real converter without bloating every install. |
+| 2026-11-14 | Spec 007: notes stored in `<project>\.lexy\notes.json`, the one exception to "nothing written into project folders". | Notes are user content and must travel with Git and folder copies. |
+| 2026-11-14 | UI follows the Windows design guidelines (DESIGN.md "Windows design alignment"): dialog primary button on the left, Cancel right; InfoBar for state notices; 14 px body text. | User request; native feel. |
 
 ## Verification Log
 
@@ -198,3 +279,16 @@ Add new ideas here first. During triage, either move them into the feature track
 | 2026-11-14 | `cargo test` + `npm test` + `npm run build`, Bangla auto font + BCC Purno | Passed | 127 Rust tests incl. a real XeLaTeX compile of the reported document (auto Nirmala UI, file untouched) and with BCC Purno from the project fonts folder (no missing glyphs); 361 Vitest tests. Not yet tried in the running app or on Overleaf. |
 | 2026-11-14 | Real BCC Purno download from kriti.app + compile (`cargo test bangla_without_setup -- --nocapture`) | Passed after fix | The app failed with "native-tls: unable to find any user-specified roots": downloads trusted only ureq's bundled Mozilla roots. They now use the Windows certificate store (`RootCerts::PlatformVerifier`). The earlier test had silently skipped the download; it now fails loudly unless `LEXY_OFFLINE` is set. 127 Rust / 361 Vitest pass. |
 | 2026-11-14 | `cargo test` + `npm test` + `npm run build`, shaping fix + kriti.app catalog + editor font | Passed | 132 Rust tests incl. conjunct width tests (automatic font and BCC Purno; fails without Script=Bengali) and a live kriti.app test (catalog, Kalpurush install, XeLaTeX compile); 364 Vitest tests. Editor font not checked visually in the running app. |
+| 2026-11-14 | `cargo test` + `npm test` + `npm run build`, tracker review | Passed | 132 Rust tests (52 s, real latexmk e2e) and 364 Vitest tests. Marked Done: F-019–F-021, F-026, F-048, F-049, F-053, F-055, F-061, F-063, F-064 (fully covered by automated or real e2e tests, no native-only check listed). Rows still waiting on a native-window or fresh-VM check stay In Progress. Spec 007 confirmed not started in code. |
+| 2026-11-14 | Planning review: spec 007 plan + Windows design guidelines | Passed (docs only) | `specs/007-writing-toolkit/` plan, research (R1–R16), data model, contracts, quickstart, tasks T001–T088; tracker regrouped by area, rows F-066–F-073 added, open items from specs 001–006 collected; DESIGN.md gained "Windows design alignment". No code changed. |
+| 2026-11-14 | Spec 007 Phase 1 (T001–T004): `cargo check`, `cargo test spell`, `npx tsc --noEmit`, `npm run build` | Passed | Added `@replit/codemirror-vim` 6.4.0, explicit `@codemirror/autocomplete` 6.20.4, `spellbook` 0.4.2, bundled `en_US` dictionary (`dictionary-en` 4.0.0, MIT AND BSD) as Tauri resources; empty `spell`, `web`, `snapshots`, `settings`, `export` modules. npm blocked the esbuild postinstall script (install-scripts policy); the build still works. |
+| 2026-11-14 | Spec 007 Gate 0 (T005–T015): `cargo test`, `npm test`, `npx tsc --noEmit`, `npm run build` | Passed | 140 Rust and 394 Vitest tests. New: `project_texts` command (junctions not followed), `get_settings`/`set_settings` (invalid → defaults, unknown keys kept), `src/latex/readable.ts`, `src/latex/index.ts`, `src/actions.ts`, `src/settings.ts` provider, `src/InfoBar.tsx`; the Writer keeps a live project index. Nothing visible changed yet. |
+| 2026-11-14 | Spec 007 Gate A (US1 writing aids): `cargo test`, `npm test`, `npx tsc --noEmit`, `npm run build`; browser pane with a stub backend | Passed | 146 Rust (spell: bundled en_US, suggestions, personal words; grammar against a local HTTP server) and 429 Vitest tests. Browser pane at 800x600 dark: only prose underlined (not `\textbf`, math, keys), word count 16, `\ref{`/`\cite{` suggestions with context, `\begin{itemize}`+Enter adds `\end{itemize}`, spelling menu replaces the word, KaTeX hover. Found and fixed: suggestion popup was light-on-light in dark mode; spelling menu was clipped by the editor pane. Not covered: native window, real LanguageTool server. |
+| 2026-11-14 | Spec 007 Gate B (US2 navigation): `npm test`, `npx tsc --noEmit`, `npm run build`; browser pane with a stub backend at 800x600 | Passed | 470 Vitest tests (folding, search/replace, tab order, tabs, outline, palette, find panel, Writer flows: Ctrl+W asks for unsaved work, Replace all never writes to disk, F11). Browser pane: tabs and side panel fit at 800 px with no horizontal overflow; outline follows `\input` in order; search finds matches across files; palette lists 49 commands; F11 hides ribbon and side panel. Fixed on the way: an App test's mocked `project_texts` threw in the success handler. Not covered: native window, screenshots (pane was hidden). |
+| 2026-11-14 | Spec 007 Gate C (US5 files and safety): `cargo test`, `npm test`, `npx tsc --noEmit`, `npm run build`; browser pane with a stub backend at 800x600 | Passed | 152 Rust (copy naming, folder copy, copy into itself refused, snapshot throttle, 30-day prune, Git detection, snapshots outside the project) and 476 Vitest tests (sidebar menu, auto-save on/off/read-only, Duplicate, Earlier versions restore). Browser pane: File tab fits at 800 px, Restore puts the snapshot text in the editor as an unsaved change. Not covered: native window, a real 10-minute snapshot cycle. |
+| 2026-11-14 | Spec 007 Gate D (US3 content): `cargo test`, `npm test`, `npm run build`; browser pane with a stub backend at 800x600 | Passed | 155 Rust tests incl. a real compile of all five templates (SC-006) and DOI lookup against a local server; 503 Vitest tests (citations, figures, dialogs, gallery, Writer flows: cite, add by DOI without disk writes, image drop adds graphicx once). Browser pane: Insert tab and New project gallery fit at 800 px. Not covered: a live doi.org lookup, native drag-drop. |
+| 2026-11-14 | Spec 007 Gate E (US4 review): `cargo test`, `npm test`, `npx tsc --noEmit`, `npm run build`; browser pane with a stub backend at 800x600 | Passed | 157 Rust tests incl. a real compile of the PDF with notes (todonotes) that leaves the preview's build folder alone, and the notes-file rule; 521 Vitest tests (notes anchoring/escaping, word diff, Notes and CompareView, Writer: Ctrl+Alt+M saves notes.json, stale offsets re-anchor, compare with last commit). Browser pane: 7 ribbon tabs and 4 side tabs fit at 800 px. Not covered: native window; opening the notes PDF. |
+| 2026-11-14 | Spec 007 Gate F (US6 settings): `npm test`, `npm run build`; browser pane with a stub backend at 800x600 | Passed | 530 Vitest tests (settings page controls, clamping, validation, Escape/Back, reset; theme attribute and font-size variable; scheduler delay; Writer: Ctrl+, opens it, preview waits the configured delay). Browser pane: page fills 800 px without sideways scroll; Theme → Dark switches colors and is stored. Fixed: page inherited the 420 px dialog width. Rust unchanged this batch. |
+| 2026-11-14 | Spec 007 Gate G (US7 export): `cargo test`, `npm test`, `npx tsc --noEmit`, `npm run build`; browser pane with a stub backend at 800x600 | Passed | 162 Rust tests (install from a local server: hash mismatch refused, wrong archive refused, progress, ZIP removed; arguments; warnings) and 532 Vitest tests (consent → install → save → export → result; cancel downloads nothing). The real-Pandoc test skipped (not installed). Not run: the 43 MB download, a real .docx/.html conversion. |
+| 2026-11-14 | Spec 007 Gate W (Windows design alignment): `npm test`, `npx tsc --noEmit`, `npm run build`; browser pane at 800x600 light and dark | Passed | 582 Vitest tests incl. 41 contrast checks (light/dark), dialog order and safe focus, prompt verbs, ribbon key tips, F6. Contrast test found two real gaps, both fixed: light line numbers 2.7:1 → 3.4:1; text fields now outlined with `--control-border` ≥ 3:1. Browser pane: all 7 ribbon tabs fit at 800 px in both themes. Not covered: Windows contrast themes and display scaling in the native window. |
+| 2026-11-14 | Spec 007 final run (T086–T088): `cargo test`, `npm test`, `npx tsc --noEmit`, `npm run build`; performance checks; data-safety pass | Passed | 162 Rust and 587 Vitest tests. Performance (500 files, 3.1 MB, in Vitest): index 66 ms cold / 3 ms after an edit, suggestions ≤ 1 ms (SC-001 < 100 ms), search ≤ 7 ms (SC-005 < 1 s), word count 143 ms. Data safety (SC-008): auto-save + Replace all + note + restore in one session wrote only texts the user saw. Found and fixed: notes containing `?` or `:` were refused. Flaky under CPU load: `TablePicker.test.tsx` failed once while `cargo test` ran in parallel, passed alone and in a full rerun. Not covered: native window, close/reopen, IPC time for project texts. |

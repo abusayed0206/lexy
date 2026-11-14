@@ -33,7 +33,24 @@ export function exportPdf(pdfPath: string, documentPath: string): Promise<string
   return invoke<string>("export_pdf", { pdfPath, documentPath });
 }
 
+/** Review → Export PDF with notes: compiles copies that carry 	odo notes and saves `<stem> (notes).pdf`; returns that name. */
+export const exportPdfWithNotes = (main: string, buffers: { path: string; text: string }[]) =>
+  invoke<string>("export_pdf_with_notes", { main, buffers });
+
 /** Raw PDF bytes from Lexy's build folder (the backend refuses any other path). */
 export async function loadPdf(path: string): Promise<Uint8Array> {
   return new Uint8Array(await invoke<ArrayBuffer>("read_pdf", { path }));
 }
+
+// ----- Word / HTML export (spec 007 US7) -----
+
+/** Mirrors `ConverterStatus` / `ExportReport` in src-tauri/src/export.rs. */
+export type ConverterStatus = { installed: boolean; version: string | null; downloadBytes: number };
+export type ExportReport = { output: string; warnings: string[] };
+export type ConverterProgress = { state: "downloading" | "unpacking" | "done" | "error"; bytesDone: number; bytesTotal: number; detail: string };
+
+export const converterStatus = () => invoke<ConverterStatus>("converter_status");
+/** Downloads the pinned Pandoc (hash-checked); progress comes as `converter-progress` events. Only after consent. */
+export const installConverter = () => invoke<void>("install_converter");
+/** Converts the saved main document; the file is written beside it. */
+export const exportDocument = (main: string, format: "docx" | "html") => invoke<ExportReport>("export_document", { main, format });

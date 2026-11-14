@@ -1,6 +1,6 @@
 # Lexy Design Brief
 
-Last updated: 2026-06-10
+Last updated: 2026-11-14
 
 Lexy should feel like a fast native writing tool, not a web dashboard. The interface should be sparse, predictable, and optimized for repeated writing and compiling.
 
@@ -84,13 +84,14 @@ Avoid silent blocking startup. If setup may take minutes, show progress immediat
 
 ## Settings
 
-Settings should be small and task-focused:
+Settings should be small and task-focused (2026-11-14: planned in `specs/007-writing-toolkit` US6; layout per "Windows design alignment" below):
 
-- Dependency paths and recheck button.
-- Auto compile on/off and debounce interval.
-- Compiler command options.
-- Theme preference.
-- App version and logs path.
+- Appearance: theme (Use system setting / Light / Dark), editor font size.
+- Editing: Vim keys, auto-save and its delay, spelling and its language.
+- Preview: live preview delay, hide PDF in focus mode.
+- Grammar: on/off and server (states that checked text is sent to it).
+- Files: image folder.
+- About: app version and logs folder.
 
 Do not build a broad preferences system until required.
 
@@ -106,6 +107,16 @@ Shortcuts (projects since feature 004):
 - `Ctrl+B` / `Ctrl+I` / `Ctrl+U`: bold / italic / underline the selection (editor only).
 - `Ctrl+L`: toggle logs.
 - `Ctrl+Shift+E`: show or hide the file sidebar (`Ctrl+B` stays Bold).
+- `Ctrl+Space`: show suggestions (they also appear while typing after `\`, inside `\ref{`, `\cite{` and `\begin{`).
+- `Shift+Alt+F`: tidy indentation (one undo step).
+- `F7`: check grammar (asks once before any text is sent online).
+- `Ctrl+Shift+P`: command palette (every action, with its shortcut).
+- `Ctrl+Shift+O` / `Ctrl+Shift+F`: side panel on Outline / Search (find and replace in the project).
+- `Ctrl+Tab` / `Ctrl+Shift+Tab`: next / previous tab; `Ctrl+W` or `Ctrl+F4`: close tab; `Ctrl+Shift+PageUp/PageDown`: move tab.
+- `Ctrl+Shift+[` / `Ctrl+Shift+]`: fold / unfold a section or environment.
+- `F11`: focus mode.
+- `Ctrl+,`: Settings.
+- `Ctrl+Alt+M`: new note on the selection (Review tab: notes, PDF with notes, compare with an earlier version).
 
 Shortcuts must not conflict with text editing expectations.
 
@@ -136,6 +147,22 @@ Lexy works on folders, not single files (`specs/004-project-workspace`).
 - The editor shows every script with Windows' own fonts (Nirmala UI for Bangla/Devanagari, Segoe UI for Arabic/Hebrew, YaHei/Yu Gothic/Malgun Gothic for CJK). Right-to-left lines read right to left; LaTeX lines stay left to right.
 - Bangla editing follows Windows text boxes: Left/Right step over a whole conjunct ("ক্ষে" is one step); Backspace removes one code point (ক্ষ → ক্), so a typist can correct the last keystroke.
 - Errors name the cause in plain words: `Font "X" not found`, `Package "X" could not be found or installed (offline?)`.
+
+## Windows design alignment (2026-11-14, feature 007)
+
+Lexy follows the Windows app design guidelines (https://learn.microsoft.com/en-us/windows/apps/design/guidelines-overview and its typography, color, commanding, dialogs, InfoBar, TabView, tooltips, keyboard, access keys, accessibility and app-settings pages). Details and sources: `specs/007-writing-toolkit/research.md` R15; tasks in batch W.
+
+- **Type**: Segoe UI Variable. Ramp: caption 12/16, body 14/20, body strong 14/20 semibold, subtitle 20/28 semibold, title 28/36 semibold. Never below 12 px regular. Emphasis is semibold, not bold or italic. Sentence case for every UI string.
+- **Dialogs** only to confirm irreversible actions (overwrite, close without saving, permanent delete) or a blocking state. The question goes in the first line; buttons are specific verbs ("Save all", "Delete"), never "OK" for a question. Order: primary (accent, Enter) on the left, secondary, safe close (Esc) on the right. Initial focus is never on a destructive button. One dialog at a time.
+- **InfoBar** (inline, icon + text, severity default/success/warning/error, closable unless the state persists) for app-state changes: folder missing, stale preview, offline, read-only window, font offers, export results. Errors tied to one field are inline under it.
+- **No confirmation for reversible actions** (Recycle Bin delete, rename, replace into unsaved buffers); undo is the safety net.
+- **Keyboard**: tab order follows visual order; arrow keys move inside groups (ribbon, trees, tab strips, lists); Esc closes transient UI only (menus, dialogs, palette, search, focus mode), never the window; F6 / Shift+F6 cycle panes; Ctrl+letter accelerators appear in tooltips; Alt shows ribbon key tips (F File, H Home, N Insert, P Layout, R Review, W View, G Git).
+- **Tabs** (editor tabs): one always active; closing the active one selects the next; Ctrl+Tab / Ctrl+Shift+Tab cycle; Ctrl+W and Ctrl+F4 close; drag or Ctrl+Shift+PageUp/PageDown reorder; overflow scrolls.
+- **Tooltips** only for icon-only controls or extra, non-essential information; they include the shortcut; never errors, status or interactive content.
+- **Color**: accent used sparingly for state and emphasis; severity always has an icon or text, never color alone; text contrast ≥ 4.5:1 (≥ 3:1 for large text, borders and focus rings) in light and dark, checked by a test; Windows contrast themes (`forced-colors`) keep borders, focus and selection visible.
+- **Settings**: one scrollable column (≤ 1000 px), short section headers in body strong, toggles for on/off, radio buttons for ≤ 5 choices, theme combo "Use system setting / Light / Dark", changes apply immediately (no Save button), About at the bottom; File → Settings, Ctrl+,.
+- **Icons**: monoline, 16 px, Segoe Fluent Icons metaphors where one exists.
+- **Implementation** (batch W): type sizes come from `--type-caption/body/subtitle/title` in `App.css`; dialogs order buttons through `windowsOrder` (mark a permanent action `destructive` so focus starts on Cancel); notices use `InfoBar`; text fields and selects use `--control-border` (≥ 3:1), while `--border-strong` is for decorative dividers; `src/test/contrast.test.ts` fails if a token pair drops below its ratio.
 
 ## Accessibility And Responsiveness
 
@@ -170,3 +197,4 @@ Add manual design ideas below. Keep each note dated and move accepted work into 
 | --- | --- | --- | --- |
 | 2026-06-10 | Codex | Keep MVP as split editor/preview with a compact command strip. | Superseded 2026-11-13 by the ribbon |
 | 2026-11-13 | User | Word-style ribbon with fonts, equations, tables, margins and live preview. | Accepted (feature 002) |
+| 2026-11-14 | User | Follow the Windows app design guidelines for UI. | Accepted: "Windows design alignment" section; batch W in `specs/007-writing-toolkit/tasks.md` (F-073) |

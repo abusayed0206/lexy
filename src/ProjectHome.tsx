@@ -2,7 +2,8 @@ import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { defaultFolder, type DefaultFolder } from "./documents";
 import { chooseProjectFolder, useChoice } from "./ProjectDialogs";
 import { createProject, errorText, forgetProject, INVALID_NAME_MESSAGE, listProjects, validName, type ProjectSummary } from "./projects";
-import { STARTER_DOCUMENT } from "./starter";
+import { TemplateGallery, templateText } from "./TemplateGallery";
+import { InfoBar } from "./InfoBar";
 
 type Props = {
   /** Open this folder as the project. */
@@ -34,6 +35,7 @@ export function ProjectHome({ onOpen, notice: initialNotice = null }: Props) {
   const [notice, setNotice] = useState<string | null>(initialNotice);
   const [naming, setNaming] = useState(false);
   const [name, setName] = useState("Untitled");
+  const [template, setTemplate] = useState("blank");
   const [nameError, setNameError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const list = useRef<HTMLUListElement>(null);
@@ -61,7 +63,7 @@ export function ProjectHome({ onOpen, notice: initialNotice = null }: Props) {
     }
     setBusy(true);
     try {
-      onOpen(await createProject(trimmed, STARTER_DOCUMENT));
+      onOpen(await createProject(trimmed, templateText(template)));
     } catch (error) {
       setNotice(`Could not create the project. ${errorText(error)}`);
       setBusy(false);
@@ -95,6 +97,7 @@ export function ProjectHome({ onOpen, notice: initialNotice = null }: Props) {
 
   function startNaming() {
     setName("Untitled");
+    setTemplate("blank");
     setNameError(null);
     setNaming(true);
   }
@@ -139,18 +142,11 @@ export function ProjectHome({ onOpen, notice: initialNotice = null }: Props) {
         </div>
       </header>
 
-      {folder?.fallback ? (
-        <div className="notice" role="status">
-          <span>Saving to {folder.path} because Documents isn't available.</span>
-        </div>
-      ) : null}
+      {folder?.fallback ? <InfoBar severity="warning">Saving to {folder.path} because Documents isn't available.</InfoBar> : null}
       {notice ? (
-        <div className="notice" role="alert">
-          <span>{notice}</span>
-          <button type="button" onClick={() => setNotice(null)}>
-            Dismiss
-          </button>
-        </div>
+        <InfoBar severity="error" onClose={() => setNotice(null)}>
+          {notice}
+        </InfoBar>
       ) : null}
 
       {naming ? (
@@ -191,6 +187,7 @@ export function ProjectHome({ onOpen, notice: initialNotice = null }: Props) {
               {nameError}
             </p>
           ) : null}
+          <TemplateGallery value={template} onChange={setTemplate} disabled={busy} />
         </form>
       ) : null}
 

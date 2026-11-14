@@ -35,6 +35,22 @@ const PATHS = {
   zoomOut: ["M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14zM20 20l-4-4", "M8 11h6"],
   fitWidth: ["M4 5v14M20 5v14", "M7 12h10M10 9l-3 3 3 3M14 9l3 3-3 3"],
   showInPdf: ["M6 3h9l3 3v15H6z", "M9 13h6M12 10l3 3-3 3"],
+  info: ["M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z", "M12 11v5M12 8h.01"],
+  success: ["M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z", "M8 12l3 3 5-6"],
+  warning: ["M12 4 2.5 20h19z", "M12 10v4M12 17h.01"],
+  error: ["M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z", "M9 9l6 6M15 9l-6 6"],
+  close: ["M6 6l12 12M18 6 6 18"],
+  tidy: ["M4 6h16M8 10h12M8 14h12M4 18h16"],
+  grammar: ["M4 17 8 6l4 11M5.5 13h5", "M14 15l2.5 2.5L21 12"],
+  focus: ["M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"],
+  image: ["M4 5h16v14H4z", "M4 16l5-5 4 4 3-3 4 4", "M15 9h.01"],
+  citation: ["M6 7h5v5H8l-2 4M14 7h5v5h-3l-2 4"],
+  note: ["M5 4h14v11l-5 5H5z", "M14 20v-5h5", "M9 9h6M9 12h4"],
+  notes: ["M7 3h12v13l-4 4H7z", "M4 7v14h11"],
+  pdfNotes: ["M6 3h9l3 3v15H6z", "M9 11h6M9 15h3", "M15 3v3h3"],
+  compare: ["M7 4v16M17 4v16", "M3 8l4-4 4 4M13 16l4 4 4-4"],
+  export: ["M6 3h9l3 3v15H6z", "M12 9v8M9 14l3 3 3-3"],
+  settings: ["M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z", "M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"],
 } as const;
 
 export type IconName = keyof typeof PATHS;

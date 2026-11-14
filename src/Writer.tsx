@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { exportPdf, installBanglaFont, loadPdf, syncToPdf, syncToSource, type CompileResult, type Problem } from "./compile";
+import { converterStatus, exportDocument, exportPdf, exportPdfWithNotes, installBanglaFont, installConverter, type ConverterProgress, type ExportReport, loadPdf, syncToPdf, syncToSource, type CompileResult, type Problem } from "./compile";
 import { addPurnoSetup, hasOutdatedPurnoSetup } from "./latex/scriptFont";
 import { Editor, type EditorHandle } from "./Editor";
 import { findEquationAt, wrapEquation, type FoundEquation } from "./latex/equations";
@@ -11,7 +11,7 @@ import { applySettings, conflicts, hasSettingsBlock, parseSettings, type Documen
 import { tableLatex, type TableSpec } from "./latex/tables";
 import { createLivePreview, type LivePreview } from "./livePreview";
 import { dirtyFiles, emptyOpenFiles, isDirty, keyOf, openFilesReducer, type OpenFilesEvent } from "./openFiles";
-import { gitStatus, STATUS_LETTER, type GitState } from "./git";
+import { gitLog, gitShowFile, gitStatus, STATUS_LETTER, type GitState } from "./git";
 import { GitPanel, type GitAction } from "./GitPanel";
 import { PdfView, type PdfViewHandle } from "./PdfView";
 import { zoomLabel, type Zoom } from "./pdfView/zoom";
@@ -21,6 +21,7 @@ import {
   absolutePath,
   baseName,
   compileProject,
+  copyEntry,
   createFile,
   createFolder,
   createProject,
@@ -31,9 +32,12 @@ import {
   joinRel,
   listDir,
   listProjects,
+  listSnapshots,
   openEntryExternal,
   parentOf,
+  projectTexts,
   readFile,
+  readSnapshot,
   renameEntry,
   sameRel,
   setMainDocument,
@@ -44,6 +48,29 @@ import {
   type ProjectSummary,
 } from "./projects";
 import { Ribbon, type RibbonActions } from "./Ribbon";
+import { buildIndex, type IndexCache, type ProjectIndex } from "./latex/index";
+import { annotate } from "./latex/readable";
+import { replaceIn, type SearchOptions } from "./latex/search";
+import { appendEntry, bibliographySetup, insertCitation } from "./latex/citations";
+import { ensureGraphicx, IMAGE_EXTENSIONS, insertFigure, isImage } from "./latex/figure";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { CitationDialog } from "./ribbon/CitationDialog";
+import { CompareView } from "./CompareView";
+import { Notes } from "./Notes";
+import { injectTodos, newNote, NOTES_PATH, parseNotes, reanchor, serializeNotes, withTodonotes, type Note } from "./latex/notes";
+import { NewProjectDialog } from "./TemplateGallery";
+import { SettingsDialog } from "./SettingsDialog";
+import { InfoBar } from "./InfoBar";
+import { DoiDialog } from "./ribbon/DoiDialog";
+import { ribbonCommands, type Action } from "./actions";
+import { CommandPalette } from "./CommandPalette";
+import { EditorTabs } from "./EditorTabs";
+import { Outline } from "./Outline";
+import { ProjectSearch } from "./ProjectSearch";
+import type { OutlineEntry } from "./latex/index";
+import { countWords, projectWordCount, type WordCountCache } from "./latex/wordCount";
+import { useSettings } from "./settings";
+import { dictionaryAdd, fetchDoi, grammarCheck, spellCheck, spellSuggest } from "./writingAids";
 import { Dialog } from "./ribbon/Dialog";
 import type { EquationResult } from "./ribbon/EquationDialog";
 import { Sidebar } from "./Sidebar";
@@ -209,6 +236,26 @@ export function Writer({ project, onSwitch }: Props) {
   const live = useRef<LivePreview | null>(null);
   const conflictWarned = useRef(false);
   const { ask, dialog: choiceDialog } = useChoice();
+  const { settings: appSettings, update: updateAppSettings } = useSettings();
+  const [projectWords, setProjectWords] = useState<number | null>(null);
+  const [selectionWords, setSelectionWords] = useState(0);
+  const wordCache = useRef<WordCountCache>(new Map());
+  const [sideTab, setSideTab] = useState<"files" | "outline" | "search" | "notes">("files");
+  const [outline, setOutline] = useState<OutlineEntry[]>([]);
+  /** Bumped whenever the index is rebuilt, so open search results refresh. */
+  const [indexVersion, setIndexVersion] = useState(0);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [focusMode, setFocusMode] = useState(false);
+  /** A file or folder chosen with Copy, for Paste (spec 007 US5). */
+  const [copied, setCopied] = useState<string | null>(null);
+  const [history, setHistory] = useState<{ file: string; kind: "commits" | "snapshots"; versions: Version[]; mode: "restore" | "compare" } | null>(null);
+  const [notes, setNotes] = useState<Note[]>([]);
+  const [compare, setCompare] = useState<{ file: string; against: string; before: string; after: string } | null>(null);
+  const [citation, setCitation] = useState<"cite" | "doi" | null>(null);
+  const [newProjectOpen, setNewProjectOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [exportState, setExportState] = useState<{ kind: "progress"; text: string } | { kind: "done"; report: ExportReport; folder: string } | null>(null);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
   const { prompt, dialog: nameDialog } = useNamePrompt();
 
   const filesRef = useRef(files);
@@ -258,6 +305,69 @@ export function Writer({ project, onSwitch }: Props) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [problems, openKeys, current]);
+
+  // Project text and index (spec 007 R1): disk text from `project_texts`, overlaid with every open
+  // file's text, so suggestions, outline and search see unsaved edits.
+  const diskTexts = useRef(new Map<string, string>());
+  const indexCache = useRef<IndexCache>(new Map());
+  /** Latest index; read through `projectIndex.current` so suggestions never wait for a render. */
+  const projectIndex = useRef<ProjectIndex>(buildIndex(new Map(), null));
+  const [textsVersion, setTextsVersion] = useState(0);
+  useEffect(() => {
+    // shortcut: reloads every text file after any tree change; switch to `project_texts(paths)` if large projects feel slow.
+    const timer = setTimeout(() => {
+      projectTexts().then(
+        (result) => {
+          diskTexts.current = new Map((result?.files ?? []).map((file) => [file.path, file.text]));
+          setTextsVersion((v) => v + 1);
+        },
+        () => undefined,
+      );
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [treeVersion]);
+  /** Every project text file, with each open file's current (possibly unsaved) text. */
+  function currentTexts(): Map<string, string> {
+    const texts = new Map(diskTexts.current);
+    const byLower = new Map([...texts.keys()].map((path) => [path.toLowerCase(), path]));
+    for (const [path, file] of filesRef.current.files) {
+      const existing = byLower.get(path.toLowerCase());
+      if (existing !== undefined) texts.delete(existing);
+      texts.set(path, file.text);
+    }
+    return texts;
+  }
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      const texts = currentTexts();
+      projectIndex.current = buildIndex(texts, filesRef.current.main, indexCache.current);
+      const files = projectIndex.current.documentFiles;
+      setProjectWords(files.length ? projectWordCount(files, texts, wordCache.current) : null);
+      setOutline(projectIndex.current.outline);
+      setIndexVersion((v) => v + 1);
+    }, 500);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [textsVersion, files]);
+
+  const spellLang = appSettings.spellLanguage;
+  const editorAids = useMemo(
+    () => ({
+      getIndex: () => projectIndex.current,
+      spellCheck: appSettings.spellCheck,
+      vim: appSettings.vim,
+      checkWords: (words: string[]) => spellCheck(spellLang, words),
+      suggest: (word: string) => spellSuggest(spellLang, word),
+      addWord: (word: string) => dictionaryAdd(word),
+    }),
+    [appSettings.spellCheck, appSettings.vim, spellLang],
+  );
+  const wordCountLabel =
+    projectWords === null
+      ? null
+      : selectionWords > 0
+        ? `${selectionWords.toLocaleString()} of ${projectWords.toLocaleString()} words`
+        : `${projectWords.toLocaleString()} ${projectWords === 1 ? "word" : "words"}`;
 
   const settings = useMemo(() => parseSettings(mainText ?? ""), [mainText]);
   const settingsManaged = useMemo(() => hasSettingsBlock(mainText ?? ""), [mainText]);
@@ -341,10 +451,12 @@ export function Writer({ project, onSwitch }: Props) {
       onResult: () => undefined,
     });
     scheduler.setEnabled(liveEnabled);
+    scheduler.setDelay(appSettings.livePreviewDelayMs);
     live.current = scheduler;
     return () => scheduler.dispose();
     // Created once; edits and toggles are pushed into it below.
   }, []);
+  useEffect(() => live.current?.setDelay(appSettings.livePreviewDelayMs), [appSettings.livePreviewDelayMs]);
 
   useEffect(() => {
     live.current?.setEnabled(liveEnabled);
@@ -361,6 +473,7 @@ export function Writer({ project, onSwitch }: Props) {
 
   /** Show a text file; loads it from disk the first time. */
   async function openFile(path: string, { first = false } = {}) {
+    pullNotes(); // keep the outgoing file's note positions before its state is put away
     const state = filesRef.current;
     const key = keyOf(state, path);
     if (key !== undefined) {
@@ -464,6 +577,8 @@ export function Writer({ project, onSwitch }: Props) {
       }
     }
     if (ok) setNotice((current) => (current?.startsWith("Could not save") ? null : current));
+    // Notes store where their text is as of this save.
+    if (notesRef.current.length) void persistNotes(pullNotes());
     void refreshGit();
     return ok;
   }
@@ -593,15 +708,11 @@ export function Writer({ project, onSwitch }: Props) {
     }
   }
 
-  async function newProject() {
-    const name = await prompt("New project", "Project name", "Untitled");
-    if (!name) return;
-    if (name.includes("\\")) {
-      setNotice("Use a project name without \\ or /.");
-      return;
-    }
+  /** File → New project: name and template come from the dialog (spec 007 US3). */
+  async function createFromTemplate(name: string, starter: string) {
+    setNewProjectOpen(false);
     try {
-      await leave(await createProject(name, STARTER_DOCUMENT));
+      await leave(await createProject(name, starter));
     } catch (error) {
       setNotice(`Could not create the project. ${errorText(error)}`);
     }
@@ -663,7 +774,7 @@ export function Writer({ project, onSwitch }: Props) {
         if (!isProjectError(error, "noRecycleBin")) throw error;
         const permanent = await ask("Delete", `This drive has no Recycle Bin. Delete ${entry.name} permanently?`, [
           { label: "Cancel", value: "cancel" },
-          { label: "Delete permanently", value: "delete", primary: true },
+          { label: "Delete permanently", value: "delete", primary: true, destructive: true },
         ]);
         if (permanent !== "delete") return;
         await deleteEntry(entry.path, true);
@@ -831,6 +942,477 @@ export function Writer({ project, onSwitch }: Props) {
   }
 
   /** Replace the main document's text as one undo step, whether or not it is on screen. */
+  // ----- content: citations and images (spec 007 US3) -----
+
+  /** Load a file into the editor's kept states without showing it (for edits in other files). */
+  async function loadInBackground(path: string): Promise<string> {
+    const known = keyOf(filesRef.current, path);
+    if (known !== undefined) return known;
+    const text = await readFile(path);
+    applyFiles({ type: "opened", path, text, background: true });
+    editor.current?.preload(path, text);
+    return path;
+  }
+
+  /** Change another (or the shown) file as one unsaved, undoable edit. */
+  async function editFile(path: string, change: (text: string) => string) {
+    const key = await loadInBackground(path);
+    const text = filesRef.current.files.get(key)!.text;
+    const next = change(text);
+    if (next !== text) replaceMainText(key, text, next);
+  }
+
+  const applyEdit = (text: string, edit: TextEdit | null) => (edit ? text.slice(0, edit.from) + edit.insert + text.slice(edit.to) : text);
+
+  function bibFiles(): string[] {
+    return [...currentTexts().keys()].filter((path) => /\.bib$/i.test(path)).sort();
+  }
+
+  /** Create references.bib (if missing) and add the bibliography commands to the main document. */
+  async function createBibliography(): Promise<string> {
+    const path = "references.bib";
+    try {
+      await createFile(path);
+    } catch (error) {
+      if (!isProjectError(error, "nameTaken")) throw error;
+    }
+    const main = filesRef.current.main;
+    if (main !== null) await editFile(main, (text) => applyEdit(text, bibliographySetup(text)));
+    setTreeVersion((v) => v + 1);
+    return path;
+  }
+
+  async function addBibEntry(entry: string, key: string, file: string | null) {
+    setCitation(null);
+    try {
+      // Cite first, while the cursor is still where the user asked.
+      edit((text, selection) => insertCitation(text, selection.from, [key]));
+      await editFile(file ?? (await createBibliography()), (text) => appendEntry(text, entry));
+      setInfo(`Added ${key} to ${file ?? "references.bib"}. Press Ctrl+S to save.`);
+    } catch (error) {
+      setNotice(`Could not add the entry. ${errorText(error)}`);
+    }
+  }
+
+  /** Copy an image into the image folder (never overwriting), insert a figure, and load graphicx once. */
+  async function insertImage(source: string, at: number | null = null) {
+    if (readOnly || filesRef.current.current === null) return;
+    const folder = appSettings.imageFolder;
+    try {
+      try {
+        await createFolder(folder);
+      } catch (error) {
+        if (!isProjectError(error, "nameTaken")) throw error;
+      }
+      const result = await importFiles([source], folder, "keepBoth");
+      const copied = result.copied[0];
+      if (!copied) return;
+      edit((text, selection) => insertFigure(text, at ?? selection.from, copied));
+      const main = filesRef.current.main;
+      if (main !== null) await editFile(main, (text) => applyEdit(text, ensureGraphicx(text)));
+      setTreeVersion((v) => v + 1);
+      setInfo(`Copied ${baseName(copied)} to ${folder}/`);
+    } catch (error) {
+      setNotice(`Could not insert the image. ${errorText(error)}`);
+    }
+  }
+
+  async function pickImage() {
+    try {
+      const picked = await openDialog({ multiple: false, filters: [{ name: "Images", extensions: IMAGE_EXTENSIONS }] });
+      if (typeof picked === "string") await insertImage(picked);
+    } catch (error) {
+      setNotice(`Could not choose an image. ${errorText(error)}`);
+    }
+  }
+
+  // Files dropped on the editor: images become figures at the drop point, other files are imported.
+  const dropRef = useRef<(paths: string[], x: number, y: number) => void>(() => undefined);
+  dropRef.current = (paths, x, y) => {
+    const scale = window.devicePixelRatio || 1;
+    const element = document.elementFromPoint(x / scale, y / scale);
+    if (!element?.closest(".editor")) return;
+    const at = editor.current?.posAtCoords(x / scale, y / scale) ?? null;
+    const images = paths.filter(isImage);
+    const others = paths.filter((path) => !isImage(path));
+    void (async () => {
+      for (const image of images) await insertImage(image, at);
+      if (others.length) await importDropped(others, "");
+    })();
+  };
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    import("@tauri-apps/api/webview")
+      .then(({ getCurrentWebview }) =>
+        getCurrentWebview().onDragDropEvent((event) => {
+          if (event.payload.type === "drop" && event.payload.paths.length) dropRef.current(event.payload.paths, event.payload.position.x, event.payload.position.y);
+        }),
+      )
+      .then((dispose) => (disposed ? dispose() : (unlisten = dispose)))
+      .catch(() => undefined); // Not running inside Tauri.
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  // ----- files and safety (spec 007 US5) -----
+
+  async function copyInto(from: string, dir: string) {
+    try {
+      const made = await copyEntry(from, dir);
+      setTreeVersion((v) => v + 1);
+      setInfo(`Created ${made}`);
+    } catch (error) {
+      setNotice(`Could not copy ${baseName(from)}. ${errorText(error)}`);
+    }
+  }
+
+  /** Earlier versions of the shown file: Git history when the project has it, else Lexy's snapshots. */
+  async function showHistory() {
+    const file = filesRef.current.current;
+    if (file === null) return;
+    if (git?.repo === "own" || git?.repo === "parent") {
+      onGit("history");
+      return;
+    }
+    try {
+      const { kind, versions } = await versionsOf(file);
+      setHistory({ file, kind, versions, mode: "restore" });
+    } catch (error) {
+      setNotice(`Could not list earlier versions. ${errorText(error)}`);
+    }
+  }
+
+  /** Restoring is an ordinary unsaved edit, so Ctrl+Z takes it back. */
+  async function restoreSnapshot(file: string, time: number) {
+    setHistory(null);
+    try {
+      const text = await readSnapshot(file, time);
+      if (!sameRel(file, filesRef.current.current)) await openFile(file);
+      const key = keyOf(filesRef.current, file);
+      if (key === undefined) return;
+      replaceMainText(key, filesRef.current.files.get(key)!.text, text);
+      setInfo(`Restored the version from ${new Date(time).toLocaleString()}. Press Ctrl+Z to undo, Ctrl+S to keep it.`);
+    } catch (error) {
+      setNotice(`Could not restore that version. ${errorText(error)}`);
+    }
+  }
+
+  // Auto-save (off by default): save every modified file once typing pauses; never in read-only windows.
+  useEffect(() => {
+    if (!appSettings.autoSave || readOnly || dirty.length === 0) return;
+    const timer = setTimeout(() => void saveAll(), appSettings.autoSaveDelayMs);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [files, appSettings.autoSave, appSettings.autoSaveDelayMs, readOnly]);
+
+  // ----- export to Word and HTML (spec 007 US7) -----
+
+  /** Pandoc is installed on first use only after the user agrees; then the saved main document is converted. */
+  async function exportAs(format: "docx" | "html") {
+    const target = filesRef.current.main;
+    if (target === null) {
+      setNotice("Choose a main document first.");
+      return;
+    }
+    try {
+      const status = await converterStatus();
+      if (!status.installed) {
+        const megabytes = Math.round(status.downloadBytes / 1_000_000);
+        const choice = await ask(
+          "Download Pandoc?",
+          `Export needs Pandoc, a free document converter (${megabytes} MB from github.com/jgm/pandoc). Lexy installs it for your Windows account only and checks the download before using it.`,
+          [
+            { label: "Cancel", value: "cancel" },
+            { label: "Download", value: "download", primary: true },
+          ],
+        );
+        if (choice !== "download") return;
+        setExportState({ kind: "progress", text: "Downloading Pandoc" });
+        let unlisten: (() => void) | undefined;
+        try {
+          unlisten = await listen<ConverterProgress>("converter-progress", ({ payload }) => {
+            if (payload.state === "downloading" || payload.state === "unpacking") {
+              const percent = payload.bytesTotal ? Math.round((payload.bytesDone / payload.bytesTotal) * 100) : 0;
+              setExportState({ kind: "progress", text: `${payload.state === "downloading" ? "Downloading" : "Unpacking"} Pandoc… ${percent} %` });
+            }
+          });
+        } catch {
+          // Not running inside Tauri: no progress events.
+        }
+        try {
+          await installConverter();
+        } finally {
+          unlisten?.();
+        }
+      }
+      // Pandoc reads the file on disk, so unsaved edits are saved first.
+      if (!(await saveAll()) && dirty.length) return;
+      setExportState({ kind: "progress", text: `Exporting ${format === "docx" ? "Word document" : "web page"}…` });
+      const report = await exportDocument(target, format);
+      setExportState({ kind: "done", report, folder: parentOf(target) });
+    } catch (error) {
+      setExportState(null);
+      setNotice(`Could not export. ${errorText(error)}`);
+    }
+  }
+
+  // ----- review: notes and compare (spec 007 US4) -----
+
+  const notesRef = useRef(notes);
+  notesRef.current = notes;
+
+  // Notes load once per project; a missing file just means no notes yet.
+  useEffect(() => {
+    readFile(NOTES_PATH).then(
+      (json) => setNotes(parseNotes(json ?? "")),
+      () => undefined,
+    );
+  }, []);
+
+  /** The shown file's notes, updated with where their highlights are now (missing → detached). */
+  function pullNotes(): Note[] {
+    const shown = filesRef.current.current;
+    const handle = editor.current;
+    if (shown === null || !handle) return notesRef.current;
+    const positions = new Map(handle.notePositions().map((mark) => [mark.id, mark]));
+    const next = notesRef.current.map((note) => {
+      if (!sameRel(note.file, shown) || note.state !== "open") return note;
+      const mark = positions.get(note.id);
+      return mark ? { ...note, from: mark.from, to: mark.to } : { ...note, state: "detached" as const };
+    });
+    if (next.some((note, index) => note !== notesRef.current[index])) {
+      notesRef.current = next;
+      setNotes(next);
+    }
+    return next;
+  }
+
+  async function persistNotes(next: Note[]) {
+    notesRef.current = next;
+    setNotes(next);
+    if (readOnly) return;
+    try {
+      try {
+        await createFolder(".lexy");
+      } catch (error) {
+        if (!isProjectError(error, "nameTaken")) throw error;
+      }
+      await writeFile(NOTES_PATH, serializeNotes(next));
+    } catch (error) {
+      setNotice(`Could not save the notes. ${errorText(error)}`);
+    }
+  }
+
+  // Show the open notes of the shown file, re-found by their quoted text.
+  useEffect(() => {
+    if (current === null) return;
+    const text = filesRef.current.files.get(current)?.text ?? "";
+    const marks = notes
+      .filter((note) => sameRel(note.file, current) && note.state === "open")
+      .map((note) => reanchor(note, text))
+      .filter((note) => note.state === "open")
+      .map(({ id, from, to }) => ({ id, from, to }));
+    editor.current?.setNotes(marks);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [current, notes]);
+
+  async function addNote() {
+    const handle = editor.current;
+    const file = filesRef.current.current;
+    if (!handle || file === null || readOnly) return;
+    const selection = handle.getSelection();
+    if (selection.from === selection.to) {
+      setInfo("Select the text the note is about, then press Ctrl+Alt+M.");
+      return;
+    }
+    // Any text is fine in a note (the default prompt check is for file names, which forbid ? : * …).
+    const body = await prompt("New note", "Note", "", (value) => (value.trim() ? null : "Write the note first."));
+    if (!body?.trim()) return;
+    await persistNotes([...pullNotes(), newNote(file, selection.from, selection.to, handle.getText(), body)]);
+    setSideTab("notes");
+  }
+
+  async function jumpToNote(note: Note) {
+    await openAt(note.file, note.from, note.to);
+  }
+
+  async function exportNotesPdf() {
+    const target = filesRef.current.main;
+    if (target === null) return;
+    const all = pullNotes();
+    if (!all.some((note) => note.state === "open")) {
+      setInfo("There are no open notes to show in the PDF.");
+      return;
+    }
+    // Copies of the main document and the files with notes; nothing is written to the project's .tex files.
+    const texts = currentTexts();
+    const files = new Set([target, ...all.filter((note) => note.state === "open").map((note) => note.file)]);
+    const noted: Buffer[] = [];
+    for (const file of files) {
+      const key = [...texts.keys()].find((path) => sameRel(path, file));
+      if (key === undefined) continue;
+      let text = injectTodos(texts.get(key)!, all.filter((note) => sameRel(note.file, file)).map((note) => reanchor(note, texts.get(key)!)));
+      if (sameRel(key, target)) text = withTodonotes(text);
+      noted.push({ path: key, text });
+    }
+    // Other unsaved files too, so the PDF shows the same text as the preview.
+    for (const buffer of buffers()) if (!noted.some((item) => sameRel(item.path, buffer.path))) noted.push(buffer);
+    setInfo("Compiling the PDF with notes…");
+    try {
+      const name = await exportPdfWithNotes(target, noted);
+      setInfo(`Saved ${name} beside the main document.`);
+    } catch (error) {
+      setInfo(null);
+      setNotice(errorText(error));
+    }
+  }
+
+  /** Versions of the shown file to compare with: Git commits when the project has Git, else snapshots. */
+  async function versionsOf(file: string): Promise<{ kind: "commits" | "snapshots"; versions: Version[] }> {
+    if (git?.repo === "own" || git?.repo === "parent") {
+      const commits = await gitLog(0, 30);
+      return {
+        kind: "commits",
+        versions: commits.map((commit) => ({ key: commit.id, label: commit.message, detail: new Date(commit.time * 1000).toLocaleString() })),
+      };
+    }
+    const snapshots = await listSnapshots(file);
+    return {
+      kind: "snapshots",
+      versions: snapshots.map((snapshot) => ({ key: String(snapshot.time), label: new Date(snapshot.time).toLocaleString(), detail: `${(snapshot.size / 1024).toFixed(1)} KB` })),
+    };
+  }
+
+  async function compareWith(file: string, kind: "commits" | "snapshots", version: Version) {
+    setHistory(null);
+    try {
+      const before = kind === "commits" ? await gitShowFile(version.key, file.split("\\").join("/")) : await readSnapshot(file, Number(version.key));
+      const key = keyOf(filesRef.current, file);
+      const after = key !== undefined ? filesRef.current.files.get(key)!.text : await readFile(file);
+      setCompare({ file, against: kind === "commits" ? `“${version.label}” (${version.detail})` : `the version from ${version.label}`, before, after });
+    } catch (error) {
+      setNotice(`Could not compare. ${errorText(error)}`);
+    }
+  }
+
+  async function compareLast() {
+    const file = filesRef.current.current;
+    if (file === null) return;
+    try {
+      const { kind, versions } = await versionsOf(file);
+      if (!versions.length) {
+        setInfo(kind === "commits" ? "No commits yet to compare with." : "No earlier version yet. Lexy keeps one when you save, at most every 10 minutes.");
+        return;
+      }
+      await compareWith(file, kind, versions[0]);
+    } catch (error) {
+      setNotice(`Could not compare. ${errorText(error)}`);
+    }
+  }
+
+  async function chooseComparison() {
+    const file = filesRef.current.current;
+    if (file === null) return;
+    try {
+      const { kind, versions } = await versionsOf(file);
+      setHistory({ file, kind, versions, mode: "compare" });
+    } catch (error) {
+      setNotice(`Could not list earlier versions. ${errorText(error)}`);
+    }
+  }
+
+  // ----- tabs, search, outline (spec 007 US2) -----
+
+  /** Close a tab; unsaved edits get Save / Don't save / Cancel. The main document stays open. */
+  async function closeTab(path: string) {
+    const state = filesRef.current;
+    const key = keyOf(state, path);
+    if (key === undefined || sameRel(key, state.main)) return;
+    const file = state.files.get(key)!;
+    if (isDirty(file)) {
+      const choice = await ask("Save changes?", `Save the changes to ${baseName(key)} before closing it?`, [
+        { label: "Cancel", value: "cancel" },
+        { label: "Don't save", value: "discard" },
+        { label: "Save", value: "save", primary: true },
+      ]);
+      if (choice !== "save" && choice !== "discard") return;
+      if (choice === "save") {
+        try {
+          await writeFile(key, file.text);
+          diskVersion.current++;
+        } catch (error) {
+          setNotice(`Could not save ${baseName(key)}. ${errorText(error)}`);
+          return;
+        }
+      }
+    }
+    const wasShown = key === filesRef.current.current;
+    applyFiles({ type: "closed", path: key });
+    const next = filesRef.current.current;
+    // Switch first: switching stores the outgoing state, which forget then drops.
+    if (wasShown && next !== null) editor.current?.switchTo(next, filesRef.current.files.get(next)!.text);
+    editor.current?.forget(key);
+    if (wasShown && next === null) editor.current?.focus();
+    afterEdit();
+  }
+
+  function cycleTab(step: 1 | -1) {
+    const order = [...filesRef.current.files.keys()];
+    if (order.length < 2) return;
+    const at = order.indexOf(filesRef.current.current ?? "");
+    void openFile(order[(at + step + order.length) % order.length]);
+  }
+
+  function moveTab(step: 1 | -1) {
+    const state = filesRef.current;
+    if (state.current === null) return;
+    const at = [...state.files.keys()].indexOf(state.current);
+    applyFiles({ type: "reordered", path: state.current, index: at + step });
+  }
+
+  async function openAt(file: string, from: number, to: number) {
+    const path = file.split("/").join("\\");
+    if (!sameRel(path, filesRef.current.current)) await openFile(path);
+    editor.current?.selectRange(from, to);
+  }
+
+  /** Replace in every file with matches: each file becomes one unsaved, undoable edit (never written to disk here). */
+  async function replaceInProject(query: string, options: SearchOptions, replacement: string, targets: string[]) {
+    if (readOnly) return;
+    let changedFiles = 0;
+    let total = 0;
+    for (const target of targets) {
+      let key = keyOf(filesRef.current, target);
+      let text: string;
+      if (key === undefined) {
+        try {
+          text = await readFile(target);
+        } catch {
+          continue;
+        }
+        applyFiles({ type: "opened", path: target, text, background: true });
+        editor.current?.preload(target, text);
+        key = target;
+      } else {
+        text = filesRef.current.files.get(key)!.text;
+      }
+      const result = replaceIn(text, query, options, replacement);
+      if (!result.count) continue;
+      replaceMainText(key, text, result.text);
+      changedFiles++;
+      total += result.count;
+    }
+    setInfo(`Replaced ${total} ${total === 1 ? "match" : "matches"} in ${changedFiles} ${changedFiles === 1 ? "file" : "files"}. Press Ctrl+S to save.`);
+  }
+
+  function showSide(tab: "files" | "outline" | "search" | "notes") {
+    setSideTab(tab);
+    if (!filesOpen) toggleFiles();
+  }
+
   function replaceMainText(key: string, text: string, updated: string) {
     if (key === filesRef.current.current) {
       editor.current?.replaceAll(updated);
@@ -864,6 +1446,36 @@ export function Writer({ project, onSwitch }: Props) {
     }
   }
 
+  /** On-demand grammar check of the shown file; the first use asks before any text leaves the machine (FR-024). */
+  async function checkGrammar() {
+    const handle = editor.current;
+    if (!handle || current === null) return;
+    if (!appSettings.grammarCheck) {
+      const choice = await ask(
+        "Check grammar online?",
+        `The text of ${baseName(current)} is sent to ${appSettings.grammarServer} for checking. You can turn this off in Settings.`,
+        [
+          { label: "Cancel", value: "cancel" },
+          { label: "Turn on", value: "on", primary: true },
+        ],
+      );
+      if (choice !== "on") return;
+      await updateAppSettings({ grammarCheck: true });
+    }
+    const text = handle.getText();
+    setInfo("Checking grammar…");
+    try {
+      // Annotated parts cover the text in order, so LanguageTool's offsets are offsets in `text`.
+      const issues = await grammarCheck(appSettings.grammarServer, appSettings.spellLanguage.replace("_", "-"), annotate(text));
+      if (handle.getText() !== text) return; // Edited meanwhile: the offsets no longer fit.
+      handle.setGrammar(issues.map((issue) => ({ from: issue.offset, to: issue.offset + issue.length, message: issue.message, replacements: issue.replacements })));
+      setInfo(issues.length ? `${issues.length} grammar ${issues.length === 1 ? "suggestion" : "suggestions"}. Point at a wavy underline to see it.` : "No grammar issues found");
+    } catch (error) {
+      setInfo(null);
+      setNotice(`Grammar check failed. ${errorText(error)}`);
+    }
+  }
+
   function afterEdit() {
     dispatch({ type: "edit" });
     live.current?.edit(String(++editSeq.current));
@@ -892,7 +1504,7 @@ export function Writer({ project, onSwitch }: Props) {
 
   const actions: RibbonActions = {
     onNew: () => void newFile(current ? parentOf(current) : ""),
-    onNewProject: () => void newProject(),
+    onNewProject: () => setNewProjectOpen(true),
     onOpen: () => void openFolder(),
     onHome: () => void leave(null),
     onRecent: (path) => void leave(path),
@@ -919,9 +1531,81 @@ export function Writer({ project, onSwitch }: Props) {
     onSize: (size: FontSize) => changeSettings({ ...settings, size }),
     onLayout: changeSettings,
     onGit,
+    onTidy: () => editor.current?.tidy(),
+    onGrammar: () => void checkGrammar(),
+    onToggleFocus: () => setFocusMode((on) => !on),
+    onHistory: () => void showHistory(),
+    onCitation: () => setCitation("cite"),
+    onImage: () => void pickImage(),
+    onNewNote: () => void addNote(),
+    onShowNotes: () => showSide("notes"),
+    onCompareLast: () => void compareLast(),
+    onCompareWith: () => void chooseComparison(),
+    onExportNotes: () => void exportNotesPdf(),
+    onExport: (format) => void exportAs(format),
+    onSettings: () => {
+      setSettingsOpen(true);
+      import("@tauri-apps/api/app").then(({ getVersion }) => getVersion()).then(setAppVersion, () => undefined);
+    },
   };
   const actionsRef = useRef(actions);
   actionsRef.current = actions;
+
+  /** Everything the command palette lists (spec 007 R12): the ribbon plus actions without a button. */
+  const commands: Action[] = [
+    ...ribbonCommands(actions),
+    { id: "view.outline", group: "View", title: "Show outline", shortcut: "Ctrl+Shift+O", run: () => showSide("outline") },
+    { id: "view.search", group: "View", title: "Find in project", shortcut: "Ctrl+Shift+F", run: () => showSide("search") },
+    { id: "view.palette", group: "View", title: "Command palette", shortcut: "Ctrl+Shift+P", run: () => setPaletteOpen(true) },
+    { id: "tabs.next", group: "Tabs", title: "Next tab", shortcut: "Ctrl+Tab", run: () => cycleTab(1) },
+    { id: "tabs.previous", group: "Tabs", title: "Previous tab", shortcut: "Ctrl+Shift+Tab", run: () => cycleTab(-1) },
+    { id: "tabs.close", group: "Tabs", title: "Close tab", shortcut: "Ctrl+W", run: () => current && void closeTab(current), enabled: () => !!current && !sameRel(current, main) },
+    { id: "tabs.left", group: "Tabs", title: "Move tab left", shortcut: "Ctrl+Shift+PageUp", run: () => moveTab(-1) },
+    { id: "tabs.right", group: "Tabs", title: "Move tab right", shortcut: "Ctrl+Shift+PageDown", run: () => moveTab(1) },
+    {
+      id: "settings.vim",
+      group: "Settings",
+      title: appSettings.vim ? "Turn off Vim keys" : "Turn on Vim keys",
+      run: () => void updateAppSettings({ vim: !appSettings.vim }),
+    },
+    {
+      id: "settings.autoSave",
+      group: "Settings",
+      title: appSettings.autoSave ? "Turn off auto-save" : "Turn on auto-save",
+      run: () => void updateAppSettings({ autoSave: !appSettings.autoSave }),
+    },
+    {
+      id: "settings.spell",
+      group: "Settings",
+      title: appSettings.spellCheck ? "Turn off spell check" : "Turn on spell check",
+      run: () => void updateAppSettings({ spellCheck: !appSettings.spellCheck }),
+    },
+  ];
+  /** F6 / Shift+F6: next / previous pane (Windows keyboard rule): ribbon → side panel → editor → PDF → drawer. */
+  function cyclePane(step: 1 | -1) {
+    const panes = [
+      document.querySelector<HTMLElement>('.ribbon:not([hidden]) [role="tab"][aria-selected="true"]'),
+      document.querySelector<HTMLElement>('.side-panel [role="tab"][aria-selected="true"]'),
+      document.querySelector<HTMLElement>(".editor-column .cm-content"),
+      document.querySelector<HTMLElement>(".preview"),
+      document.querySelector<HTMLElement>('.log-drawer [role="tab"][aria-selected="true"]'),
+    ].filter((pane): pane is HTMLElement => pane !== null);
+    if (!panes.length) return;
+    const regions = [".ribbon", ".side-panel", ".editor-column", ".preview", ".log-drawer"];
+    const active = document.activeElement;
+    const at = panes.findIndex((pane) => {
+      const region = regions.find((selector) => pane.closest(selector));
+      return region !== undefined && !!active?.closest(region);
+    });
+    const next = at < 0 ? (step === 1 ? 0 : panes.length - 1) : (at + step + panes.length) % panes.length;
+    panes[next].focus();
+  }
+
+  const cyclePaneRef = useRef(cyclePane);
+  cyclePaneRef.current = cyclePane;
+  const commandsRef = useRef(commands);
+  commandsRef.current = commands;
+  const runCommand = (id: string) => () => commandsRef.current.find((command) => command.id === id)?.run();
 
   useEffect(() => {
     // Capture phase so these win over the editor's own bindings (Ctrl+L select line, Ctrl+I select parent).
@@ -936,6 +1620,20 @@ export function Writer({ project, onSwitch }: Props) {
       else if (ctrl && event.shiftKey && key === "e") action = run.onToggleFiles;
       else if (ctrl && event.shiftKey && key === "g") action = () => run.onGit("changes");
       else if (ctrl && event.shiftKey && key === "k") action = () => run.onGit("focus");
+      else if (event.key === "F7" && !event.ctrlKey && !event.altKey) action = run.onGrammar;
+      else if (event.key === "F11" && !event.ctrlKey && !event.altKey) action = runCommand("view.focus");
+      else if (event.key === "F6" && !event.ctrlKey && !event.altKey) action = () => cyclePaneRef.current(event.shiftKey ? -1 : 1);
+      else if (event.ctrlKey && event.altKey && !event.shiftKey && key === "m") action = run.onNewNote;
+      else if (ctrl && !event.shiftKey && event.key === ",") action = run.onSettings;
+      else if (event.ctrlKey && !event.altKey && event.key === "Tab") action = runCommand(event.shiftKey ? "tabs.previous" : "tabs.next");
+      else if (event.ctrlKey && !event.altKey && event.key === "F4") action = runCommand("tabs.close");
+      else if (ctrl && event.shiftKey && event.key === "PageUp") action = runCommand("tabs.left");
+      else if (ctrl && event.shiftKey && event.key === "PageDown") action = runCommand("tabs.right");
+      else if (ctrl && event.shiftKey && key === "p") action = runCommand("view.palette");
+      else if (ctrl && event.shiftKey && key === "f") action = runCommand("view.search");
+      else if (ctrl && event.shiftKey && key === "o") action = runCommand("view.outline");
+      else if (ctrl && !event.shiftKey && key === "w") action = runCommand("tabs.close");
+      else if (event.altKey && event.shiftKey && !event.ctrlKey && key === "f") action = run.onTidy;
       else if (ctrl && !event.shiftKey) {
         action =
           { n: run.onNew, o: run.onOpen, l: run.onToggleLogs, j: run.onShowInPdf, b: () => run.onFormat("textbf"), i: () => run.onFormat("textit"), u: () => run.onFormat("underline") }[key] ??
@@ -1016,9 +1714,19 @@ export function Writer({ project, onSwitch }: Props) {
   const compiling = state.status === "compiling";
   const currentName = current ?? "No file open";
 
+  const hidePdf = focusMode && appSettings.hidePdfInFocus;
+  const showSidebar = filesOpen && !focusMode;
+  const tabPaths = [...files.files.keys()];
+
   return (
-    <main className="writer">
+    <main className={focusMode ? "writer focus-mode" : "writer"}>
+      {focusMode ? (
+        <button type="button" className="leave-focus" onClick={() => setFocusMode(false)}>
+          Leave focus mode (F11)
+        </button>
+      ) : null}
       <Ribbon
+        hidden={focusMode}
         actions={actions}
         state={{
           fileName: currentName,
@@ -1041,84 +1749,114 @@ export function Writer({ project, onSwitch }: Props) {
           git,
           gitOpen,
           zoomLabel: zoomLabel(zoom),
+          wordCount: wordCountLabel,
         }}
       />
 
-      {readOnly ? (
-        <div className="notice info" role="status">
-          <span>Open in another Lexy window. Read-only.</span>
-        </div>
-      ) : null}
+      {readOnly ? <InfoBar severity="warning">Open in another Lexy window. Read-only.</InfoBar> : null}
       {missing ? (
-        <div className="notice" role="alert">
-          <span>Project folder is missing.</span>
-          <button type="button" onClick={() => void saveAsNewProject()}>
-            Save as new project
-          </button>
-        </div>
+        <InfoBar
+          severity="error"
+          actions={
+            <button type="button" onClick={() => void saveAsNewProject()}>
+              Save as new project
+            </button>
+          }
+        >
+          Project folder is missing.
+        </InfoBar>
       ) : null}
       {currentFile?.diskChanged ? (
-        <div className="notice" role="alert">
-          <span>{baseName(current!)} changed on disk.</span>
-          <span className="notice-actions">
-            <button type="button" onClick={() => void reloadCurrent()}>
-              Reload
-            </button>
-            <button type="button" onClick={() => applyFiles({ type: "keptMine", path: current! })}>
-              Keep mine
-            </button>
-          </span>
-        </div>
+        <InfoBar
+          severity="warning"
+          actions={
+            <>
+              <button type="button" onClick={() => void reloadCurrent()}>
+                Reload
+              </button>
+              <button type="button" onClick={() => applyFiles({ type: "keptMine", path: current! })}>
+                Keep mine
+              </button>
+            </>
+          }
+        >
+          {baseName(current!)} changed on disk.
+        </InfoBar>
       ) : null}
       {banglaOffer ? (
-        <div className="notice info" role="status">
-          <span>
-            Bangla text without a Bangla font: the preview uses Nirmala UI. Add BCC Purno (Bangladesh Computer Council, 0.8 MB) to this
-            project so it compiles on any computer and on Overleaf (choose XeLaTeX there)?
-          </span>
-          <span className="notice-actions">
-            <button type="button" onClick={() => void addBanglaFont()}>
-              Add font
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                banglaDismissed.current = true;
-                setBanglaOffer(false);
-              }}
-            >
-              Not now
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                writeStorage(banglaKey, "never");
-                setBanglaOffer(false);
-              }}
-            >
-              Don't ask again
-            </button>
-          </span>
-        </div>
+        <InfoBar
+          actions={
+            <>
+              <button type="button" className="primary" onClick={() => void addBanglaFont()}>
+                Add font
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  banglaDismissed.current = true;
+                  setBanglaOffer(false);
+                }}
+              >
+                Not now
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  writeStorage(banglaKey, "never");
+                  setBanglaOffer(false);
+                }}
+              >
+                Don't ask again
+              </button>
+            </>
+          }
+        >
+          Bangla text without a Bangla font: the preview uses Nirmala UI. Add BCC Purno (Bangladesh Computer Council, 0.8 MB) to this
+          project so it compiles on any computer and on Overleaf (choose XeLaTeX there)?
+        </InfoBar>
       ) : null}
       {notice ? (
-        <div className="notice" role="alert">
-          <span>{notice}</span>
-          <button type="button" onClick={() => setNotice(null)}>
-            Dismiss
-          </button>
-        </div>
+        <InfoBar severity="error" onClose={() => setNotice(null)}>
+          {notice}
+        </InfoBar>
       ) : null}
-      {info ? (
-        <div className="notice info" role="status">
-          <span>{info}</span>
-        </div>
+      {exportState?.kind === "progress" ? <InfoBar>{exportState.text}</InfoBar> : null}
+      {exportState?.kind === "done" ? (
+        <InfoBar
+          severity={exportState.report.warnings.length ? "warning" : "success"}
+          onClose={() => setExportState(null)}
+          actions={
+            <>
+              <button type="button" onClick={() => void openEntryExternal(joinRel(exportState.folder, exportState.report.output)).catch((error) => setNotice(errorText(error)))}>
+                Open
+              </button>
+              {exportState.report.warnings.length ? (
+                <button
+                  type="button"
+                  onClick={() =>
+                    void ask("Approximated parts", <ul className="export-warnings">{exportState.report.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul>, [
+                      { label: "Close", value: "close", primary: true },
+                    ])
+                  }
+                >
+                  Show details
+                </button>
+              ) : null}
+            </>
+          }
+        >
+          Exported {exportState.report.output}
+          {exportState.report.warnings.length
+            ? `. ${exportState.report.warnings.length} ${exportState.report.warnings.length === 1 ? "part was" : "parts were"} approximated.`
+            : "."}
+        </InfoBar>
       ) : null}
+      {info ? <InfoBar>{info}</InfoBar> : null}
 
       <div
         className="workspace"
         style={{
-          gridTemplateColumns: `${filesOpen ? `${sidebarWidth}px 4px ` : ""}minmax(0, 1fr)${gitOpen ? " var(--git-panel-width)" : ""}`,
+          gridTemplateColumns: `${showSidebar ? `${sidebarWidth}px 4px ` : ""}minmax(0, 1fr)${gitOpen && !focusMode ? " var(--git-panel-width)" : ""}`,
         }}
         onPointerMove={(event) => {
           if (dragging.current === "sidebar") updateSidebar(event.clientX - event.currentTarget.getBoundingClientRect().left);
@@ -1127,8 +1865,68 @@ export function Writer({ project, onSwitch }: Props) {
           if (dragging.current === "sidebar") dragging.current = null;
         }}
       >
-        {filesOpen ? (
+        {showSidebar ? (
           <>
+            <div className="side-panel">
+              <div className="side-tabs" role="tablist" aria-label="Side panel">
+                {(
+                  [
+                    ["files", "Files", "Ctrl+Shift+E"],
+                    ["outline", "Outline", "Ctrl+Shift+O"],
+                    ["search", "Search", "Ctrl+Shift+F"],
+                    ["notes", "Notes", "Ctrl+Alt+M adds one"],
+                  ] as const
+                ).map(([id, label, shortcut]) => (
+                  <button
+                    key={id}
+                    type="button"
+                    role="tab"
+                    id={`side-tab-${id}`}
+                    aria-selected={sideTab === id}
+                    aria-controls={`side-panel-${id}`}
+                    tabIndex={sideTab === id ? 0 : -1}
+                    title={`${label} (${shortcut})`}
+                    onClick={() => setSideTab(id)}
+                    onKeyDown={(event) => {
+                      const order = ["files", "outline", "search", "notes"] as const;
+                      const at = order.indexOf(id);
+                      const to = event.key === "ArrowRight" ? order[(at + 1) % 4] : event.key === "ArrowLeft" ? order[(at + 3) % 4] : null;
+                      if (!to) return;
+                      event.preventDefault();
+                      setSideTab(to);
+                      document.getElementById(`side-tab-${to}`)?.focus();
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <div className="side-body" id="side-panel-outline" role="tabpanel" aria-labelledby="side-tab-outline" hidden={sideTab !== "outline"}>
+                {sideTab === "outline" ? <Outline entries={outline} hasMain={main !== null} onJump={(file, line) => void jumpTo(file, line)} /> : null}
+              </div>
+              <div className="side-body" id="side-panel-search" role="tabpanel" aria-labelledby="side-tab-search" hidden={sideTab !== "search"}>
+                {sideTab === "search" ? (
+                  <ProjectSearch
+                    getTexts={currentTexts}
+                    readOnly={readOnly}
+                    version={indexVersion}
+                    onOpen={(file, from, to) => void openAt(file, from, to)}
+                    onReplaceAll={(query, options, replacement, targets) => void replaceInProject(query, options, replacement, targets)}
+                  />
+                ) : null}
+              </div>
+              <div className="side-body" id="side-panel-notes" role="tabpanel" aria-labelledby="side-tab-notes" hidden={sideTab !== "notes"}>
+                {sideTab === "notes" ? (
+                  <Notes
+                    notes={notes}
+                    readOnly={readOnly}
+                    onJump={(note) => void jumpToNote(note)}
+                    onState={(note, state) => void persistNotes(pullNotes().map((item) => (item.id === note.id ? { ...item, state } : item)))}
+                    onDelete={(note) => void persistNotes(pullNotes().filter((item) => item.id !== note.id))}
+                  />
+                ) : null}
+              </div>
+              <div className="side-body" id="side-panel-files" role="tabpanel" aria-labelledby="side-tab-files" hidden={sideTab !== "files"}>
             <Sidebar
               projectName={project.name}
               version={treeVersion}
@@ -1148,8 +1946,17 @@ export function Writer({ project, onSwitch }: Props) {
                 onHome: () => void leave(null),
                 onImport: (sources, dir) => void importDropped(sources, dir),
                 onError: setNotice,
+                onDuplicate: (entry) => void copyInto(entry.path, parentOf(entry.path)),
+                onCopy: (entry) => {
+                  setCopied(entry.path);
+                  setInfo(`Copied ${entry.name}. Right-click a folder and choose Paste.`);
+                },
+                onPaste: (dir) => copied !== null && void copyInto(copied, dir),
               }}
+              canPaste={copied !== null}
             />
+              </div>
+            </div>
             <div
               className="splitter sidebar-splitter"
               role="separator"
@@ -1183,8 +1990,27 @@ export function Writer({ project, onSwitch }: Props) {
         <div
           className="panes"
           ref={panes}
-          style={{ gridTemplateColumns: `minmax(0, ${split}fr) 6px minmax(0, ${1 - split}fr)` }}
+          style={{ gridTemplateColumns: hidePdf ? "minmax(0, 1fr)" : `minmax(0, ${split}fr) 6px minmax(0, ${1 - split}fr)` }}
         >
+          <div className="editor-column">
+          {focusMode ? null : (
+            <EditorTabs
+              paths={tabPaths}
+              current={current}
+              main={main}
+              dirty={dirtySet}
+              onSelect={(path) => void openFile(path)}
+              onClose={(path) => void closeTab(path)}
+              onMove={(path, index) => applyFiles({ type: "reordered", path, index })}
+              onCloseOthers={(keep) => {
+                void (async () => {
+                  for (const path of [...filesRef.current.files.keys()]) if (!sameRel(path, keep)) await closeTab(path);
+                })();
+              }}
+              onCopyPath={(path) => void navigator.clipboard?.writeText(absolutePath(project.root, path))}
+              onReveal={() => showSide("files")}
+            />
+          )}
           <Editor
             handle={editor}
             value={currentFile?.text ?? ""}
@@ -1195,7 +2021,13 @@ export function Writer({ project, onSwitch }: Props) {
               applyFiles({ type: "edited", path, text: next });
               afterEdit();
             }}
+            aids={editorAids}
+            onSelectionText={(text) => setSelectionWords(text ? countWords(text) : 0)}
           />
+          {compare ? <CompareView {...compare} onClose={() => setCompare(null)} /> : null}
+          </div>
+          {hidePdf ? null : (
+          <>
           <div
             className="splitter"
             role="separator"
@@ -1225,7 +2057,7 @@ export function Writer({ project, onSwitch }: Props) {
               event.preventDefault();
             }}
           />
-          <section className="preview" aria-label="PDF preview">
+          <section className="preview" aria-label="PDF preview" tabIndex={-1}>
             {state.status === "error" ? (
               <div className="preview-banner">
                 <span>{state.origin === "live" ? `Preview failed: ${state.summary}` : "Compile failed. Open log."}</span>
@@ -1250,8 +2082,10 @@ export function Writer({ project, onSwitch }: Props) {
               onDoubleClickPoint={(page, x, y) => void showInSource(page, x, y)}
             />
           </section>
+          </>
+          )}
         </div>
-        {gitOpen ? (
+        {gitOpen && !focusMode ? (
           <GitPanel
             state={git}
             projectName={project.name}
@@ -1267,7 +2101,17 @@ export function Writer({ project, onSwitch }: Props) {
         ) : null}
       </div>
 
-      {logsOpen ? (
+      {paletteOpen ? (
+        <CommandPalette
+          actions={commands}
+          onClose={() => {
+            setPaletteOpen(false);
+            editor.current?.focus();
+          }}
+        />
+      ) : null}
+
+      {logsOpen && !focusMode ? (
         <section className="log-drawer" aria-label="Compile log">
           <div className="log-header">
             <div className="log-tabs" role="tablist">
@@ -1289,6 +2133,54 @@ export function Writer({ project, onSwitch }: Props) {
           </div>
           {drawerTab === "log" ? <pre>{state.log || "No log yet"}</pre> : <Problems problems={problems} onJump={(file, line) => void jumpTo(file, line)} />}
         </section>
+      ) : null}
+
+      {citation === "cite" ? (
+        <CitationDialog
+          entries={projectIndex.current.bibEntries}
+          hasBib={bibFiles().length > 0}
+          onInsert={(keys) => {
+            setCitation(null);
+            edit((text, selection) => insertCitation(text, selection.from, keys));
+          }}
+          onAddByDoi={() => setCitation("doi")}
+          onCreateBib={() => {
+            setCitation(null);
+            createBibliography().then(
+              () => setInfo("Created references.bib. Add entries there or by DOI."),
+              (error) => setNotice(`Could not create references.bib. ${errorText(error)}`),
+            );
+          }}
+          onClose={() => setCitation(null)}
+        />
+      ) : null}
+      {citation === "doi" ? (
+        <DoiDialog
+          bibFiles={bibFiles()}
+          existingKeys={projectIndex.current.bibEntries.map((entry) => entry.key)}
+          lookup={fetchDoi}
+          onAdd={(entry, key, file) => void addBibEntry(entry, key, file)}
+          onClose={() => setCitation(null)}
+        />
+      ) : null}
+
+      {settingsOpen ? (
+        <SettingsDialog settings={appSettings} update={updateAppSettings} version={appVersion} onClose={() => setSettingsOpen(false)} />
+      ) : null}
+
+      {newProjectOpen ? (
+        <NewProjectDialog onCreate={(name, template) => void createFromTemplate(name, template.text)} onClose={() => setNewProjectOpen(false)} />
+      ) : null}
+
+      {history ? (
+        <HistoryDialog
+          file={history.file}
+          versions={history.versions}
+          readOnly={readOnly}
+          onRestore={history.kind === "snapshots" ? (version) => void restoreSnapshot(history.file, Number(version.key)) : undefined}
+          onCompare={(version) => void compareWith(history.file, history.kind, version)}
+          onClose={() => setHistory(null)}
+        />
       ) : null}
 
       {mainChooser ? (
@@ -1321,6 +2213,8 @@ export function Writer({ project, onSwitch }: Props) {
 
 
 /** "Which file is the main document?" (contracts/ui.md). */
+type Version = { key: string; label: string; detail: string };
+
 function MainChooser({ candidates, onChoose, onCancel }: { candidates: string[]; onChoose: (path: string) => void; onCancel: () => void }) {
   const [picked, setPicked] = useState(candidates[0]);
   return (
@@ -1329,11 +2223,11 @@ function MainChooser({ candidates, onChoose, onCancel }: { candidates: string[];
       onClose={onCancel}
       actions={
         <>
-          <button type="button" onClick={onCancel}>
-            Cancel
-          </button>
           <button type="button" className="primary" onClick={() => onChoose(picked)}>
             Use this
+          </button>
+          <button type="button" onClick={onCancel}>
+            Cancel
           </button>
         </>
       }
@@ -1347,6 +2241,56 @@ function MainChooser({ candidates, onChoose, onCancel }: { candidates: string[];
           </label>
         ))}
       </fieldset>
+    </Dialog>
+  );
+}
+
+/** Earlier versions of one file (Lexy's snapshots, or Git commits for Compare), spec 007 US4/US5. */
+function HistoryDialog({
+  file,
+  versions,
+  readOnly,
+  onRestore,
+  onCompare,
+  onClose,
+}: {
+  file: string;
+  versions: Version[];
+  readOnly: boolean;
+  onRestore?: (version: Version) => void;
+  onCompare: (version: Version) => void;
+  onClose: () => void;
+}) {
+  return (
+    <Dialog
+      title={`Earlier versions of ${baseName(file)}`}
+      onClose={onClose}
+      actions={
+        <button type="button" onClick={onClose}>
+          Close
+        </button>
+      }
+    >
+      {versions.length ? (
+        <ul className="history-list">
+          {versions.map((version) => (
+            <li key={version.key}>
+              <span>{version.label}</span>
+              <span className="history-size">{version.detail}</span>
+              <button type="button" onClick={() => onCompare(version)}>
+                Compare
+              </button>
+              {onRestore ? (
+                <button type="button" disabled={readOnly} onClick={() => onRestore(version)}>
+                  Restore
+                </button>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p>No earlier versions yet. Lexy keeps one when you save, at most every 10 minutes, for 30 days.</p>
+      )}
     </Dialog>
   );
 }

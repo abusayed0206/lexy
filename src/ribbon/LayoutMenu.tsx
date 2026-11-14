@@ -97,11 +97,11 @@ export function MarginsDialog({
       onClose={onCancel}
       actions={
         <>
-          <button type="button" onClick={onCancel}>
-            Cancel
-          </button>
           <button type="button" className="primary" disabled={invalid.length > 0} onClick={() => onApply(parsed)}>
             Apply
+          </button>
+          <button type="button" onClick={onCancel}>
+            Cancel
           </button>
         </>
       }

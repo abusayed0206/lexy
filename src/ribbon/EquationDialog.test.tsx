@@ -116,7 +116,8 @@ describe("EquationDialog", () => {
 
   it("keeps focus inside the dialog", async () => {
     const { user } = setup({ initialTex: "x" });
-    act(() => screen.getByRole("button", { name: "Insert" }).focus());
+    // Cancel is the last button (Windows order: primary first, Cancel last); Tab wraps to the start.
+    act(() => screen.getByRole("button", { name: "Cancel" }).focus());
     await user.tab();
     expect(screen.getByRole("button", { name: "Fraction" })).toHaveFocus();
   });

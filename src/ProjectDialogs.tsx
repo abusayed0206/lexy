@@ -3,7 +3,17 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { Dialog } from "./ribbon/Dialog";
 import { countEntries, INVALID_NAME_MESSAGE, validName } from "./projects";
 
-export type Choice<T extends string> = { label: string; value: T; primary?: boolean };
+/** `destructive`: the primary action can't be undone (permanent delete), so focus starts on the safe choice. */
+export type Choice<T extends string> = { label: string; value: T; primary?: boolean; destructive?: boolean };
+
+/**
+ * Windows dialog order (DESIGN.md "Windows design alignment"): the primary action first (left),
+ * then the others, the safe "close" choice last (right). Callers list Cancel first, so the
+ * non-primary choices are reversed.
+ */
+export function windowsOrder<T extends string>(choices: Choice<T>[]): Choice<T>[] {
+  return [...choices.filter((choice) => choice.primary), ...choices.filter((choice) => !choice.primary).reverse()];
+}
 type Pending = { title: string; body: ReactNode; choices: Choice<string>[]; resolve: (value: string | null) => void };
 
 /**
@@ -27,17 +37,22 @@ export function useChoice() {
     <Dialog
       title={pending.title}
       onClose={() => finish(null)}
-      actions={pending.choices.map((choice) => (
-        <button
-          key={choice.value}
-          type="button"
-          className={choice.primary ? "primary" : undefined}
-          data-autofocus={choice.primary ? "" : undefined}
-          onClick={() => finish(choice.value)}
-        >
-          {choice.label}
-        </button>
-      ))}
+      actions={windowsOrder(pending.choices).map((choice, index, ordered) => {
+        // Focus the primary choice, unless it is destructive: then the safe last one.
+        const destructive = ordered.some((item) => item.primary && item.destructive);
+        const focus = destructive ? index === ordered.length - 1 : !!choice.primary;
+        return (
+          <button
+            key={choice.value}
+            type="button"
+            className={choice.primary ? "primary" : undefined}
+            data-autofocus={focus ? "" : undefined}
+            onClick={() => finish(choice.value)}
+          >
+            {choice.label}
+          </button>
+        );
+      })}
     >
       {pending.body}
     </Dialog>
@@ -47,7 +62,13 @@ export function useChoice() {
 
 /** Returns an error message, or null when the value is fine. */
 export type Validate = (value: string) => string | null;
-type NamePending = { title: string; label: string; initial: string; validate?: Validate; resolve: (value: string | null) => void };
+type NamePending = { title: string; label: string; initial: string; validate?: Validate; action: string; resolve: (value: string | null) => void };
+
+/** A specific verb for the prompt's button (never "OK" for a question): New… → Create, Save… → Save, … */
+export function promptAction(title: string): string {
+  const first = title.split(" ")[0];
+  return ({ New: title === "New note" ? "Add note" : "Create", Save: "Save", Publish: "Publish", Connect: "Connect", Rename: "Rename" } as Record<string, string>)[first] ?? "Save";
+}
 
 /** Promise-based single-name prompt with Windows name validation. */
 export function useNamePrompt() {
@@ -57,11 +78,11 @@ export function useNamePrompt() {
   const input = useRef<HTMLInputElement>(null);
 
   const prompt = useCallback(
-    (title: string, label: string, initial: string, validate?: Validate) =>
+    (title: string, label: string, initial: string, validate?: Validate, action = promptAction(title)) =>
       new Promise<string | null>((resolve) => {
         setValue(initial);
         setError(null);
-        setPending({ title, label, initial, validate, resolve });
+        setPending({ title, label, initial, validate, action, resolve });
       }),
     [],
   );
@@ -90,11 +111,11 @@ export function useNamePrompt() {
       onClose={() => finish(null)}
       actions={
         <>
+          <button type="button" className="primary" onClick={submit}>
+            {pending.action}
+          </button>
           <button type="button" onClick={() => finish(null)}>
             Cancel
-          </button>
-          <button type="button" className="primary" onClick={submit}>
-            OK
           </button>
         </>
       }

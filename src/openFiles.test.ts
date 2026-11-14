@@ -87,4 +87,35 @@ describe("openFilesReducer", () => {
     expect(closed.current).toBe("main.tex");
     expect(closed.files.size).toBe(1);
   });
+
+  describe("tabs (spec 007 US2)", () => {
+    const three = () =>
+      run(
+        { type: "mainSet", path: "main.tex" },
+        { type: "opened", path: "main.tex", text: "M" },
+        { type: "opened", path: "a.tex", text: "A" },
+        { type: "opened", path: "b.tex", text: "B" },
+      );
+
+    it("closing the shown tab shows its right neighbour, else its left one", () => {
+      const shownA = openFilesReducer(three(), { type: "switched", path: "a.tex" });
+      expect(openFilesReducer(shownA, { type: "closed", path: "a.tex" }).current).toBe("b.tex");
+      expect(openFilesReducer(three(), { type: "closed", path: "b.tex" }).current).toBe("a.tex");
+      expect(openFilesReducer(three(), { type: "closed", path: "a.tex" }).current).toBe("b.tex");
+    });
+
+    it("reordered moves a tab and keeps the rest in order", () => {
+      const moved = openFilesReducer(three(), { type: "reordered", path: "b.tex", index: 0 });
+      expect([...moved.files.keys()]).toEqual(["b.tex", "main.tex", "a.tex"]);
+      expect(moved.current).toBe("b.tex");
+      expect([...openFilesReducer(three(), { type: "reordered", path: "main.tex", index: 99 }).files.keys()]).toEqual(["a.tex", "b.tex", "main.tex"]);
+    });
+
+    it("background opening loads a file without showing it", () => {
+      const state = openFilesReducer(three(), { type: "opened", path: "c.tex", text: "C", background: true });
+      expect(state.current).toBe("b.tex");
+      expect(state.files.get("c.tex")?.text).toBe("C");
+      expect(openFilesReducer(state, { type: "opened", path: "a.tex", text: "x", background: true }).current).toBe("b.tex");
+    });
+  });
 });

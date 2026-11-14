@@ -1,19 +1,24 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { exportPdf, installBanglaFont, loadPdf, syncToPdf, syncToSource, type CompileResult } from "./compile";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { gitLog, gitShowFile, gitStatus } from "./git";
+import { converterStatus, exportDocument, exportPdf, installBanglaFont, installConverter, loadPdf, syncToPdf, syncToSource, type CompileResult } from "./compile";
 import type { EditorHandle } from "./Editor";
 import { BLOCK_START, XELATEX_MARKER } from "./latex/settings";
 import { chooseProjectFolder } from "./ProjectDialogs";
 import {
   compileProject,
+  copyEntry,
   createFile,
   deleteEntry,
   importFiles,
   listDir,
   listProjects,
+  listSnapshots,
   openEntryExternal,
+  projectTexts,
   readFile,
+  readSnapshot,
   renameEntry,
   setMainDocument,
   writeFile,
@@ -21,10 +26,13 @@ import {
   type OpenedProject,
 } from "./projects";
 import { STARTER_DOCUMENT } from "./starter";
+import { countWords } from "./latex/wordCount";
+import { fetchDoi, grammarCheck } from "./writingAids";
+import { DEFAULT_SETTINGS, useSettings } from "./settings";
 import { clampSidebar, clampSplit, compileReducer, MAX_SPLIT, MIN_SPLIT, statusDetail, statusLabel, Writer } from "./Writer";
 
 // A textarea that implements the same EditorHandle; CodeMirror itself is covered in Editor.test.tsx.
-const spies = vi.hoisted(() => ({ jumpToLine: vi.fn(), setProblems: vi.fn(), showSpot: vi.fn() }));
+const spies = vi.hoisted(() => ({ jumpToLine: vi.fn(), setProblems: vi.fn(), showSpot: vi.fn(), tidy: vi.fn(), setGrammar: vi.fn(), selectRange: vi.fn(), setNotes: vi.fn() }));
 vi.mock("./Editor", async () => {
   const React = await import("react");
   return {
@@ -52,6 +60,14 @@ vi.mock("./Editor", async () => {
         jumpToLine: (line: number) => spies.jumpToLine(current.current, line),
         cursorLine: () => 7,
         setProblems: (path: string, problems: unknown[]) => spies.setProblems(path, problems),
+        tidy: () => spies.tidy(),
+        selectionText: () => area.current!.value.slice(area.current!.selectionStart, area.current!.selectionEnd),
+        setGrammar: (marks) => spies.setGrammar(marks),
+        selectRange: (from: number, to: number) => spies.selectRange(current.current, from, to),
+        preload: () => undefined,
+        posAtCoords: () => 0,
+        setNotes: (marks: unknown[]) => spies.setNotes(current.current, marks),
+        notePositions: () => [],
       }));
       return <textarea ref={area} className="editor" aria-label={label} value={value} onChange={(event) => onChange(event.target.value)} />;
     },
@@ -80,11 +96,20 @@ vi.mock("./PdfView", async () => {
     },
   };
 });
-vi.mock("./compile", () => ({ loadPdf: vi.fn(), exportPdf: vi.fn(), syncToSource: vi.fn(), syncToPdf: vi.fn(), installBanglaFont: vi.fn() }));
+vi.mock("./settings", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./settings")>();
+  return { ...real, useSettings: vi.fn(() => ({ settings: real.DEFAULT_SETTINGS, update: vi.fn(async () => undefined) })) };
+});
+vi.mock("./writingAids", () => ({ spellCheck: vi.fn(async () => []), spellSuggest: vi.fn(async () => []), dictionaryAdd: vi.fn(async () => undefined), grammarCheck: vi.fn(), fetchDoi: vi.fn() }));
+vi.mock("./compile", () => ({ loadPdf: vi.fn(), exportPdf: vi.fn(), syncToSource: vi.fn(), syncToPdf: vi.fn(), installBanglaFont: vi.fn(), exportPdfWithNotes: vi.fn(), converterStatus: vi.fn(), installConverter: vi.fn(), exportDocument: vi.fn() }));
 vi.mock("./projects", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./projects")>()),
   compileProject: vi.fn(),
   readFile: vi.fn(),
+  copyEntry: vi.fn(),
+  listSnapshots: vi.fn(),
+  readSnapshot: vi.fn(),
+  projectTexts: vi.fn(() => Promise.resolve({ files: [], truncated: false })),
   writeFile: vi.fn(),
   listDir: vi.fn(),
   listProjects: vi.fn(),
@@ -108,12 +133,14 @@ vi.mock("./latex/fonts", async (importOriginal) => ({
   installKritiFont: vi.fn(() => Promise.resolve({ family: "Kalpurush", regular: "Kalpurush.ttf", bold: null, italic: null, boldItalic: null })),
 }));
 type DropHandler = (event: { payload: { type: string; paths?: string[]; position?: { x: number; y: number } } }) => void;
-let dropHandler: DropHandler | null = null;
+const dropHandlers = new Set<DropHandler>();
+/** Every registered drag-drop listener (the sidebar's and the editor's) gets the event, like in Tauri. */
+const dropHandler = (event: Parameters<DropHandler>[0]) => dropHandlers.forEach((handler) => handler(event));
 vi.mock("@tauri-apps/api/webview", () => ({
   getCurrentWebview: () => ({
     onDragDropEvent: (handler: DropHandler) => {
-      dropHandler = handler;
-      return Promise.resolve(() => (dropHandler = null));
+      dropHandlers.add(handler);
+      return Promise.resolve(() => void dropHandlers.delete(handler));
     },
   }),
 }));
@@ -121,6 +148,8 @@ vi.mock("@tauri-apps/api/webview", () => ({
 const events = new Map<string, (event: { payload: unknown }) => void>();
 vi.mock("./git", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./git")>()),
+  gitLog: vi.fn(async () => []),
+  gitShowFile: vi.fn(async () => ""),
   gitStatus: vi.fn(() =>
     Promise.resolve({
       installed: true,
@@ -468,13 +497,13 @@ describe("Writer", () => {
     it("copies dropped files in, asking once about conflicts", async () => {
       const { user } = await renderWriter();
       await screen.findByRole("treeitem", { name: MAIN });
-      await waitFor(() => expect(dropHandler).not.toBeNull());
+      await waitFor(() => expect(dropHandlers.size).toBeGreaterThan(0));
       vi.mocked(importFiles)
         .mockResolvedValueOnce({ copied: ["chapters\\b.png"], skipped: [], conflicts: ["C:\\a.png", "C:\\c.png"] })
         .mockResolvedValueOnce({ copied: ["chapters\\a (2).png", "chapters\\c (2).png"], skipped: [], conflicts: [] });
       const original = document.elementFromPoint;
       document.elementFromPoint = () => row("chapters");
-      act(() => dropHandler!({ payload: { type: "drop", paths: ["C:\\a.png", "C:\\b.png", "C:\\c.png"], position: { x: 1, y: 1 } } }));
+      act(() => dropHandler({ payload: { type: "drop", paths: ["C:\\a.png", "C:\\b.png", "C:\\c.png"], position: { x: 1, y: 1 } } }));
       document.elementFromPoint = original;
       expect(importFiles).toHaveBeenCalledWith(["C:\\a.png", "C:\\b.png", "C:\\c.png"], "chapters", "ask");
       const dialog = await screen.findByRole("dialog", { name: "Files already exist" });
@@ -713,6 +742,36 @@ describe("Writer", () => {
       await user.click(screen.getByRole("button", { name: "Insert" }));
       expect(editor().value).toContain("\\begin{equation}\n  E=mc^2\n\\end{equation}\n\\end{document}");
     });
+
+    it("shows the project word count next to the status", async () => {
+      await renderWriter();
+      const expected = countWords(STARTER_DOCUMENT);
+      await waitFor(() => expect(document.querySelector(".word-count")).toHaveTextContent(`${expected} words`));
+      type(" two more");
+      await waitFor(() => expect(document.querySelector(".word-count")).toHaveTextContent(`${expected + 2} words`));
+    });
+
+    it("Tidy and Shift+Alt+F re-indent through the editor", async () => {
+      const { user } = await renderWriter();
+      await user.click(screen.getByRole("button", { name: "Tidy" }));
+      fireEvent.keyDown(editor(), { key: "F", altKey: true, shiftKey: true });
+      expect(spies.tidy).toHaveBeenCalledTimes(2);
+    });
+
+    it("Check grammar asks before sending text, then marks the issues", async () => {
+      vi.mocked(grammarCheck).mockResolvedValue([{ offset: 2, length: 3, message: "Possible typo", replacements: ["fix"], rule: "R" }]);
+      const { user } = await renderWriter();
+      fireEvent.keyDown(editor(), { key: "F7" });
+      const dialog = await screen.findByRole("dialog", { name: "Check grammar online?" });
+      expect(dialog).toHaveTextContent("https://api.languagetool.org");
+      await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      expect(grammarCheck).not.toHaveBeenCalled();
+      await user.click(tab("Review"));
+      await user.click(screen.getByRole("button", { name: "Check grammar" }));
+      await user.click(await screen.findByRole("button", { name: "Turn on" }));
+      await waitFor(() => expect(spies.setGrammar).toHaveBeenCalledWith([{ from: 2, to: 5, message: "Possible typo", replacements: ["fix"] }]));
+      expect(grammarCheck).toHaveBeenCalledWith("https://api.languagetool.org", "en-US", expect.any(Array));
+    });
   });
 
   describe("shortcuts and layout", () => {
@@ -761,6 +820,357 @@ describe("Writer", () => {
       expect(within(drawer()!).getByText("No compile yet")).toBeInTheDocument();
       await user.click(screen.getByRole("button", { name: "Hide logs" }));
       expect(drawer()).not.toBeInTheDocument();
+    });
+  });
+
+  describe("navigation (spec 007 US2)", () => {
+    const tabStrip = () => screen.getByRole("tablist", { name: "Open files" });
+
+    it("shows open files as tabs; Ctrl+Tab cycles and Ctrl+W asks before closing unsaved work", async () => {
+      const { user } = await renderWriter();
+      await openIntro(user);
+      expect(within(tabStrip()).getAllByRole("tab").map((t) => t.textContent)).toEqual(["thesis.tex", "intro.tex"]);
+      fireEvent.keyDown(editor(), { key: "Tab", ctrlKey: true });
+      await waitFor(() => expect(editor()).toHaveValue(STARTER_DOCUMENT));
+      fireEvent.keyDown(editor(), { key: "w", ctrlKey: true });
+      expect(within(tabStrip()).getAllByRole("tab")).toHaveLength(2); // the main document stays open
+      await user.click(within(tabStrip()).getByRole("tab", { name: /intro\.tex/ }));
+      await waitFor(() => expect(editor()).toHaveValue("Intro text."));
+      type(" More.");
+      fireEvent.keyDown(editor(), { key: "w", ctrlKey: true });
+      const dialog = await screen.findByRole("dialog", { name: "Save changes?" });
+      await user.click(within(dialog).getByRole("button", { name: "Don't save" }));
+      await waitFor(() => expect(within(tabStrip()).getAllByRole("tab").map((t) => t.textContent)).toEqual(["thesis.tex"]));
+      expect(editor()).toHaveValue(STARTER_DOCUMENT);
+      expect(writeFile).not.toHaveBeenCalled();
+    });
+
+    it("Replace all in the project edits files as unsaved changes, never writing to disk", async () => {
+      vi.mocked(projectTexts).mockResolvedValue({
+        files: [
+          { path: MAIN, text: STARTER_DOCUMENT, modified: 1 },
+          { path: INTRO, text: disk[INTRO], modified: 1 },
+        ],
+        truncated: false,
+      });
+      const { user } = await renderWriter();
+      fireEvent.keyDown(editor(), { key: "F", ctrlKey: true, shiftKey: true });
+      const find = await screen.findByRole("textbox", { name: "Find in project" });
+      await user.type(find, "Intro text");
+      await user.type(screen.getByRole("textbox", { name: "Replace with" }), "Opening words");
+      await screen.findByText("1 match in 1 file");
+      await user.click(screen.getByRole("button", { name: "Replace all" }));
+      await screen.findByText(/Replaced 1 match in 1 file/);
+      expect(within(tabStrip()).getByRole("tab", { name: /intro\.tex/ })).toContainElement(within(tabStrip()).getByRole("img", { name: "Unsaved changes" }));
+      expect(writeFile).not.toHaveBeenCalled();
+      expect(editor()).toHaveValue(STARTER_DOCUMENT); // the shown file didn't change
+    });
+
+    it("Ctrl+Shift+O shows the outline and clicking a heading jumps to it", async () => {
+      const { user } = await renderWriter();
+      fireEvent.keyDown(editor(), { key: "O", ctrlKey: true, shiftKey: true });
+      expect(screen.getByRole("tab", { name: "Outline" })).toHaveAttribute("aria-selected", "true");
+      await user.click(await screen.findByRole("treeitem", { name: /Introduction/ }));
+      expect(spies.jumpToLine).toHaveBeenCalledWith(MAIN, 11);
+    });
+
+    it("the command palette runs any action", async () => {
+      const { user } = await renderWriter();
+      fireEvent.keyDown(editor(), { key: "P", ctrlKey: true, shiftKey: true });
+      await user.type(await screen.findByRole("combobox", { name: "Type a command" }), "logs{Enter}");
+      await waitFor(() => expect(drawer()).toBeInTheDocument());
+      expect(screen.queryByRole("dialog", { name: "Command palette" })).toBeNull();
+    });
+
+    it("F6 and Shift+F6 move between panes (Windows keyboard rule)", async () => {
+      await renderWriter();
+      act(() => tab("Home").focus());
+      fireEvent.keyDown(tab("Home"), { key: "F6" });
+      expect(screen.getByRole("tab", { name: "Files" })).toHaveFocus();
+      fireEvent.keyDown(document.activeElement!, { key: "F6" });
+      expect(preview()).toHaveFocus(); // the editor pane is CodeMirror in the app (a plain textarea in these tests)
+      fireEvent.keyDown(document.activeElement!, { key: "F6", shiftKey: true });
+      expect(screen.getByRole("tab", { name: "Files" })).toHaveFocus();
+    });
+
+    it("F11 enters and leaves focus mode", async () => {
+      const { user } = await renderWriter();
+      fireEvent.keyDown(editor(), { key: "F11" });
+      expect(screen.queryByRole("tab", { name: "Home" })).toBeNull();
+      expect(screen.queryByRole("tablist", { name: "Side panel" })).toBeNull();
+      expect(editor()).toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: "Leave focus mode (F11)" }));
+      expect(tab("Home")).toBeInTheDocument();
+    });
+  });
+
+  describe("export to Word and HTML (spec 007 US7)", () => {
+    it("asks before downloading Pandoc, then saves and exports", async () => {
+      vi.mocked(converterStatus).mockResolvedValue({ installed: false, version: null, downloadBytes: 42_983_200 });
+      vi.mocked(installConverter).mockResolvedValue(undefined);
+      vi.mocked(exportDocument).mockResolvedValue({ output: "thesis.docx", warnings: ["Skipped tikzpicture"] });
+      const { user } = await renderWriter();
+      type(" More.");
+      await user.click(tab("File"));
+      await user.click(screen.getByRole("button", { name: "Export" }));
+      await user.click(screen.getByRole("menuitem", { name: "Word document (.docx)" }));
+      const consent = await screen.findByRole("dialog", { name: "Download Pandoc?" });
+      expect(consent).toHaveTextContent("43 MB");
+      await user.click(within(consent).getByRole("button", { name: "Download" }));
+      await screen.findByText(/Exported thesis\.docx\. 1 part was approximated\./);
+      expect(installConverter).toHaveBeenCalledOnce();
+      expect(writeFile).toHaveBeenCalledWith(MAIN, `${STARTER_DOCUMENT} More.`); // saved before exporting
+      expect(exportDocument).toHaveBeenCalledWith(MAIN, "docx");
+      await user.click(screen.getByRole("button", { name: "Show details" }));
+      expect(await screen.findByRole("dialog", { name: "Approximated parts" })).toHaveTextContent("Skipped tikzpicture");
+    });
+
+    it("downloads nothing when the user cancels, and skips the question once installed", async () => {
+      vi.mocked(converterStatus).mockResolvedValue({ installed: false, version: null, downloadBytes: 42_983_200 });
+      const { user } = await renderWriter();
+      await user.click(tab("File"));
+      await user.click(screen.getByRole("button", { name: "Export" }));
+      await user.click(screen.getByRole("menuitem", { name: "Web page (.html)" }));
+      await user.click(within(await screen.findByRole("dialog", { name: "Download Pandoc?" })).getByRole("button", { name: "Cancel" }));
+      expect(installConverter).not.toHaveBeenCalled();
+      expect(exportDocument).not.toHaveBeenCalled();
+
+      vi.mocked(converterStatus).mockResolvedValue({ installed: true, version: "3.13", downloadBytes: 42_983_200 });
+      vi.mocked(exportDocument).mockResolvedValue({ output: "thesis.html", warnings: [] });
+      await user.click(screen.getByRole("button", { name: "Export" }));
+      await user.click(screen.getByRole("menuitem", { name: "Web page (.html)" }));
+      await screen.findByText(/Exported thesis\.html\./);
+      expect(screen.queryByRole("dialog", { name: "Download Pandoc?" })).toBeNull();
+      expect(installConverter).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("review (spec 007 US4)", () => {
+    it("Ctrl+Alt+M adds a note on the selection and saves it to .lexy\\notes.json", async () => {
+      const { user } = await renderWriter();
+      const start = STARTER_DOCUMENT.indexOf("Start writing");
+      select(start, start + 13);
+      fireEvent.keyDown(editor(), { key: "m", ctrlKey: true, altKey: true });
+      const dialog = await screen.findByRole("dialog", { name: "New note" });
+      await user.type(within(dialog).getByRole("textbox"), "Make this longer{Enter}");
+      await waitFor(() => expect(writeFile).toHaveBeenCalledWith(".lexy\\notes.json", expect.stringContaining('"body": "Make this longer"')));
+      const saved = JSON.parse(vi.mocked(writeFile).mock.calls.find(([path]) => path === ".lexy\\notes.json")![1]);
+      expect(saved.notes[0]).toMatchObject({ file: MAIN, from: start, to: start + 13, quote: "Start writing", state: "open" });
+      expect(spies.setNotes).toHaveBeenLastCalledWith(MAIN, [{ id: saved.notes[0].id, from: start, to: start + 13 }]);
+      expect(screen.getByRole("tab", { name: "Notes" })).toHaveAttribute("aria-selected", "true");
+      expect(screen.getByText("Make this longer")).toBeInTheDocument();
+    });
+
+    it("loads notes from the project and shows them on their file", async () => {
+      const start = STARTER_DOCUMENT.indexOf("Introduction");
+      disk[".lexy\\notes.json"] = JSON.stringify({
+        version: 1,
+        notes: [{ id: "n1", file: MAIN, from: 0, to: 12, quote: "Introduction", body: "Rename?", created: "2026-11-14T10:00:00Z", state: "open" }],
+      });
+      await renderWriter();
+      // The stored offsets were stale; the quote finds the passage again.
+      await waitFor(() => expect(spies.setNotes).toHaveBeenLastCalledWith(MAIN, [{ id: "n1", from: start, to: start + 12 }]));
+    });
+
+    it("Compare with last version shows the differences to the last commit", async () => {
+      vi.mocked(gitLog).mockResolvedValue([{ id: "abc123", message: "First draft", author: "A", time: 1_700_000_000, files: 1 }]);
+      vi.mocked(gitShowFile).mockResolvedValue(STARTER_DOCUMENT.replace("Start writing here.", "Old words."));
+      const { user } = await renderWriter();
+      await user.click(tab("Review"));
+      await user.click(screen.getByRole("button", { name: "Compare with last version" }));
+      const view = await screen.findByRole("region", { name: `Comparison of ${MAIN}` });
+      expect(gitShowFile).toHaveBeenCalledWith("abc123", MAIN);
+      expect(view).toHaveTextContent("“First draft”");
+      const removed = [...view.querySelectorAll(".compare-body del")].map((del) => del.textContent).join("|");
+      expect(removed).toContain("Old");
+      expect(removed).toContain("words");
+      expect([...view.querySelectorAll(".compare-body ins")].map((ins) => ins.textContent).join("|")).toContain("Start");
+      await user.click(within(view).getByRole("button", { name: "Close comparison" }));
+      expect(screen.queryByRole("region", { name: `Comparison of ${MAIN}` })).toBeNull();
+    });
+  });
+
+  describe("content (spec 007 US3)", () => {
+    const BIB = "@book{knuth84, author={Donald Knuth}, title={The TeXbook}, year=1984}\n";
+
+    function withBib() {
+      disk["refs.bib"] = BIB;
+      vi.mocked(projectTexts).mockResolvedValue({
+        files: [
+          { path: MAIN, text: STARTER_DOCUMENT, modified: 1 },
+          { path: "refs.bib", text: BIB, modified: 1 },
+        ],
+        truncated: false,
+      });
+    }
+
+    it("Insert → Citation inserts the picked keys at the cursor", async () => {
+      withBib();
+      const { user } = await renderWriter();
+      await new Promise((resolve) => setTimeout(resolve, 900)); // the index picks up refs.bib
+      select(STARTER_DOCUMENT.indexOf("Start writing"));
+      await user.click(tab("Insert"));
+      await user.click(screen.getByRole("button", { name: "Citation" }));
+      const dialog = await screen.findByRole("dialog", { name: "Insert citation" });
+      await user.click(within(dialog).getByRole("checkbox"));
+      await user.click(within(dialog).getByRole("button", { name: "Insert" }));
+      expect(editor().value).toContain("\\cite{knuth84}Start writing");
+    });
+
+    it("Add by DOI cites the entry and appends it to the .bib as an unsaved change", async () => {
+      withBib();
+      vi.mocked(fetchDoi).mockResolvedValue("@article{X_1, title={Black holes}, author={Ann Person}, year={2008}}");
+      const { user } = await renderWriter();
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      select(STARTER_DOCUMENT.indexOf("Start writing"));
+      await user.click(tab("Insert"));
+      await user.click(screen.getByRole("button", { name: "Citation" }));
+      await user.click(await screen.findByRole("button", { name: "Add by DOI…" }));
+      await user.type(await screen.findByRole("textbox", { name: "DOI" }), "10.1/x");
+      await user.click(screen.getByRole("button", { name: "Look up" }));
+      await user.click(await screen.findByRole("button", { name: "Add and cite" }));
+      await waitFor(() => expect(editor().value).toContain("\\cite{person2008black}Start writing"));
+      await waitFor(() => expect(within(screen.getByRole("tablist", { name: "Open files" })).getByRole("tab", { name: /refs\.bib/ })).toBeInTheDocument());
+      expect(writeFile).not.toHaveBeenCalled();
+    });
+
+    it("an image dropped on the editor is copied in and gets a figure; graphicx is added once", async () => {
+      vi.mocked(importFiles).mockResolvedValue({ copied: ["figures\\plot.png"], skipped: [], conflicts: [] });
+      await renderWriter();
+      await waitFor(() => expect(dropHandlers.size).toBeGreaterThan(1));
+      const original = document.elementFromPoint;
+      document.elementFromPoint = () => editor();
+      act(() => dropHandler({ payload: { type: "drop", paths: ["C:\\pics\\plot.png"], position: { x: 1, y: 1 } } }));
+      document.elementFromPoint = original;
+      await waitFor(() => expect(editor().value).toContain("\\includegraphics[width=0.8\\linewidth]{figures/plot.png}"));
+      expect(importFiles).toHaveBeenCalledWith(["C:\\pics\\plot.png"], "figures", "keepBoth");
+      await waitFor(() => expect(editor().value).toContain("\\documentclass{article}\n\\usepackage{graphicx}\n"));
+      expect(editor().value.match(/\\usepackage\{graphicx\}/g)).toHaveLength(1);
+    });
+  });
+
+  describe("files and safety (spec 007 US5)", () => {
+    function withSettings(change: Partial<typeof DEFAULT_SETTINGS>) {
+      vi.mocked(useSettings).mockImplementation(() => ({ settings: { ...DEFAULT_SETTINGS, ...change }, update: vi.fn(async () => undefined) }));
+    }
+    afterEach(() => vi.mocked(useSettings).mockImplementation(() => ({ settings: DEFAULT_SETTINGS, update: vi.fn(async () => undefined) })));
+
+    it("auto-save writes modified files once typing pauses", async () => {
+      withSettings({ autoSave: true, autoSaveDelayMs: 1000 });
+      await renderWriter();
+      type(" Saved by itself.");
+      expect(writeFile).not.toHaveBeenCalled();
+      await waitFor(() => expect(writeFile).toHaveBeenCalledWith(MAIN, `${STARTER_DOCUMENT} Saved by itself.`), { timeout: 3000 });
+      await waitFor(() => expect(unsavedInTitle()).toBeNull());
+    });
+
+    it("Ctrl+, opens Settings and changes apply through the settings store (spec 007 US6)", async () => {
+      const update = vi.fn(async () => undefined);
+      vi.mocked(useSettings).mockImplementation(() => ({ settings: DEFAULT_SETTINGS, update }));
+      const { user } = await renderWriter();
+      fireEvent.keyDown(editor(), { key: ",", ctrlKey: true });
+      const page = await screen.findByRole("dialog", { name: "Settings" });
+      await user.click(within(page).getByRole("switch", { name: /Auto-save/ }));
+      expect(update).toHaveBeenCalledWith({ autoSave: true });
+      await user.click(within(page).getByRole("button", { name: "Back" }));
+      expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull();
+    });
+
+    it("the live preview waits the configured delay", async () => {
+      withSettings({ livePreviewDelayMs: 300 });
+      localStorage.setItem("lexy.livePreview", "1");
+      await renderWriter();
+      await waitFor(() => expect(compileProject).toHaveBeenCalled()); // the first compile on open
+      vi.mocked(compileProject).mockClear();
+      type(" x");
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      expect(compileProject).toHaveBeenCalled(); // well before the 1 s default
+    });
+
+    it("data safety (SC-008): auto-save, Replace all, a note and a restore in one session lose no text", async () => {
+      withSettings({ autoSave: true, autoSaveDelayMs: 1000 });
+      const withGit = vi.mocked(gitStatus).getMockImplementation()!;
+      vi.mocked(gitStatus).mockImplementation(async () => ({ ...(await withGit()), repo: "none" }));
+      onTestFinished(() => void vi.mocked(gitStatus).mockImplementation(withGit));
+      vi.mocked(projectTexts).mockResolvedValue({ files: [{ path: MAIN, text: STARTER_DOCUMENT, modified: 1 }], truncated: false });
+      const original = STARTER_DOCUMENT;
+      vi.mocked(listSnapshots).mockResolvedValue([{ time: 1, size: original.length }]);
+      vi.mocked(readSnapshot).mockResolvedValue(original);
+      const mainWrites = () => vi.mocked(writeFile).mock.calls.filter(([path]) => path === MAIN).map(([, text]) => text);
+      const { user } = await renderWriter();
+
+      // 1. Typing is auto-saved.
+      type(" Added sentence.");
+      const typed = `${original} Added sentence.`;
+      await waitFor(() => expect(mainWrites()).toContain(typed), { timeout: 3000 });
+
+      // 2. Replace all edits the buffer; auto-save then stores exactly that text.
+      fireEvent.keyDown(editor(), { key: "F", ctrlKey: true, shiftKey: true });
+      await user.type(await screen.findByRole("textbox", { name: "Find in project" }), "Introduction");
+      await user.type(screen.getByRole("textbox", { name: "Replace with" }), "Overview");
+      await screen.findByText("1 match in 1 file");
+      await user.click(screen.getByRole("button", { name: "Replace all" }));
+      const replaced = typed.replace("Introduction", "Overview");
+      await waitFor(() => expect(mainWrites()).toContain(replaced), { timeout: 3000 });
+
+      // 3. A note is stored beside the text, never inside it.
+      const at = replaced.indexOf("Overview");
+      select(at, at + 8);
+      fireEvent.keyDown(editor(), { key: "m", ctrlKey: true, altKey: true });
+      await user.type(within(await screen.findByRole("dialog", { name: "New note" })).getByRole("textbox"), "Better title?{Enter}");
+      await waitFor(() => expect(disk[".lexy\\notes.json"]).toContain("Better title?"));
+
+      // 4. Restoring an earlier version is an ordinary edit, auto-saved like the rest.
+      await user.click(tab("File"));
+      await user.click(screen.getByRole("button", { name: "Earlier versions" }));
+      await user.click(within(await screen.findByRole("dialog", { name: /Earlier versions/ })).getByRole("button", { name: "Restore" }));
+      await waitFor(() => expect(disk[MAIN]).toBe(original), { timeout: 3000 });
+
+      // Every write of the document was one of the texts the user saw; none was empty or mixed.
+      expect(new Set(mainWrites())).toEqual(new Set([typed, replaced, original]));
+      expect(mainWrites().every((text) => !text.includes("Better title?"))).toBe(true);
+    });
+
+    it("auto-save is off by default", async () => {
+      await renderWriter();
+      type(" x");
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      expect(writeFile).not.toHaveBeenCalled();
+    });
+
+    it("auto-save never runs in a read-only window", async () => {
+      withSettings({ autoSave: true, autoSaveDelayMs: 1000 });
+      await renderWriter({ ...PROJECT, readOnly: true });
+      type(" x");
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      expect(writeFile).not.toHaveBeenCalled();
+    });
+
+    it("Duplicate copies a file beside the original", async () => {
+      vi.mocked(copyEntry).mockResolvedValue("thesis (copy).tex");
+      const { user } = await renderWriter();
+      await user.pointer({ keys: "[MouseRight]", target: row(MAIN) });
+      await user.click(screen.getByRole("menuitem", { name: "Duplicate" }));
+      expect(copyEntry).toHaveBeenCalledWith(MAIN, "");
+      expect(await screen.findByText("Created thesis (copy).tex")).toBeInTheDocument();
+    });
+
+    it("Earlier versions restores a snapshot as an unsaved change", async () => {
+      const withGit = vi.mocked(gitStatus).getMockImplementation()!;
+      vi.mocked(gitStatus).mockImplementation(async () => ({ ...(await withGit()), repo: "none" }));
+      onTestFinished(() => void vi.mocked(gitStatus).mockImplementation(withGit));
+      vi.mocked(listSnapshots).mockResolvedValue([{ time: Date.UTC(2026, 10, 14, 9, 0), size: 2048 }]);
+      vi.mocked(readSnapshot).mockResolvedValue("\\documentclass{article}\nOld text");
+      const { user } = await renderWriter();
+      await user.click(tab("File"));
+      await user.click(screen.getByRole("button", { name: "Earlier versions" }));
+      const dialog = await screen.findByRole("dialog", { name: "Earlier versions of thesis.tex" });
+      expect(within(dialog).getByText("2.0 KB")).toBeInTheDocument();
+      await user.click(within(dialog).getByRole("button", { name: "Restore" }));
+      await waitFor(() => expect(editor()).toHaveValue("\\documentclass{article}\nOld text"));
+      expect(readSnapshot).toHaveBeenCalledWith(MAIN, Date.UTC(2026, 10, 14, 9, 0));
+      expect(unsavedInTitle()).not.toBeNull();
+      expect(writeFile).not.toHaveBeenCalled();
     });
   });
 

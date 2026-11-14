@@ -1,4 +1,4 @@
-import { useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import type { FontChoice } from "./latex/fonts";
 import type { DocumentSettings, FontSize } from "./latex/settings";
 import type { TableSpec } from "./latex/tables";
@@ -10,9 +10,11 @@ import { TablePicker } from "./ribbon/TablePicker";
 import type { GitState } from "./git";
 import type { GitAction } from "./GitPanel";
 
-export const RIBBON_TABS = ["file", "home", "insert", "layout", "view", "git"] as const;
+export const RIBBON_TABS = ["file", "home", "insert", "layout", "review", "view", "git"] as const;
 export type RibbonTab = (typeof RIBBON_TABS)[number];
-const TAB_LABELS: Record<RibbonTab, string> = { file: "File", home: "Home", insert: "Insert", layout: "Layout", view: "View", git: "Git" };
+/** Ribbon access keys (Windows/Word precedents): Alt, then the letter, opens the tab. */
+export const ACCESS_KEYS: Record<RibbonTab, string> = { file: "F", home: "H", insert: "N", layout: "P", review: "R", view: "W", git: "G" };
+const TAB_LABELS: Record<RibbonTab, string> = { file: "File", home: "Home", insert: "Insert", layout: "Layout", review: "Review", view: "View", git: "Git" };
 const TAB_KEY = "lexy.ribbonTab";
 
 export type RibbonActions = {
@@ -45,6 +47,28 @@ export type RibbonActions = {
   onSize: (size: FontSize) => void;
   onLayout: (settings: DocumentSettings) => void;
   onGit: (action: GitAction) => void;
+  /** Re-indent environments (Shift+Alt+F). */
+  onTidy: () => void;
+  /** On-demand grammar check (F7). */
+  onGrammar: () => void;
+  /** Focus mode (F11). */
+  onToggleFocus: () => void;
+  /** Earlier versions of the shown file (snapshots, or Git history). */
+  onHistory: () => void;
+  /** Insert → Citation. */
+  onCitation: () => void;
+  /** Insert → Image (copied into the project's image folder). */
+  onImage: () => void;
+  /** Review (spec 007 US4). */
+  onNewNote: () => void;
+  onShowNotes: () => void;
+  onCompareLast: () => void;
+  onCompareWith: () => void;
+  onExportNotes: () => void;
+  /** File → Settings (Ctrl+,). */
+  onSettings: () => void;
+  /** File → Export: Word document or web page (spec 007 US7). */
+  onExport: (format: "docx" | "html") => void;
 };
 
 export type RibbonState = {
@@ -70,6 +94,8 @@ export type RibbonState = {
   gitOpen: boolean;
   /** "Fit" or "125 %". */
   zoomLabel: string;
+  /** "1,234 words" or "56 of 1,234 words"; null without a main document. */
+  wordCount?: string | null;
 };
 
 function loadTab(): RibbonTab {
@@ -89,10 +115,63 @@ function saveTab(tab: RibbonTab) {
   }
 }
 
-export function Ribbon({ actions, state }: { actions: RibbonActions; state: RibbonState }) {
+export function Ribbon({ actions, state, hidden = false }: { actions: RibbonActions; state: RibbonState; hidden?: boolean }) {
   const [tab, setTab] = useState<RibbonTab>(loadTab);
-  const tabRefs = useRef<Record<RibbonTab, HTMLButtonElement | null>>({ file: null, home: null, insert: null, layout: null, view: null, git: null });
+  const tabRefs = useRef<Record<RibbonTab, HTMLButtonElement | null>>({ file: null, home: null, insert: null, layout: null, review: null, view: null, git: null });
   const baseId = useId();
+  const [keyTips, setKeyTips] = useState(false);
+
+  // Alt pressed and released alone shows key tips; the next letter opens that tab (Esc or any other key hides them).
+  // Alt+letter works directly too, except in text fields, where Alt+letters belong to the field (Find in project).
+  useEffect(() => {
+    if (hidden) return;
+    let altAlone = false;
+    const byLetter = (key: string) => RIBBON_TABS.find((name) => ACCESS_KEYS[name] === key.toUpperCase());
+    const inTextField = (target: EventTarget | null) => !!(target as HTMLElement | null)?.closest?.("input, textarea, select, .cm-editor, .dialog");
+    function onKeyDown(event: globalThis.KeyboardEvent) {
+      if (event.key === "Alt") {
+        altAlone = !event.repeat;
+        return;
+      }
+      altAlone = false;
+      if (keyTipsRef.current) {
+        const target = byLetter(event.key);
+        setKeyTips(false);
+        if (target) {
+          event.preventDefault();
+          select(target, true);
+        }
+        return;
+      }
+      if (event.altKey && !event.ctrlKey && !event.shiftKey && !inTextField(event.target)) {
+        const target = byLetter(event.key);
+        if (target) {
+          event.preventDefault();
+          select(target, true);
+        }
+      }
+    }
+    function onKeyUp(event: globalThis.KeyboardEvent) {
+      if (event.key !== "Alt" || !altAlone) return;
+      altAlone = false;
+      event.preventDefault();
+      setKeyTips((on) => !on);
+    }
+    const hide = () => setKeyTips(false);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("pointerdown", hide);
+    window.addEventListener("blur", hide);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("pointerdown", hide);
+      window.removeEventListener("blur", hide);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hidden]);
+  const keyTipsRef = useRef(keyTips);
+  keyTipsRef.current = keyTips;
 
   function select(next: RibbonTab, focus = false) {
     setTab(next);
@@ -121,7 +200,7 @@ export function Ribbon({ actions, state }: { actions: RibbonActions; state: Ribb
   const tabId = (name: RibbonTab) => `${baseId}-tab-${name}`;
 
   return (
-    <header className="ribbon">
+    <header className="ribbon" hidden={hidden}>
       <div className="ribbon-top">
         <div className="ribbon-tabs" role="tablist" aria-label="Ribbon">
           {RIBBON_TABS.map((name) => (
@@ -136,11 +215,17 @@ export function Ribbon({ actions, state }: { actions: RibbonActions; state: Ribb
               className="ribbon-tab"
               aria-selected={tab === name}
               aria-controls={panelId(name)}
+              aria-keyshortcuts={`Alt+${ACCESS_KEYS[name]}`}
               tabIndex={tab === name ? 0 : -1}
               onClick={() => select(name)}
               onKeyDown={onTabKeyDown}
             >
               {TAB_LABELS[name]}
+              {keyTips ? (
+                <span className="key-tip" aria-hidden="true">
+                  {ACCESS_KEYS[name]}
+                </span>
+              ) : null}
             </button>
           ))}
         </div>
@@ -157,6 +242,11 @@ export function Ribbon({ actions, state }: { actions: RibbonActions; state: Ribb
           ) : null}
         </div>
 
+        {state.wordCount ? (
+          <span className="word-count" aria-live="off" title="Words in the document and its included files (commands and math not counted)">
+            {state.wordCount}
+          </span>
+        ) : null}
         <span
           className={`compile-status ${state.statusClass}`}
           role="status"
@@ -214,6 +304,20 @@ export function Ribbon({ actions, state }: { actions: RibbonActions; state: Ribb
               <RibbonButton icon="new" label="New file" shortcut="Ctrl+N" disabled={state.readOnly} onClick={actions.onNew} />
               <RibbonButton icon="save" label="Save" shortcut="Ctrl+S" disabled={state.readOnly} onClick={actions.onSave} />
               <RibbonButton icon="saveAs" label="Save as" shortcut="Ctrl+Shift+S" disabled={state.readOnly} onClick={actions.onSaveAs} />
+              <RibbonButton icon="recent" label="Earlier versions" onClick={actions.onHistory} />
+            </Group>
+            <Group label="Export">
+              <MenuButton
+                label="Export"
+                icon="export"
+                items={[
+                  { label: "Word document (.docx)", onSelect: () => actions.onExport("docx") },
+                  { label: "Web page (.html)", onSelect: () => actions.onExport("html") },
+                ]}
+              />
+            </Group>
+            <Group label="App">
+              <RibbonButton icon="settings" label="Settings" shortcut="Ctrl+," onClick={actions.onSettings} />
             </Group>
           </>
         );
@@ -261,6 +365,9 @@ export function Ribbon({ actions, state }: { actions: RibbonActions; state: Ribb
                 ]}
               />
             </Group>
+            <Group label="Proofing">
+              <RibbonButton icon="tidy" label="Tidy" shortcut="Shift+Alt+F" disabled={state.readOnly} onClick={actions.onTidy} />
+            </Group>
           </>
         );
       case "insert":
@@ -275,8 +382,12 @@ export function Ribbon({ actions, state }: { actions: RibbonActions; state: Ribb
             <Group label="Pages">
               <RibbonButton icon="pageBreak" label="Page break" onClick={actions.onPageBreak} />
             </Group>
+            <Group label="Illustrations">
+              <RibbonButton icon="image" label="Image" disabled={state.readOnly} onClick={actions.onImage} />
+            </Group>
             <Group label="References">
               <RibbonButton icon="footnote" label="Footnote" onClick={actions.onFootnote} />
+              <RibbonButton icon="citation" label="Citation" onClick={actions.onCitation} />
             </Group>
           </>
         );
@@ -286,11 +397,29 @@ export function Ribbon({ actions, state }: { actions: RibbonActions; state: Ribb
             <LayoutMenu settings={state.settings} onChange={actions.onLayout} />
           </Group>
         );
+      case "review":
+        return (
+          <>
+            <Group label="Proofing">
+              <RibbonButton icon="grammar" label="Check grammar" shortcut="F7" onClick={actions.onGrammar} />
+            </Group>
+            <Group label="Notes">
+              <RibbonButton icon="note" label="New note" shortcut="Ctrl+Alt+M" disabled={state.readOnly} onClick={actions.onNewNote} />
+              <RibbonButton icon="notes" label="Show notes" onClick={actions.onShowNotes} />
+              <RibbonButton icon="pdfNotes" label="PDF with notes" disabled={state.readOnly} onClick={actions.onExportNotes} />
+            </Group>
+            <Group label="Compare">
+              <RibbonButton icon="compare" label="Compare with last version" onClick={actions.onCompareLast} />
+              <RibbonButton icon="recent" label="Compare with…" onClick={actions.onCompareWith} />
+            </Group>
+          </>
+        );
       case "view":
         return (
           <>
             <Group label="Show">
               <RibbonButton icon="files" label="Files" shortcut="Ctrl+Shift+E" pressed={state.filesOpen} onClick={actions.onToggleFiles} />
+              <RibbonButton icon="focus" label="Focus" shortcut="F11" onClick={actions.onToggleFocus} />
             </Group>
             <Group label="Preview">
               <RibbonButton icon="preview" label="Live preview" pressed={state.liveEnabled} disabled={state.readOnly} onClick={actions.onToggleLive} />

@@ -74,6 +74,20 @@ export const importFiles = (sources: string[], targetDir: string, onConflict: On
   invoke<ImportResult>("import_files", { sources, targetDir, onConflict });
 export const openEntryExternal = (rel: string) => invoke<void>("open_entry_external", { rel });
 
+/** Copy a file or folder into `toDir` under a free "(copy)" name; resolves to the new path. */
+export const copyEntry = (from: string, toDir: string) => invoke<string>("copy_entry", { from, toDir });
+
+/** Mirrors `Snapshot` in snapshots.rs: a saved earlier version of a file (projects without Git). */
+export type Snapshot = { time: number; size: number };
+export const listSnapshots = (file: string) => invoke<Snapshot[]>("list_snapshots", { file });
+export const readSnapshot = (file: string, time: number) => invoke<string>("read_snapshot", { file, time });
+
+/** Mirrors `ProjectText` / `ProjectTexts` in project.rs (spec 007 R1). */
+export type ProjectText = { path: string; text: string; modified: number };
+export type ProjectTexts = { files: ProjectText[]; truncated: boolean };
+/** Every project text file, or only `paths` (missing ones are omitted). */
+export const projectTexts = (paths?: string[]) => invoke<ProjectTexts>("project_texts", { paths: paths ?? null });
+
 /** Compile the main document with the unsaved text of open files (never written to disk). */
 export const compileProject = (main: string, buffers: Buffer[]) => invoke<CompileResult>("compile_project", { main, buffers });
 

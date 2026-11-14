@@ -1,8 +1,9 @@
-import { act, render } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import { EditorView } from "@codemirror/view";
 import { cursorCharLeft, deleteCharBackward, undo } from "@codemirror/commands";
 import { describe, expect, it, vi } from "vitest";
-import { Editor, type EditorHandle } from "./Editor";
+import { Editor, type EditorAids, type EditorHandle } from "./Editor";
+import { buildIndex } from "./latex/index";
 
 function mount(value: string, onChange = vi.fn()) {
   const utils = render(<Editor value={value} label="LaTeX source" onChange={onChange} />);
@@ -222,5 +223,118 @@ describe("Editor", () => {
     const destroy = vi.spyOn(view, "destroy");
     unmount();
     expect(destroy).toHaveBeenCalled();
+  });
+});
+
+describe("Editor writing aids (spec 007 US1)", () => {
+  function mountAids(value: string, aids?: Partial<EditorAids>, onSelectionText = vi.fn()) {
+    const handle: { current: EditorHandle | null } = { current: null };
+    const full: EditorAids = {
+      getIndex: () => buildIndex(new Map(), null),
+      spellCheck: true,
+      checkWords: vi.fn(async (words: string[]) => words.filter((word) => word === "teh")),
+      suggest: vi.fn(async () => ["the", "tea"]),
+      addWord: vi.fn(async () => undefined),
+      ...aids,
+    };
+    const utils = render(<Editor value={value} label="LaTeX source" onChange={vi.fn()} handle={handle} aids={full} onSelectionText={onSelectionText} />);
+    const view = EditorView.findFromDOM(utils.container.querySelector<HTMLElement>(".cm-content")!)!;
+    return { ...utils, handle: handle.current!, view, aids: full, onSelectionText };
+  }
+
+  it("tidies indentation as one undo step", () => {
+    const { handle, view } = mountAids("\\begin{itemize}\n\\item x\n\\end{itemize}");
+    act(() => handle.tidy());
+    expect(view.state.doc.toString()).toBe("\\begin{itemize}\n  \\item x\n\\end{itemize}");
+    act(() => void undo(view));
+    expect(view.state.doc.toString()).toBe("\\begin{itemize}\n\\item x\n\\end{itemize}");
+  });
+
+  it("reports the selected text", () => {
+    const { handle, view, onSelectionText } = mountAids("one two three");
+    act(() => view.dispatch({ selection: { anchor: 4, head: 13 } }));
+    expect(handle.selectionText()).toBe("two three");
+    expect(onSelectionText).toHaveBeenLastCalledWith("two three");
+  });
+
+  it("closes an environment on Enter", () => {
+    const { view } = mountAids("\\begin{itemize}");
+    act(() => view.dispatch({ selection: { anchor: 15 } }));
+    act(() => void view.contentDOM.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })));
+    expect(view.state.doc.toString()).toBe("\\begin{itemize}\n  \n\\end{itemize}");
+    expect(view.state.selection.main.head).toBe(18);
+  });
+
+  it("marks grammar issues and clears them", () => {
+    const { handle, container } = mountAids("This are fine.");
+    act(() => handle.setGrammar([{ from: 5, to: 8, message: "Use is", replacements: ["is"] }]));
+    expect(container.querySelector(".cm-grammar")).toHaveTextContent("are");
+    act(() => handle.setGrammar([]));
+    expect(container.querySelector(".cm-grammar")).toBeNull();
+  });
+
+  it("underlines misspelled prose words only", async () => {
+    const { container, aids } = mountAids("teh \\textbf{teh} $teh$ fine");
+    await waitFor(() => expect(container.querySelectorAll(".cm-spell")).toHaveLength(2), { timeout: 2000 });
+    expect(aids.checkWords).toHaveBeenCalledWith(["teh", "fine"]);
+  });
+
+  it("offers suggestions on right-click and replaces the word", async () => {
+    const { container, view } = mountAids("teh end");
+    await waitFor(() => expect(container.querySelector(".cm-spell")).not.toBeNull(), { timeout: 2000 });
+    const mark = container.querySelector<HTMLElement>(".cm-spell")!;
+    vi.spyOn(view, "posAtCoords").mockReturnValue(1);
+    act(() => void mark.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 5, clientY: 5 })));
+    const fix = await screen.findByRole("menuitem", { name: "the" });
+    act(() => fix.click());
+    expect(view.state.doc.toString()).toBe("the end");
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  it("does not check spelling when it is turned off", async () => {
+    const checkWords = vi.fn(async () => []);
+    mountAids("teh", { spellCheck: false, checkWords });
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    expect(checkWords).not.toHaveBeenCalled();
+  });
+});
+
+describe("Editor navigation (spec 007 US2)", () => {
+  const aids = (vim: boolean): EditorAids => ({
+    getIndex: () => buildIndex(new Map(), null),
+    spellCheck: false,
+    vim,
+    checkWords: async () => [],
+    suggest: async () => [],
+    addWord: async () => undefined,
+  });
+
+  it("turns Vim keys on and off with the setting", () => {
+    const { container, rerender } = render(<Editor value="abc" label="LaTeX source" onChange={vi.fn()} aids={aids(false)} />);
+    expect(container.querySelector(".cm-vim-panel")).toBeNull();
+    rerender(<Editor value="abc" label="LaTeX source" onChange={vi.fn()} aids={aids(true)} />);
+    expect(container.querySelector(".cm-vim-panel")).not.toBeNull();
+    rerender(<Editor value="abc" label="LaTeX source" onChange={vi.fn()} aids={aids(false)} />);
+    expect(container.querySelector(".cm-vim-panel")).toBeNull();
+  });
+
+  it("preloads a file so an edit there is undoable once it is shown", () => {
+    const handle: { current: EditorHandle | null } = { current: null };
+    const { container } = render(<Editor value="main" label="LaTeX source" onChange={vi.fn()} handle={handle} />);
+    const view = EditorView.findFromDOM(container.querySelector<HTMLElement>(".cm-content")!)!;
+    act(() => handle.current!.switchTo("main.tex", "main"));
+    act(() => handle.current!.preload("b.tex", "old words"));
+    expect(handle.current!.applyTo("b.tex", { from: 0, to: 9, insert: "new words", selectFrom: 0, selectTo: 0 })).toBe("new words");
+    act(() => handle.current!.switchTo("b.tex", "ignored"));
+    expect(view.state.doc.toString()).toBe("new words");
+    act(() => void undo(view));
+    expect(view.state.doc.toString()).toBe("old words");
+  });
+
+  it("selects a range for search results", () => {
+    const handle: { current: EditorHandle | null } = { current: null };
+    render(<Editor value="find the word" label="LaTeX source" onChange={vi.fn()} handle={handle} />);
+    act(() => handle.current!.selectRange(9, 13));
+    expect(handle.current!.selectionText()).toBe("word");
   });
 });

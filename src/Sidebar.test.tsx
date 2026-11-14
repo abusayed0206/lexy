@@ -169,6 +169,30 @@ describe("Sidebar", () => {
     expect(handlers.onSetMain).toHaveBeenCalledWith("chapters\\intro.tex");
   });
 
+  it("offers Duplicate, Copy and, after copying, Paste (spec 007 US5)", async () => {
+    const extra = { onDuplicate: vi.fn(), onCopy: vi.fn(), onPaste: vi.fn() };
+    const { user, rerender } = setup({ actions: { ...actions(), ...extra } });
+    await user.pointer({ keys: "[MouseRight]", target: await screen.findByRole("treeitem", { name: "refs.bib" }) });
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
+      "Open",
+      "Rename",
+      "Delete",
+      "Duplicate",
+      "Copy",
+      "New file here",
+      "New folder here",
+      "Open in Explorer",
+    ]);
+    await user.click(screen.getByRole("menuitem", { name: "Duplicate" }));
+    expect(extra.onDuplicate).toHaveBeenCalledWith(TREE[""][4]);
+    rerender(
+      <Sidebar projectName="Thesis" version={0} current="main.tex" main="main.tex" dirty={new Set()} readOnly={false} actions={{ ...actions(), ...extra }} canPaste />,
+    );
+    await user.pointer({ keys: "[MouseRight]", target: row("chapters") });
+    await user.click(screen.getByRole("menuitem", { name: "Paste" }));
+    expect(extra.onPaste).toHaveBeenCalledWith("chapters");
+  });
+
   it("disables writing actions when read-only", async () => {
     const { user } = setup({ readOnly: true });
     await screen.findByRole("treeitem", { name: "main.tex" });

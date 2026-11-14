@@ -22,6 +22,11 @@ mod bangla;
 mod kriti;
 mod setup;
 mod sync;
+mod spell;
+mod web;
+mod snapshots;
+mod settings;
+mod export;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -592,6 +597,46 @@ async fn compile_project(
     Ok(result)
 }
 
+/// Review → Export PDF with notes (spec 007 US4): `buffers` already carry the `\todo{}` notes.
+/// Compiled in its own build root, so the preview and its SyncTeX data are never touched;
+/// the PDF is saved as `<stem> (notes).pdf` beside the main document. Returns that file name.
+fn export_pdf_with_notes_at(build_root: &Path, root: &Path, main: &str, buffers: &[Buffer]) -> Result<String, project::ProjectError> {
+    use project::{ErrorKind, ProjectError};
+    let result = compile_project_at(&build_root.join("Notes"), root, main, buffers)?;
+    let pdf = match (&result.pdf_path, result.ok) {
+        (Some(pdf), true) => PathBuf::from(pdf),
+        _ => return Err(ProjectError::new(ErrorKind::Io, format!("The PDF with notes didn't compile. {}", result.summary))),
+    };
+    let main_path = project::resolve_in_project(root, main)?;
+    let stem = main_path.file_stem().and_then(OsStr::to_str).unwrap_or("document");
+    let name = format!("{stem} (notes).pdf");
+    let bytes = fs::read(&pdf).map_err(|error| ProjectError::new(ErrorKind::Io, format!("failed to read the PDF: {error}")))?;
+    write_atomic(&main_path.with_file_name(&name), &bytes).map_err(|error| ProjectError::new(ErrorKind::Io, format!("{error} (is the PDF open in another program?)")))?;
+    Ok(name)
+}
+
+#[tauri::command]
+async fn export_pdf_with_notes(
+    main: String,
+    buffers: Vec<Buffer>,
+    lock: State<'_, CompileLock>,
+    project: State<'_, project::ProjectState>,
+) -> Result<String, project::ProjectError> {
+    let root = project.with(|open| {
+        if open.read_only {
+            return Err(project::ProjectError::new(project::ErrorKind::ReadOnly, "this project is open in another Lexy window"));
+        }
+        Ok(open.root.clone())
+    })?;
+    let lock = Arc::clone(&lock.0);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        export_pdf_with_notes_at(&build_root()?, &root, &main, &buffers)
+    })
+    .await
+    .map_err(|error| format!("export task failed: {error}"))?
+}
+
 /// The build folder of a project's main document (same key for compiles and lookups).
 pub(crate) fn build_dir_for(root: &Path, main: &str) -> Result<PathBuf, String> {
     let main_path = project::resolve_in_project(root, main).map_err(|error| error.message)?;
@@ -1116,11 +1161,14 @@ pub fn run() {
         .manage(project::ProjectState::default())
         .manage(sync::SyncState::default())
         .manage(git::GitLock::default())
+        .manage(spell::SpellState::default())
+        .manage(export::ConverterLock::default())
         .invoke_handler(tauri::generate_handler![
             check_environment,
             start_initial_setup,
             read_setup_log,
             compile_project,
+            export_pdf_with_notes,
             read_pdf,
             default_document_folder,
             list_system_fonts,
@@ -1136,6 +1184,20 @@ pub fn run() {
             project::list_dir,
             project::read_file,
             project::write_file,
+            project::project_texts,
+            project::copy_entry,
+            project::list_snapshots,
+            project::read_snapshot,
+            settings::get_settings,
+            settings::set_settings,
+            spell::spell_check,
+            spell::spell_suggest,
+            spell::dictionary_add,
+            web::grammar_check,
+            web::fetch_doi,
+            export::converter_status,
+            export::install_converter,
+            export::export_document,
             project::create_file,
             project::create_folder,
             project::rename_entry,
@@ -1966,6 +2028,46 @@ mod tests {
             let widths: Vec<f64> = log[start..end].split("pt").map(str::trim).filter(|w| !w.is_empty()).map(|w| w.parse().unwrap()).collect();
             let separate = widths[1] + widths[2] + widths[3];
             assert!(widths[0] + 0.5 < separate, "{label}: ক্ষ is {}pt, separate letters {separate}pt: conjunct not shaped", widths[0]);
+        }
+    }
+
+    /// Review → Export PDF with notes writes `main (notes).pdf` and never touches the preview's build folder.
+    #[test]
+    fn pdf_with_notes_when_tools_are_installed() {
+        if !detect_environment().ready {
+            eprintln!("skipping: LaTeX tools not installed");
+            return;
+        }
+        let build = TempDir::new("e2e-notes");
+        let (dir, root) = project_dir("e2e-notes-project", "\\documentclass{article}\\begin{document}Text.\\end{document}\n");
+        let noted = "\\documentclass{article}\n\\usepackage{todonotes}\n\\begin{document}Text.\\todo{check this}\\end{document}\n";
+        let name = export_pdf_with_notes_at(&build.0, &root, "main.tex", &[buffer("main.tex", noted)]).unwrap();
+        assert_eq!(name, "main (notes).pdf");
+        assert!(fs::read(dir.0.join("main (notes).pdf")).unwrap().starts_with(b"%PDF"));
+        assert!(!build.0.join(build_key(Path::new(&project::display_path(&root.join("main.tex"))))).exists(), "the preview's build folder stays untouched");
+        assert_eq!(fs::read_to_string(dir.0.join("main.tex")).unwrap(), "\\documentclass{article}\\begin{document}Text.\\end{document}\n");
+    }
+
+    /// Every New project template compiles unchanged (spec 007 SC-006).
+    #[test]
+    fn every_template_compiles_when_tools_are_installed() {
+        if !detect_environment().ready {
+            eprintln!("skipping: LaTeX tools not installed");
+            return;
+        }
+        let build = TempDir::new("e2e-templates");
+        let templates = [
+            ("article", include_str!("../../src/templates/article.tex")),
+            ("report", include_str!("../../src/templates/report.tex")),
+            ("letter", include_str!("../../src/templates/letter.tex")),
+            ("cv", include_str!("../../src/templates/cv.tex")),
+            ("beamer", include_str!("../../src/templates/beamer.tex")),
+        ];
+        for (name, text) in templates {
+            let (_dir, root) = project_dir(&format!("e2e-template-{name}"), text);
+            let result = compile_project_at(&build.0, &root, "main.tex", &[]).unwrap();
+            assert!(result.ok, "{name}: {}\n{}", result.summary, result.log.chars().rev().take(3000).collect::<String>().chars().rev().collect::<String>());
+            assert!(result.problems.iter().all(|problem| problem.severity != sync::Severity::Error), "{name}: {:?}", result.problems);
         }
     }
 

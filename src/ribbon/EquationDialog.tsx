@@ -81,11 +81,11 @@ export default function EquationDialog({ initialTex = "", initialMode = "display
       wide
       actions={
         <>
-          <button type="button" onClick={onClose}>
-            Cancel
-          </button>
           <button type="button" className="primary" disabled={!tex.trim()} onClick={submit}>
             {editing ? "Update" : "Insert"}
+          </button>
+          <button type="button" onClick={onClose}>
+            Cancel
           </button>
         </>
       }

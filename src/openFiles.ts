@@ -17,7 +17,8 @@ export type OpenFilesState = {
 };
 
 export type OpenFilesEvent =
-  | { type: "opened"; path: string; text: string }
+  /** `background`: load without showing it (Replace all in files that weren't open). */
+  | { type: "opened"; path: string; text: string; background?: boolean }
   | { type: "switched"; path: string }
   | { type: "edited"; path: string; text: string }
   | { type: "saved"; path: string; text: string }
@@ -27,6 +28,8 @@ export type OpenFilesEvent =
   | { type: "renamed"; from: string; to: string }
   | { type: "deleted"; path: string }
   | { type: "closed"; path: string }
+  /** Move a tab; `index` is its new position among the open files (Map order = tab order). */
+  | { type: "reordered"; path: string; index: number }
   | { type: "mainSet"; path: string | null };
 
 export const emptyOpenFiles: OpenFilesState = { files: new Map(), current: null, main: null };
@@ -63,10 +66,10 @@ export function openFilesReducer(state: OpenFilesState, event: OpenFilesEvent): 
   switch (event.type) {
     case "opened": {
       const key = keyOf(state, event.path);
-      if (key !== undefined) return { ...state, current: key };
+      if (key !== undefined) return event.background ? state : { ...state, current: key };
       const files = new Map(state.files);
       files.set(event.path, { savedText: event.text, text: event.text, diskChanged: false });
-      return { ...state, files, current: event.path };
+      return { ...state, files, current: event.background ? state.current : event.path };
     }
     case "switched": {
       const key = keyOf(state, event.path);
@@ -96,10 +99,21 @@ export function openFilesReducer(state: OpenFilesState, event: OpenFilesEvent): 
     case "closed": {
       const key = keyOf(state, event.path);
       if (key === undefined || sameRel(key, state.main)) return state; // the main document can't be closed
+      // Closing the shown tab shows its right neighbour, else its left one (Windows TabView rule).
+      const order = [...state.files.keys()];
+      const at = order.indexOf(key);
       const files = new Map(state.files);
       files.delete(key);
-      const current = key === state.current ? (state.main !== null && files.has(state.main) ? state.main : null) : state.current;
+      const neighbour = order[at + 1] ?? order[at - 1] ?? null;
+      const current = key === state.current ? neighbour : state.current;
       return { ...state, files, current };
+    }
+    case "reordered": {
+      const key = keyOf(state, event.path);
+      if (key === undefined) return state;
+      const order = [...state.files.keys()].filter((path) => path !== key);
+      order.splice(Math.max(0, Math.min(event.index, order.length)), 0, key);
+      return { ...state, files: new Map(order.map((path) => [path, state.files.get(path)!])) };
     }
     case "mainSet":
       return { ...state, main: event.path };

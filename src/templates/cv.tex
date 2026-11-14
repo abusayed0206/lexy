@@ -1,0 +1,27 @@
+\documentclass[11pt]{article}
+\usepackage[margin=2cm]{geometry}
+\usepackage{hyperref}
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+
+% One CV entry: \entry{years}{title}{place}{details}
+\newcommand{\entry}[4]{%
+  \textbf{#2} \hfill #1\\
+  \textit{#3}\\
+  #4\par\medskip}
+
+\begin{document}
+
+{\LARGE\textbf{Your name}}\\[4pt]
+your.email@example.com \quad \textbar \quad +00 000 000 000 \quad \textbar \quad Your city
+
+\section*{Education}
+\entry{2020--2024}{BSc in Your subject}{Your university}{Thesis: Your thesis title.}
+
+\section*{Experience}
+\entry{2024--now}{Your position}{Your employer}{What you did and achieved.}
+
+\section*{Skills}
+\LaTeX, writing, and more.
+
+\end{document}

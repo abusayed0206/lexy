@@ -39,6 +39,16 @@ describe("createLivePreview", () => {
     expect(live.state().phase).toBe("running");
   });
 
+  it("uses a new delay from the next edit (Settings → Live preview delay)", async () => {
+    const { live, compile } = setup();
+    live.setDelay(300);
+    live.edit("a");
+    await vi.advanceTimersByTimeAsync(299);
+    expect(compile).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(compile).toHaveBeenCalledWith("a");
+  });
+
   it("queues edits during a compile and then compiles only the newest text", async () => {
     const { live, compile, onResult, finish } = setup();
     live.edit("v1");

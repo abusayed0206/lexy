@@ -141,7 +141,13 @@ pub fn classify(name: &str, is_dir: bool) -> (bool, bool) {
 }
 
 fn is_editable(path: &Path) -> bool {
-    path.file_name().and_then(OsStr::to_str).is_some_and(|name| classify(name, false).0)
+    path.file_name().and_then(OsStr::to_str).is_some_and(|name| classify(name, false).0) || is_notes_file(path)
+}
+
+/// `.lexy\notes.json`: the one Lexy file kept inside a project (spec 007 US4, notes travel with it).
+fn is_notes_file(path: &Path) -> bool {
+    path.file_name().and_then(OsStr::to_str).is_some_and(|name| name.eq_ignore_ascii_case("notes.json"))
+        && path.parent().and_then(Path::file_name).and_then(OsStr::to_str).is_some_and(|dir| dir.eq_ignore_ascii_case(".lexy"))
 }
 
 fn modified_ms(metadata: &fs::Metadata) -> u64 {
@@ -251,6 +257,70 @@ pub fn write_file_at(root: &Path, rel: &str, contents: &str) -> Result<PathBuf> 
     Ok(path)
 }
 
+/// Text files the TypeScript index reads (spec 007 R1); larger files are skipped.
+const MAX_TEXT_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_TEXT_FILES: usize = 2000;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectText {
+    pub path: String,
+    pub text: String,
+    pub modified: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectTexts {
+    pub files: Vec<ProjectText>,
+    pub truncated: bool,
+}
+
+fn read_text(root: &Path, path: &Path) -> Option<ProjectText> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_TEXT_BYTES || !is_editable(path) {
+        return None;
+    }
+    Some(ProjectText { path: relative(root, path)?, text: fs::read_to_string(path).ok()?, modified: modified_ms(&metadata) })
+}
+
+/// Every editable text file below `root` (hidden names and build clutter skipped), or only `paths`.
+pub fn project_texts_at(root: &Path, paths: Option<&[String]>) -> Result<ProjectTexts> {
+    if let Some(paths) = paths {
+        let mut files = Vec::new();
+        for rel in paths {
+            // Missing or invalid paths are simply omitted: the caller drops them from its cache.
+            if let Some(text) = resolve_in_project(root, rel).ok().and_then(|path| read_text(root, &path)) {
+                files.push(text);
+            }
+        }
+        return Ok(ProjectTexts { files, truncated: false });
+    }
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
+            let Ok(kind) = entry.file_type() else { continue };
+            // Symlinks and junctions are not followed, so the walk never leaves the project.
+            if kind.is_symlink() || classify(&name, kind.is_dir()).1 {
+                continue;
+            }
+            if kind.is_dir() {
+                stack.push(entry.path());
+            } else if let Some(text) = read_text(root, &entry.path()) {
+                if files.len() == MAX_TEXT_FILES {
+                    return Ok(ProjectTexts { files, truncated: true });
+                }
+                files.push(text);
+            }
+        }
+    }
+    files.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+    Ok(ProjectTexts { files, truncated: false })
+}
+
 fn taken(rel: &str) -> ProjectError {
     ProjectError::new(ErrorKind::NameTaken, format!("{rel} already exists"))
 }
@@ -289,6 +359,77 @@ pub fn rename_entry_at(root: &Path, from: &str, to: &str) -> Result<()> {
         return Err(ProjectError::new(ErrorKind::InvalidName, "a folder can't be moved into itself"));
     }
     fs::rename(&source, &target).map_err(|error| ProjectError::io("failed to rename", error))
+}
+
+/// `name (copy).ext`, then `name (copy 2).ext`… — the first name not taken in `dir`.
+fn copy_name(dir: &Path, name: &str, is_dir: bool) -> String {
+    let (stem, ext) = match name.rfind('.') {
+        Some(dot) if !is_dir && dot > 0 => (&name[..dot], &name[dot..]),
+        _ => (name, ""),
+    };
+    (1..)
+        .map(|n| if n == 1 { format!("{stem} (copy){ext}") } else { format!("{stem} (copy {n}){ext}") })
+        .find(|candidate| !dir.join(candidate).exists())
+        .unwrap_or_else(|| format!("{stem} (copy){ext}"))
+}
+
+/// Copy a folder's contents into the existing folder `target`; symlinks and junctions are skipped,
+/// so nothing outside the project is pulled in.
+fn copy_tree(source: &Path, target: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            continue;
+        }
+        let to = target.join(entry.file_name());
+        if kind.is_dir() {
+            fs::create_dir(&to)?;
+            copy_tree(&entry.path(), &to)?;
+        } else {
+            fs::copy(entry.path(), to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Copy a file or folder into `to_dir` under a free "(copy)" name; never overwrites. Returns the new path.
+pub fn copy_entry_at(root: &Path, from: &str, to_dir: &str) -> Result<String> {
+    let source = resolve_in_project(root, from)?;
+    let dir = resolve_in_project(root, to_dir)?;
+    if source == root {
+        return Err(ProjectError::new(ErrorKind::InvalidName, "the project folder itself can't be copied"));
+    }
+    let metadata = fs::symlink_metadata(&source).map_err(|error| ProjectError::io(&format!("failed to copy {from}"), error))?;
+    if metadata.file_type().is_symlink() {
+        return Err(ProjectError::new(ErrorKind::InvalidName, format!("{from} is a link and can't be copied")));
+    }
+    if !dir.is_dir() {
+        return Err(ProjectError::new(ErrorKind::NotFound, format!("{to_dir} is not a folder")));
+    }
+    if metadata.is_dir() && fs::canonicalize(&dir).ok().zip(fs::canonicalize(&source).ok()).is_some_and(|(d, s)| d.starts_with(s)) {
+        return Err(ProjectError::new(ErrorKind::InvalidName, "a folder can't be copied into itself"));
+    }
+    let name = source.file_name().and_then(OsStr::to_str).ok_or_else(|| ProjectError::new(ErrorKind::InvalidName, format!("{from} has no name")))?;
+    // A copy into another folder keeps the name when it is free.
+    let target_name = if dir.join(name).exists() { copy_name(&dir, name, metadata.is_dir()) } else { name.to_string() };
+    let target = dir.join(&target_name);
+    let failed = |error| ProjectError::io(&format!("failed to copy {from}"), error);
+    if metadata.is_dir() {
+        // create_dir fails if the name was taken meanwhile, so the cleanup below only ever removes our own copy.
+        fs::create_dir(&target).map_err(failed)?;
+        if let Err(error) = copy_tree(&source, &target) {
+            let _ = fs::remove_dir_all(&target);
+            return Err(failed(error));
+        }
+    } else {
+        fs::OpenOptions::new().write(true).create_new(true).open(&target).map_err(failed)?;
+        if let Err(error) = fs::copy(&source, &target) {
+            let _ = fs::remove_file(&target);
+            return Err(failed(error));
+        }
+    }
+    relative(root, &target).ok_or_else(|| ProjectError::new(ErrorKind::Io, "failed to name the copy"))
 }
 
 pub fn delete_entry_at(root: &Path, rel: &str, permanent: bool) -> Result<()> {
@@ -810,6 +951,10 @@ pub fn open_project(app: AppHandle, state: State<'_, ProjectState>, path: String
     }
     save_store(&dir, &store)?;
 
+    // Old snapshots go when their project is opened (spec 007 US5).
+    let snapshot_dir = crate::snapshots::project_dir(&dir, &canonical);
+    std::thread::spawn(move || crate::snapshots::prune(&snapshot_dir, now_ms()));
+
     let writes: RecentWrites = Arc::default();
     let watcher = start_watcher(&app, &canonical, Arc::clone(&writes));
     let name = canonical.file_name().and_then(OsStr::to_str).unwrap_or(&shown).to_string();
@@ -860,9 +1005,53 @@ pub fn read_file(state: State<'_, ProjectState>, rel: String) -> Result<String> 
     state.with(|project| read_file_at(&project.root, &rel))
 }
 
+/// Before a save in a project without Git, keep the text being replaced (spec 007 US5).
+/// Best effort: a failed snapshot never blocks the save.
+fn keep_snapshot(root: &Path, rel: &str, contents: &str) {
+    if crate::snapshots::has_git(root) {
+        return;
+    }
+    let Ok(path) = resolve_in_project(root, rel) else { return };
+    let Ok(previous) = fs::read_to_string(&path) else { return };
+    if previous == contents {
+        return;
+    }
+    if let Ok(base) = app_data_dir() {
+        let _ = crate::snapshots::take(&crate::snapshots::project_dir(&base, root), rel, &previous, now_ms());
+    }
+}
+
+#[tauri::command]
+pub fn list_snapshots(state: State<'_, ProjectState>, file: String) -> Result<Vec<crate::snapshots::Snapshot>> {
+    let root = state.with(|project| Ok(project.root.clone()))?;
+    resolve_in_project(&root, &file)?;
+    Ok(crate::snapshots::list(&crate::snapshots::project_dir(&app_data_dir()?, &root), &file))
+}
+
+#[tauri::command]
+pub fn read_snapshot(state: State<'_, ProjectState>, file: String, time: u64) -> Result<String> {
+    let root = state.with(|project| Ok(project.root.clone()))?;
+    resolve_in_project(&root, &file)?;
+    crate::snapshots::read(&crate::snapshots::project_dir(&app_data_dir()?, &root), &file, time)
+        .map_err(|error| ProjectError::io("failed to read the snapshot", error))
+}
+
+#[tauri::command]
+pub async fn copy_entry(state: State<'_, ProjectState>, from: String, to_dir: String) -> Result<String> {
+    let root = state.writable(|project| Ok(project.root.clone()))?;
+    blocking(move || copy_entry_at(&root, &from, &to_dir)).await
+}
+
+#[tauri::command]
+pub async fn project_texts(state: State<'_, ProjectState>, paths: Option<Vec<String>>) -> Result<ProjectTexts> {
+    let root = state.with(|project| Ok(project.root.clone()))?;
+    blocking(move || project_texts_at(&root, paths.as_deref())).await
+}
+
 #[tauri::command]
 pub fn write_file(state: State<'_, ProjectState>, rel: String, contents: String) -> Result<()> {
     state.writable(|project| {
+        keep_snapshot(&project.root, &rel, &contents);
         let path = write_file_at(&project.root, &rel, &contents)?;
         if let (Ok(modified), Ok(mut writes)) = (fs::metadata(&path).and_then(|m| m.modified()), project.writes.lock()) {
             writes.insert(path, modified);
@@ -990,6 +1179,102 @@ mod tests {
             return;
         }
         assert_eq!(kind(resolve_in_project(&root.0, "escape\\secret.tex")), ErrorKind::OutsideProject);
+        let _ = fs::remove_dir(&link);
+    }
+
+    // ----- project texts (spec 007) -----
+
+    #[test]
+    fn project_texts_returns_text_files_only() {
+        let root = TempDir::new("texts");
+        fs::create_dir_all(root.0.join("chapters")).unwrap();
+        fs::create_dir_all(root.0.join(".git")).unwrap();
+        fs::write(root.0.join("main.tex"), "\\documentclass{article}").unwrap();
+        fs::write(root.0.join("chapters").join("one.tex"), "One").unwrap();
+        fs::write(root.0.join("refs.bib"), "@book{k,}").unwrap();
+        fs::write(root.0.join("main.aux"), "clutter").unwrap();
+        fs::write(root.0.join("fig.png"), [0u8, 1, 2]).unwrap();
+        fs::write(root.0.join(".git").join("config.txt"), "hidden").unwrap();
+        fs::write(root.0.join("latin1.tex"), [0xE9u8, 0x20]).unwrap();
+        fs::write(root.0.join("big.txt"), vec![b'a'; (MAX_TEXT_BYTES + 1) as usize]).unwrap();
+        let texts = project_texts_at(&root.0, None).unwrap();
+        let paths: Vec<&str> = texts.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, ["chapters\\one.tex", "main.tex", "refs.bib"]);
+        assert!(!texts.truncated);
+        assert_eq!(texts.files[1].text, "\\documentclass{article}");
+        assert!(texts.files[1].modified > 0);
+    }
+
+    #[test]
+    fn project_texts_reads_only_the_named_paths() {
+        let root = TempDir::new("texts-paths");
+        fs::write(root.0.join("a.tex"), "A").unwrap();
+        fs::write(root.0.join("b.tex"), "B").unwrap();
+        let names = ["b.tex", "missing.tex", "..\\outside.tex", "a.tex"].map(String::from);
+        let texts = project_texts_at(&root.0, Some(&names)).unwrap();
+        let paths: Vec<&str> = texts.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, ["b.tex", "a.tex"]);
+    }
+
+    #[test]
+    fn notes_file_is_the_only_editable_json() {
+        let root = TempDir::new("notes-file");
+        fs::create_dir_all(root.0.join(".lexy")).unwrap();
+        write_file_at(&root.0, ".lexy\\notes.json", "{\"version\":1,\"notes\":[]}").unwrap();
+        assert_eq!(read_file_at(&root.0, ".lexy/notes.json").unwrap(), "{\"version\":1,\"notes\":[]}");
+        assert_eq!(kind(write_file_at(&root.0, "notes.json", "{}")), ErrorKind::InvalidName);
+        assert_eq!(kind(write_file_at(&root.0, ".lexy\\other.json", "{}")), ErrorKind::InvalidName);
+    }
+
+    // ----- copy (spec 007 US5) -----
+
+    #[test]
+    fn copy_entry_names_copies_and_never_overwrites() {
+        let root = TempDir::new("copy-names");
+        fs::create_dir_all(root.0.join("chapters")).unwrap();
+        fs::write(root.0.join("chapters").join("one.tex"), "One").unwrap();
+        assert_eq!(copy_entry_at(&root.0, "chapters\\one.tex", "chapters").unwrap(), "chapters\\one (copy).tex");
+        assert_eq!(copy_entry_at(&root.0, "chapters\\one.tex", "chapters").unwrap(), "chapters\\one (copy 2).tex");
+        assert_eq!(fs::read_to_string(root.0.join("chapters").join("one (copy 2).tex")).unwrap(), "One");
+        // Into another folder the name stays when it is free.
+        assert_eq!(copy_entry_at(&root.0, "chapters\\one.tex", "").unwrap(), "one.tex");
+        assert_eq!(copy_entry_at(&root.0, "chapters\\one.tex", "").unwrap(), "one (copy).tex");
+        assert_eq!(fs::read_to_string(root.0.join("chapters").join("one.tex")).unwrap(), "One");
+    }
+
+    #[test]
+    fn copy_entry_copies_folders_but_not_into_themselves() {
+        let root = TempDir::new("copy-folders");
+        fs::create_dir_all(root.0.join("chapters").join("figs")).unwrap();
+        fs::write(root.0.join("chapters").join("figs").join("a.png"), [1u8, 2]).unwrap();
+        fs::write(root.0.join("chapters").join("one.tex"), "One").unwrap();
+        assert_eq!(copy_entry_at(&root.0, "chapters", "").unwrap(), "chapters (copy)");
+        assert_eq!(fs::read(root.0.join("chapters (copy)").join("figs").join("a.png")).unwrap(), [1, 2]);
+        assert_eq!(kind(copy_entry_at(&root.0, "chapters", "chapters\\figs")), ErrorKind::InvalidName);
+        assert_eq!(kind(copy_entry_at(&root.0, "", "chapters")), ErrorKind::InvalidName);
+        assert_eq!(kind(copy_entry_at(&root.0, "missing.tex", "")), ErrorKind::NotFound);
+        assert_eq!(kind(copy_entry_at(&root.0, "chapters\\one.tex", "chapters\\one.tex")), ErrorKind::NotFound);
+        assert_eq!(kind(copy_entry_at(&root.0, "..\\x.tex", "")), ErrorKind::OutsideProject);
+    }
+
+    #[test]
+    fn project_texts_does_not_follow_a_junction_out_of_the_project() {
+        let root = TempDir::new("texts-junction");
+        let outside = TempDir::new("texts-junction-target");
+        fs::write(outside.0.join("secret.tex"), "secret").unwrap();
+        let link = root.0.join("escape");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside.0)
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !made {
+            eprintln!("skipping: could not create a junction");
+            return;
+        }
+        let texts = project_texts_at(&root.0, None).unwrap();
+        assert!(texts.files.is_empty(), "{:?}", texts.files);
         let _ = fs::remove_dir(&link);
     }
 

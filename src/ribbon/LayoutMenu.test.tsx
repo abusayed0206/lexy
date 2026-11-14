@@ -113,7 +113,7 @@ describe("LayoutMenu", () => {
     it("keeps Tab focus inside the dialog", async () => {
       const { user } = await openCustom();
       await user.tab({ shift: true });
-      expect(screen.getByRole("button", { name: "Apply" })).toHaveFocus();
+      expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus(); // the last button (Windows order)
       await user.tab();
       expect(screen.getByLabelText("Top (cm)")).toHaveFocus();
     });

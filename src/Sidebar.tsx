@@ -15,6 +15,12 @@ export type SidebarActions = {
   onHome: () => void;
   onImport: (sources: string[], dir: string) => void;
   onError: (message: string) => void;
+  /** A copy beside the original, named "(copy)". */
+  onDuplicate?: (entry: Entry) => void;
+  /** Remember `entry` for Paste (within this window). */
+  onCopy?: (entry: Entry) => void;
+  /** Paste the copied entry into `dir`; never overwrites. */
+  onPaste?: (dir: string) => void;
 };
 
 type Props = {
@@ -29,6 +35,8 @@ type Props = {
   changes?: ReadonlyMap<string, string>;
   readOnly: boolean;
   actions: SidebarActions;
+  /** Something was copied in this window, so Paste is offered. */
+  canPaste?: boolean;
 };
 
 type Row = { entry: Entry; depth: number };
@@ -48,7 +56,7 @@ function readHidden(): boolean {
 const folderOf = (entry: Entry | null) => (entry === null ? "" : entry.kind === "folder" ? entry.path : parentOf(entry.path));
 
 /** Lazy project tree (contracts/ui.md): one folder listed at a time, tree keyboard pattern, context menu, drop target. */
-export function Sidebar({ projectName, version, current, main, dirty, changes, readOnly, actions }: Props) {
+export function Sidebar({ projectName, version, current, main, dirty, changes, readOnly, actions, canPaste = false }: Props) {
   const [children, setChildren] = useState<ReadonlyMap<string, Entry[]>>(new Map());
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set([""]));
   const [focused, setFocused] = useState<string | null>(null);
@@ -254,6 +262,9 @@ export function Sidebar({ projectName, version, current, main, dirty, changes, r
     if (entry) items.push({ label: "Open", run: () => activate(entry) });
     if (entry) items.push({ label: "Rename", run: () => startRename(entry), disabled: readOnly });
     if (entry) items.push({ label: "Delete", run: () => actions.onDelete(entry), disabled: readOnly });
+    if (entry && actions.onDuplicate) items.push({ label: "Duplicate", run: () => actions.onDuplicate?.(entry), disabled: readOnly });
+    if (entry && actions.onCopy) items.push({ label: "Copy", run: () => actions.onCopy?.(entry) });
+    if (actions.onPaste && canPaste) items.push({ label: "Paste", run: () => actions.onPaste?.(dir), disabled: readOnly });
     items.push({ label: "New file here", run: () => actions.onNewFile(dir), disabled: readOnly });
     items.push({ label: "New folder here", run: () => actions.onNewFolder(dir), disabled: readOnly });
     if (entry?.kind === "file" && /\.tex$/i.test(entry.name) && !sameRel(entry.path, main)) {
