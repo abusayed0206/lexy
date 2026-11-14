@@ -29,6 +29,9 @@ export type RibbonActions = {
   onSaveAs: () => void;
   onCompile: () => void;
   onToggleLogs: () => void;
+  /** Ctrl+J: show the cursor's line in the PDF. */
+  onShowInPdf: () => void;
+  onZoom: (kind: "in" | "out" | "fit") => void;
   onToggleLive: () => void;
   onToggleFiles: () => void;
   onFormat: (command: "textbf" | "textit" | "underline") => void;
@@ -65,6 +68,8 @@ export type RibbonState = {
   settingsManaged: boolean;
   git: GitState | null;
   gitOpen: boolean;
+  /** "Fit" or "125 %". */
+  zoomLabel: string;
 };
 
 function loadTab(): RibbonTab {
@@ -290,6 +295,12 @@ export function Ribbon({ actions, state }: { actions: RibbonActions; state: Ribb
             <Group label="Preview">
               <RibbonButton icon="preview" label="Live preview" pressed={state.liveEnabled} disabled={state.readOnly} onClick={actions.onToggleLive} />
               <RibbonButton icon="compile" label="Compile now" shortcut="F5" disabled={state.compiling || state.readOnly} onClick={actions.onCompile} />
+              <RibbonButton icon="showInPdf" label="Show in PDF" shortcut="Ctrl+J" onClick={actions.onShowInPdf} />
+            </Group>
+            <Group label={`Zoom (${state.zoomLabel})`}>
+              <RibbonButton icon="zoomOut" label="Zoom out" shortcut="Ctrl+-" onClick={() => actions.onZoom("out")} />
+              <RibbonButton icon="fitWidth" label="Fit width" shortcut="Ctrl+0" pressed={state.zoomLabel === "Fit"} onClick={() => actions.onZoom("fit")} />
+              <RibbonButton icon="zoomIn" label="Zoom in" shortcut="Ctrl+=" onClick={() => actions.onZoom("in")} />
             </Group>
             <Group label="Output">
               <RibbonButton

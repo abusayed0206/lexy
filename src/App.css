@@ -1141,21 +1141,20 @@ h1 {
 .pdf-pages {
   display: flex;
   flex-direction: column;
-  align-items: center;
+  align-items: safe center;
   gap: 12px;
   padding: 16px;
 }
 
 .pdf-page {
-  width: 100%;
+  position: relative;
+  flex: none;
   background: #ffffff;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
 }
 
 .pdf-page canvas {
   display: block;
-  width: 100%;
-  height: auto;
 }
 
 .log-drawer {
@@ -1748,4 +1747,95 @@ h1 {
 
 .diff-hunk {
   color: var(--text-muted);
+}
+
+/* PDF ↔ source sync and problems (spec 003) */
+
+.pdf-scroller:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.pdf-spot {
+  position: absolute;
+  pointer-events: none;
+  border-radius: 3px;
+  background: var(--selection);
+  outline: 2px solid var(--accent);
+  animation: lexy-fade 1s ease-out forwards;
+}
+
+.cm-flash-line {
+  animation: lexy-flash 1s ease-out;
+}
+
+@keyframes lexy-fade {
+  70% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+@keyframes lexy-flash {
+  0% { background-color: var(--selection); }
+  100% { background-color: transparent; }
+}
+
+.preview-stale {
+  color: var(--text-muted);
+}
+
+.log-tabs {
+  display: flex;
+  gap: 2px;
+}
+
+.log-tabs button[aria-selected="true"] {
+  font-weight: 600;
+}
+
+.problems,
+.problems-empty {
+  margin: 0;
+  padding: 6px 10px;
+  overflow: auto;
+}
+
+.problems {
+  list-style: none;
+}
+
+.problem-row {
+  width: 100%;
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 3px 4px;
+  border: none;
+  background: none;
+  text-align: left;
+  font: inherit;
+}
+
+button.problem-row:hover,
+button.problem-row:focus-visible {
+  background: var(--accent-soft);
+}
+
+.problem-icon {
+  font-weight: 700;
+  width: 1em;
+  flex: none;
+}
+
+.problem-icon.error {
+  color: var(--danger-text);
+}
+
+.problem-icon.warning {
+  color: var(--warn-text);
+}
+
+.problem-where {
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  flex: none;
 }

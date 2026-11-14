@@ -89,6 +89,9 @@ This tracker is the source of truth for implementation status. Any contributor w
 | F-057 | Git local history: start history, commit, ignore list, identity, large-file warning, sidebar marks | P1 | In Progress | Claude | Rust e2e (real git) + Vitest | `src-tauri/src/git.rs`, `src/GitPanel.tsx`, Git ribbon tab, Ctrl+Shift+G / Ctrl+Shift+K. Manual quickstart A pending. |
 | F-058 | Git diff, history, view/compare/restore | P1 | In Progress | Claude | Rust e2e + Vitest | Inline diff (`src/git/diff.ts`), paged history, restore as uncommitted changes. Manual quickstart B pending. |
 | F-059 | Git remote: connect, publish to GitHub, push, pull, sync, conflicts | P2 | In Progress | Claude | Rust e2e with local bare remote + Vitest | Publish uses GitHub CLI browser sign-in; push/pull use Git Credential Manager. Real GitHub run (quickstart C) pending. |
+| F-060 | Click-to-jump PDF ↔ source (SyncTeX, both directions, sub-files) | P1 | In Progress | Claude | Rust e2e (pdfLaTeX + XeLaTeX round trip) + Vitest | `src-tauri/src/sync.rs`, double-click / Ctrl+J. Manual quickstart B pending. |
+| F-061 | Actionable problems (inline markers + Problems list) | P1 | In Progress | Claude | Rust parser tests + e2e + Vitest | `CompileResult.problems`, `src/Problems.tsx`, `@codemirror/lint`. |
+| F-062 | Stable preview: zoom, position keeping, last good PDF note | P1 | In Progress | Claude | Vitest | `src/pdfView/zoom.ts`; eager page rendering kept (shortcut). |
 | F-045 | PDF saved next to the document on exit | P1 | In Progress | Claude | Rust + UI tests | PDF lives in the build folder while editing; on close it is written as `<name>.pdf` beside the saved `.tex` (recompiled first if the preview doesn't match the saved text). Native check pending. |
 
 ## Manual Feature Intake
@@ -102,32 +105,32 @@ Add new ideas here first. During triage, either move them into the feature track
 | 2026-06-10 | Codex | Choose PDF preview strategy. | Affects file permissions, refresh behavior, and app size. | Resolved 2026-11-13: blob URL iframe |
 | 2026-06-10 | Codex | Decide whether to switch Strawberry Perl from MSI to portable. | Portable may better match no-GUI app-managed setup, but asset URL and extraction flow need confirmation. | Resolved 2026-11-13: portable ZIP |
 | 2026-11-13 | User | Click-to-jump between PDF and source (SyncTeX). | Standard in TeXstudio, Overleaf, LaTeX Workshop; fastest way to find preview text in source. | Specced: `specs/003-pdf-source-sync` |
-| 2026-11-13 | User | Document outline sidebar (sections, figures, tables). | Navigate long documents. | Accepted, needs spec |
-| 2026-11-13 | User | Smart autocomplete (commands, environments, `\ref`/`\cite` keys). | Fewer typos, discoverability for new users. | Accepted, needs spec |
-| 2026-11-13 | User | Friendly compile errors with "Go to line". | Raw latexmk logs are hard for non-experts. | Accepted, needs spec |
-| 2026-11-13 | User | Citations / bibliography (.bib, citation picker, add by DOI). | Core need for academic writing. | Accepted, needs spec |
-| 2026-11-13 | User | Insert image (ribbon + drag-and-drop, copied into project folder). | Word-style users expect it. | Accepted, needs spec |
-| 2026-11-13 | User | Template gallery for New (article, report, letter, CV, beamer). | Faster start than the single starter document. | Accepted, needs spec |
-| 2026-11-13 | User | Spell check (LaTeX-aware) and word count. | Basic writing aids every word processor has. | Accepted, needs spec |
+| 2026-11-13 | User | Document outline sidebar (sections, figures, tables). | Navigate long documents. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-13 | User | Smart autocomplete (commands, environments, `\ref`/`\cite` keys). | Fewer typos, discoverability for new users. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-13 | User | Friendly compile errors with "Go to line". | Raw latexmk logs are hard for non-experts. | Specced: `specs/003-pdf-source-sync` (US3) |
+| 2026-11-13 | User | Citations / bibliography (.bib, citation picker, add by DOI). | Core need for academic writing. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-13 | User | Insert image (ribbon + drag-and-drop, copied into project folder). | Word-style users expect it. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-13 | User | Template gallery for New (article, report, letter, CV, beamer). | Faster start than the single starter document. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-13 | User | Spell check (LaTeX-aware) and word count. | Basic writing aids every word processor has. | Specced: `specs/007-writing-toolkit` |
 | 2026-11-13 | User | Project workspace: Project Home, open folder, file sidebar, main document. | Multi-file documents (chapters, .bib, images); replaces single-file model and F-014 Recent files. | Implemented as F-046…F-051 (`specs/004-project-workspace`) |
-| 2026-11-13 | Claude | Local version history (automatic snapshots per project, restore any version). | Undo across sessions; safety net without Git. | Suggested |
-| 2026-11-13 | Claude | Command palette (Ctrl+Shift+P) to run any ribbon action by name. | Fast keyboard access as features grow. | Suggested |
-| 2026-11-13 | Claude | Find and replace across the whole project. | Needed once documents span several files. | Suggested |
-| 2026-11-13 | Claude | Export to Word (.docx) and HTML. | Share with people who do not use LaTeX. | Suggested |
-| 2026-11-13 | Claude | Auto-save (optional, every few seconds). | Word-style users expect it; pairs with version history. | Suggested |
-| 2026-11-13 | Claude | Settings screen (theme, editor font size, live preview delay, auto-save). | Covers F-033; needed as options multiply. | Suggested |
-| 2026-11-13 | Claude | Layout revamp: three panes (sidebar with Files/Outline tabs, editor, PDF) plus focus mode. | Gives the outline and the project tree one home; focus mode for distraction-free writing. | Suggested |
+| 2026-11-13 | Claude | Local version history (automatic snapshots per project, restore any version). | Undo across sessions; safety net without Git. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-13 | Claude | Command palette (Ctrl+Shift+P) to run any ribbon action by name. | Fast keyboard access as features grow. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-13 | Claude | Find and replace across the whole project. | Needed once documents span several files. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-13 | Claude | Export to Word (.docx) and HTML. | Share with people who do not use LaTeX. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-13 | Claude | Auto-save (optional, every few seconds). | Word-style users expect it; pairs with version history. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-13 | Claude | Settings screen (theme, editor font size, live preview delay, auto-save). | Covers F-033; needed as options multiply. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-13 | Claude | Layout revamp: three panes (sidebar with Files/Outline tabs, editor, PDF) plus focus mode. | Gives the outline and the project tree one home; focus mode for distraction-free writing. | Specced: `specs/007-writing-toolkit` |
 | 2026-11-13 | User | Seamless Bangla and other languages: auto Unicode engine for latexbangla/fontspec/polyglossia, custom fonts (installed or in the project folder), editor display of all scripts, non-Latin file names. | The LaTeXbangla example failed: Lexy compiled it with pdfLaTeX because there was no `% !TEX program` line. | Implemented as F-052…F-056 (`specs/005-bangla-multilingual`) |
 | 2026-11-13 | User | Git integration: init, commit and push from a Git ribbon tab or menu with visual status. | Version control and backup for projects without leaving Lexy. | Implemented as F-057–F-059 (`specs/006-git-integration`) |
-| 2026-11-14 | User (from upvote research) | Grammar check that skips LaTeX commands (LanguageTool-style). | TeXstudio "Grammarly integration" 40👍. | Accepted, needs spec |
-| 2026-11-14 | User (from upvote research) | Optional Vim keybindings in the editor. | TeXstudio's top request: "Vim keybindings" 47👍 + "vim editing" 24👍. | Accepted, needs spec |
-| 2026-11-14 | User (from upvote research) | Editor tabs for open files. | Overleaf "Latex Editor with Tabs" 55👍. | Accepted, needs spec |
-| 2026-11-14 | User (from upvote research) | Fold sections and environments. | LaTeX Workshop "Folding of sections" 8👍. | Accepted, needs spec |
-| 2026-11-14 | User (from upvote research) | Comments / notes on text, resolve them, optional PDF export with comments. | Overleaf: comments 108👍, export PDF with comments 85👍, mentions 59👍. | Accepted, needs spec |
-| 2026-11-14 | User (from upvote research) | Hover math preview in the source. | LaTeX Workshop "Real-time math preview" 24👍. | Accepted, needs spec |
-| 2026-11-14 | User (from upvote research) | Auto-close `\begin{…}` with `\end{…}`, and a tidy-indentation command. | LaTeX Workshop: auto-closing environments, code formatter. | Accepted, needs spec |
-| 2026-11-14 | User (from upvote research) | Compare versions (track-changes style view since a commit or date). | Overleaf track changes is paid; partly covered by `specs/006` diff/history. | Accepted, needs spec |
-| 2026-11-14 | User (from upvote research) | Copy / duplicate files and folders in the sidebar. | Overleaf "Copy Files and Folders" 54👍. | Accepted, needs spec |
+| 2026-11-14 | User (from upvote research) | Grammar check that skips LaTeX commands (LanguageTool-style). | TeXstudio "Grammarly integration" 40👍. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-14 | User (from upvote research) | Optional Vim keybindings in the editor. | TeXstudio's top request: "Vim keybindings" 47👍 + "vim editing" 24👍. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-14 | User (from upvote research) | Editor tabs for open files. | Overleaf "Latex Editor with Tabs" 55👍. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-14 | User (from upvote research) | Fold sections and environments. | LaTeX Workshop "Folding of sections" 8👍. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-14 | User (from upvote research) | Comments / notes on text, resolve them, optional PDF export with comments. | Overleaf: comments 108👍, export PDF with comments 85👍, mentions 59👍. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-14 | User (from upvote research) | Hover math preview in the source. | LaTeX Workshop "Real-time math preview" 24👍. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-14 | User (from upvote research) | Auto-close `\begin{…}` with `\end{…}`, and a tidy-indentation command. | LaTeX Workshop: auto-closing environments, code formatter. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-14 | User (from upvote research) | Compare versions (track-changes style view since a commit or date). | Overleaf track changes is paid; partly covered by `specs/006` diff/history. | Specced: `specs/007-writing-toolkit` |
+| 2026-11-14 | User (from upvote research) | Copy / duplicate files and folders in the sidebar. | Overleaf "Copy Files and Folders" 54👍. | Specced: `specs/007-writing-toolkit` |
 | 2026-11-14 | User (from upvote research) | Select and copy text in the PDF preview. | TeXstudio 16👍. | Declined by user (2026-11-14) |
 | 2026-11-14 | User (from upvote research) | Zotero / Mendeley citation insert. | LaTeX Workshop "Mendeley API support" 10👍. | Declined by user for now; citations intake row covers .bib |
 
@@ -184,3 +187,4 @@ Add new ideas here first. During triage, either move them into the feature track
 | 2026-11-14 | `cargo test` + `npm test` + `npm run build`, feature 005 (Bangla and multilingual) | Passed | 110 Rust tests; the real e2e ran (no skips): LaTeXbangla example with no engine line → XeLaTeX, project-only font via `[Path=fonts/]`, `Font "NoSuchFont" not found`, Bangla project/main/chapter names compiled and exported as `আমার প্রবন্ধ.pdf`. 334 Vitest tests incl. Indic keys and engine tooltip. |
 | 2026-11-14 | Browser pane, backend mocked, 800x600, feature 005 | Passed | Bangla, Devanagari, Arabic and Chinese lines: no clipping at line height 1.55; Arabic line resolves RTL (`dir="auto"`), others LTR; tooltip "XeLaTeX · PDF ready"; WebView `Intl.Segmenter` splits "ক্ষেত্র" 4+3; Left from the line end steps 3 then 4 more; Backspace removes one code point. Keys sent as events (window hidden). Not covered: real typing with Avro/Windows Bangla keyboard, fresh-machine package install, LuaLaTeX per-user fonts, non-ASCII Windows user name. |
 | 2026-11-14 | `cargo test` + `npm test` + `npm run build`, feature 006 (Git) | Passed | 118 Rust tests incl. 4 real-git e2e tests (init/commit/diff/restore, identity + 50 MB warning, project inside a parent repo, push/pull/conflict/abort against a local bare remote); 346 Vitest tests. Manual quickstart A–C and real GitHub publish not yet run. |
+| 2026-11-14 | `cargo test` + `npm test` + `npm run build`, feature 003 (sync, problems, zoom) | Passed | 123 Rust tests incl. real SyncTeX round trip (pdfLaTeX and XeLaTeX, sub-file, unsaved overlay buffer, failed compile keeps the shown PDF, error mapped to `chapters/intro.tex:3`); 357 Vitest tests. Found and fixed: latexmk skipped reruns when a file moved into the overlay. Manual quickstart and the SyncTeX timing check (SC-004) not yet run. |

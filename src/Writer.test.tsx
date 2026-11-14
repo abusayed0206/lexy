@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { exportPdf, loadPdf, type CompileResult } from "./compile";
+import { exportPdf, loadPdf, syncToPdf, syncToSource, type CompileResult } from "./compile";
 import type { EditorHandle } from "./Editor";
 import { BLOCK_START, XELATEX_MARKER } from "./latex/settings";
 import { chooseProjectFolder } from "./ProjectDialogs";
@@ -24,6 +24,7 @@ import { STARTER_DOCUMENT } from "./starter";
 import { clampSidebar, clampSplit, compileReducer, MAX_SPLIT, MIN_SPLIT, statusDetail, statusLabel, Writer } from "./Writer";
 
 // A textarea that implements the same EditorHandle; CodeMirror itself is covered in Editor.test.tsx.
+const spies = vi.hoisted(() => ({ jumpToLine: vi.fn(), setProblems: vi.fn(), showSpot: vi.fn() }));
 vi.mock("./Editor", async () => {
   const React = await import("react");
   return {
@@ -48,17 +49,38 @@ vi.mock("./Editor", async () => {
         applyTo: () => null,
         forget: () => undefined,
         rename: () => undefined,
+        jumpToLine: (line: number) => spies.jumpToLine(current.current, line),
+        cursorLine: () => 7,
+        setProblems: (path: string, problems: unknown[]) => spies.setProblems(path, problems),
       }));
       return <textarea ref={area} className="editor" aria-label={label} value={value} onChange={(event) => onChange(event.target.value)} />;
     },
   };
 });
-vi.mock("./PdfView", () => ({
-  PdfView: ({ bytes, busy }: { bytes: Uint8Array | null; busy: boolean }) => (
-    <div data-testid="pdf">{bytes ? `pdf ${Array.from(bytes).join(",")}` : busy ? "Compiling" : "No PDF yet"}</div>
-  ),
-}));
-vi.mock("./compile", () => ({ loadPdf: vi.fn(), exportPdf: vi.fn() }));
+vi.mock("./PdfView", async () => {
+  const React = await import("react");
+  return {
+    PdfView: ({
+      bytes,
+      busy,
+      handle,
+      onDoubleClickPoint,
+    }: {
+      bytes: Uint8Array | null;
+      busy: boolean;
+      handle?: React.Ref<unknown>;
+      onDoubleClickPoint?: (page: number, x: number, y: number) => void;
+    }) => {
+      React.useImperativeHandle(handle, () => ({ zoomIn: vi.fn(), zoomOut: vi.fn(), fit: vi.fn(), showSpot: spies.showSpot }));
+      return (
+        <div data-testid="pdf" onDoubleClick={() => onDoubleClickPoint?.(2, 10, 20)}>
+          {bytes ? `pdf ${Array.from(bytes).join(",")}` : busy ? "Compiling" : "No PDF yet"}
+        </div>
+      );
+    },
+  };
+});
+vi.mock("./compile", () => ({ loadPdf: vi.fn(), exportPdf: vi.fn(), syncToSource: vi.fn(), syncToPdf: vi.fn() }));
 vi.mock("./projects", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./projects")>()),
   compileProject: vi.fn(),
@@ -493,6 +515,8 @@ describe("Writer", () => {
       await user.click(compileButton());
       expect(compileStatus()).toHaveTextContent("Compile failed");
       expect(drawer()).toHaveTextContent(failed.summary);
+      expect(within(drawer()!).getByRole("tab", { name: /Problems/ })).toHaveAttribute("aria-selected", "true");
+      await user.click(within(drawer()!).getByRole("tab", { name: "Log" }));
       expect(drawer()!.querySelector("pre")).toHaveTextContent("l.3 \\foo");
       expect(preview()).toHaveTextContent("Compile failed. Open log.");
       await user.click(screen.getByRole("button", { name: "Copy log" }));
@@ -845,6 +869,77 @@ describe("Writer", () => {
       expect(screen.getByText("1 change")).toBeInTheDocument();
       await user.keyboard("{Control>}{Shift>}g{/Shift}{/Control}");
       await waitFor(() => expect(screen.queryByRole("complementary", { name: "Version history" })).toBeNull());
+    });
+  });
+
+  describe("PDF ↔ source and problems", () => {
+    async function withPdf() {
+      localStorage.setItem("lexy.livePreview", "1");
+      const result = await renderWriter();
+      await waitFor(() => expect(screen.getByTestId("pdf")).toHaveTextContent("pdf 1,2,3"));
+      return result;
+    }
+
+    it("double-clicking the PDF opens the sub-file and jumps to the line", async () => {
+      const { user } = await withPdf();
+      vi.mocked(syncToSource).mockResolvedValueOnce({ kind: "project", file: "chapters/intro.tex", line: 4 });
+      await user.dblClick(screen.getByTestId("pdf"));
+      await waitFor(() => expect(spies.jumpToLine).toHaveBeenCalledWith(INTRO, 4));
+      expect(syncToSource).toHaveBeenCalledWith(MAIN, 2, 10, 20);
+      expect(editor()).toHaveValue("Intro text.");
+    });
+
+    it("names files outside the project instead of jumping", async () => {
+      const { user } = await withPdf();
+      vi.mocked(syncToSource).mockResolvedValueOnce({ kind: "external", name: "article.cls" });
+      await user.dblClick(screen.getByTestId("pdf"));
+      expect(await screen.findByText("Text is in article.cls")).toBeInTheDocument();
+      expect(spies.jumpToLine).not.toHaveBeenCalled();
+    });
+
+    it("Ctrl+J shows the cursor line in the PDF, or asks to compile first", async () => {
+      localStorage.setItem("lexy.livePreview", "0");
+      const { user, unmount } = await renderWriter();
+      await user.keyboard("{Control>}j{/Control}");
+      expect(await screen.findByText("Compile first")).toBeInTheDocument();
+      unmount();
+
+      const spot = { page: 2, x: 72, y: 100, width: 300, height: 10 };
+      vi.mocked(syncToPdf).mockResolvedValueOnce(spot);
+      const second = await withPdf();
+      await second.user.keyboard("{Control>}j{/Control}");
+      await waitFor(() => expect(spies.showSpot).toHaveBeenCalledWith(spot));
+      expect(syncToPdf).toHaveBeenCalledWith(MAIN, MAIN, 7);
+    });
+
+    it("lists problems after F5, marks them inline, and jumps from a row", async () => {
+      const { user } = await renderWriter();
+      vi.mocked(compileProject).mockResolvedValueOnce({
+        ...failed,
+        problems: [
+          { severity: "error", file: "chapters/intro.tex", line: 3, message: "Undefined control sequence." },
+          { severity: "warning", file: null, line: null, message: "article.cls: Something" },
+        ],
+      });
+      await user.keyboard("{F5}");
+      const list = await screen.findByRole("list", { name: "Problems" });
+      expect(within(drawer()!).getByRole("tab", { name: "Problems (2)" })).toBeInTheDocument();
+      expect(within(list).queryAllByRole("button")).toHaveLength(1);
+      expect(spies.setProblems).toHaveBeenCalledWith(MAIN, []);
+      await user.click(within(list).getByRole("button", { name: /chapters\/intro\.tex:3/ }));
+      await waitFor(() => expect(spies.jumpToLine).toHaveBeenCalledWith(INTRO, 3));
+      expect(spies.setProblems).toHaveBeenCalledWith(INTRO, [expect.objectContaining({ line: 3 })]);
+    });
+
+    it("keeps the last good PDF with a note when a compile fails", async () => {
+      const { user } = await withPdf();
+      vi.mocked(compileProject).mockResolvedValueOnce(failed);
+      await user.keyboard("{F5}");
+      expect(await screen.findByText("Preview is from the last successful compile.")).toBeInTheDocument();
+      expect(screen.getByTestId("pdf")).toHaveTextContent("pdf 1,2,3");
+      vi.mocked(compileProject).mockResolvedValueOnce(succeeded);
+      await user.keyboard("{F5}");
+      await waitFor(() => expect(screen.queryByText("Preview is from the last successful compile.")).toBeNull());
     });
   });
 });

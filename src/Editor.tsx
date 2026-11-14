@@ -1,11 +1,13 @@
 import { useEffect, useImperativeHandle, useRef, type Ref } from "react";
 import { basicSetup } from "codemirror";
-import { EditorSelection, EditorState, Extension } from "@codemirror/state";
+import { EditorSelection, EditorState, Extension, StateEffect, StateField } from "@codemirror/state";
+import { lintGutter, setDiagnostics, type Diagnostic } from "@codemirror/lint";
 import { Decoration, EditorView, ViewPlugin, type DecorationSet, type ViewUpdate } from "@codemirror/view";
 import { HighlightStyle, StreamLanguage, syntaxHighlighting } from "@codemirror/language";
 import { stex } from "@codemirror/legacy-modes/mode/stex";
 import { tags } from "@lezer/highlight";
 import { indicKeys } from "./indicKeys";
+import type { Problem } from "./compile";
 import type { Selection, TextEdit } from "./latex/format";
 
 /**
@@ -38,6 +40,30 @@ const autoDirection = ViewPlugin.fromClass(
   { decorations: (plugin) => plugin.decorations },
 );
 
+/** A 1 s highlight on the line a jump landed on (spec 003). */
+const flashEffect = StateEffect.define<number | null>();
+const flashLine = Decoration.line({ class: "cm-flash-line" });
+const flashField = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update(value, tr) {
+    for (const effect of tr.effects) {
+      if (effect.is(flashEffect)) value = effect.value === null ? Decoration.none : Decoration.set([flashLine.range(effect.value)]);
+    }
+    return tr.docChanged ? value.map(tr.changes) : value;
+  },
+  provide: (field) => EditorView.decorations.from(field),
+});
+
+/** Compile problems for one file as whole-line diagnostics (lines clamped to the document). */
+function diagnosticsFor(state: EditorState, problems: Problem[]): Diagnostic[] {
+  return problems
+    .filter((problem) => problem.line !== null)
+    .map((problem) => {
+      const line = state.doc.line(Math.min(Math.max(1, problem.line!), state.doc.lines));
+      return { from: line.from, to: line.to, severity: problem.severity, message: problem.message, source: "LaTeX" };
+    });
+}
+
 /** Ribbon actions edit the document only through this, so each is exactly one undo step. */
 export type EditorHandle = {
   getText: () => string;
@@ -60,6 +86,12 @@ export type EditorHandle = {
   forget: (path: string) => void;
   /** Keep a file's state under its new path after a rename (folder renames move all files below). */
   rename: (from: string, to: string) => void;
+  /** Put the cursor at the start of `line` (clamped), scroll it to the middle, focus, flash it. No undo step. */
+  jumpToLine: (line: number) => void;
+  /** 1-based line of the cursor in the shown file. */
+  cursorLine: () => number;
+  /** Show compile problems inline in any file the editor has shown (empty list clears). */
+  setProblems: (path: string, problems: Problem[]) => void;
 };
 
 type Props = {
@@ -176,6 +208,30 @@ export function Editor({ value, onChange, label, handle }: Props) {
         states.current = new Map([...states.current].map(([path, state]) => [moved(path), state]));
         if (currentPath.current !== null) currentPath.current = moved(currentPath.current);
       },
+      jumpToLine: (line) => {
+        const editor = view.current;
+        if (!editor) return;
+        const target = editor.state.doc.line(Math.min(Math.max(1, line), editor.state.doc.lines));
+        editor.dispatch({
+          selection: EditorSelection.cursor(target.from),
+          effects: [EditorView.scrollIntoView(target.from, { y: "center" }), flashEffect.of(target.from)],
+        });
+        editor.focus();
+        setTimeout(() => view.current?.dispatch({ effects: flashEffect.of(null) }), 1000);
+      },
+      cursorLine: () => {
+        const state = view.current?.state;
+        return state ? state.doc.lineAt(state.selection.main.head).number : 1;
+      },
+      setProblems: (path, problems) => {
+        if (path === currentPath.current) {
+          const editor = view.current;
+          if (editor) editor.dispatch(setDiagnostics(editor.state, diagnosticsFor(editor.state, problems)));
+          return;
+        }
+        const saved = states.current.get(path);
+        if (saved) states.current.set(path, saved.update(setDiagnostics(saved, diagnosticsFor(saved, problems))).state);
+      },
     }),
     [],
   );
@@ -187,6 +243,8 @@ export function Editor({ value, onChange, label, handle }: Props) {
       StreamLanguage.define(stex),
       syntaxHighlighting(latexHighlight),
       lexyTheme,
+      flashField,
+      lintGutter(),
       EditorView.lineWrapping,
       // Arabic/Hebrew/Urdu lines read right to left; LaTeX-only lines stay left to right.
       EditorView.perLineTextDirection.of(true),

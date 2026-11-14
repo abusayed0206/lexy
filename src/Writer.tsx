@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { exportPdf, loadPdf, type CompileResult } from "./compile";
+import { exportPdf, loadPdf, syncToPdf, syncToSource, type CompileResult, type Problem } from "./compile";
 import { Editor, type EditorHandle } from "./Editor";
 import { findEquationAt, wrapEquation, type FoundEquation } from "./latex/equations";
 import type { FontChoice } from "./latex/fonts";
@@ -12,7 +12,9 @@ import { createLivePreview, type LivePreview } from "./livePreview";
 import { dirtyFiles, emptyOpenFiles, isDirty, keyOf, openFilesReducer, type OpenFilesEvent } from "./openFiles";
 import { gitStatus, STATUS_LETTER, type GitState } from "./git";
 import { GitPanel, type GitAction } from "./GitPanel";
-import { PdfView } from "./PdfView";
+import { PdfView, type PdfViewHandle } from "./PdfView";
+import { zoomLabel, type Zoom } from "./pdfView/zoom";
+import { Problems } from "./Problems";
 import { chooseProjectFolder, useChoice, useNamePrompt } from "./ProjectDialogs";
 import {
   absolutePath,
@@ -193,6 +195,10 @@ export function Writer({ project, onSwitch }: Props) {
   const [gitOpen, setGitOpen] = useState(false);
   const [gitRequest, setGitRequest] = useState<{ action: GitAction; seq: number } | null>(null);
   const panes = useRef<HTMLDivElement>(null);
+  const pdfView = useRef<PdfViewHandle>(null);
+  const [problems, setProblems] = useState<Problem[]>([]);
+  const [drawerTab, setDrawerTab] = useState<"problems" | "log">("problems");
+  const [zoom, setZoom] = useState<Zoom>("fit");
   const dragging = useRef<"split" | "sidebar" | null>(null);
   const editor = useRef<EditorHandle>(null);
   const live = useRef<LivePreview | null>(null);
@@ -221,6 +227,21 @@ export function Writer({ project, onSwitch }: Props) {
   const dirty = useMemo(() => dirtyFiles(files), [files]);
   const dirtySet = useMemo(() => new Set(dirty.map((path) => path.toLowerCase())), [dirty]);
 
+  // Inline problems in every open file; a file without problems is cleared (spec 003 US3).
+  const openKeys = [...files.files.keys()].join("|");
+  useEffect(() => {
+    const byFile = new Map<string, Problem[]>();
+    for (const problem of problems) {
+      if (!problem.file) continue;
+      const key = problem.file.toLowerCase();
+      byFile.set(key, [...(byFile.get(key) ?? []), problem]);
+    }
+    for (const path of files.files.keys()) {
+      editor.current?.setProblems(path, byFile.get(path.split("\\").join("/").toLowerCase()) ?? []);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [problems, openKeys, current]);
+
   const settings = useMemo(() => parseSettings(mainText ?? ""), [mainText]);
   const settingsManaged = useMemo(() => hasSettingsBlock(mainText ?? ""), [mainText]);
 
@@ -242,7 +263,11 @@ export function Writer({ project, onSwitch }: Props) {
       }
     }
     dispatch({ type: "done", origin, result: final });
-    if (origin === "explicit" && !final.ok) setLogsOpen(true);
+    setProblems(final.problems ?? (final.ok ? [] : [{ severity: "error", file: null, line: null, message: final.summary }]));
+    if (origin === "explicit" && !final.ok) {
+      setDrawerTab("problems");
+      setLogsOpen(true);
+    }
   }
 
   function failure(error: unknown): CompileResult {
@@ -332,6 +357,43 @@ export function Writer({ project, onSwitch }: Props) {
       if (first && liveEnabled) live.current?.now(String(++editSeq.current));
     } catch (error) {
       setNotice(`Could not open ${baseName(path)}. ${errorText(error)}`);
+    }
+  }
+
+  // ----- PDF ↔ source (spec 003) -----
+
+  /** Open a project file (path from the backend, `/`-separated) and put the cursor on `line`. */
+  async function jumpTo(file: string, line: number) {
+    const path = file.split("/").join("\\");
+    if (!sameRel(path, filesRef.current.current)) await openFile(path);
+    editor.current?.jumpToLine(line);
+  }
+
+  async function showInSource(page: number, x: number, y: number) {
+    const target = filesRef.current.main;
+    if (target === null) return;
+    try {
+      const found = await syncToSource(target, page, x, y);
+      if (found?.kind === "project") await jumpTo(found.file, found.line);
+      else if (found?.kind === "external") setInfo(`Text is in ${found.name}`);
+    } catch {
+      setInfo("Click-to-jump needs a fresh compile");
+    }
+  }
+
+  async function showInPdf() {
+    const target = filesRef.current.main;
+    const path = filesRef.current.current;
+    if (target === null || path === null || !pdfBytes) {
+      setInfo("Compile first");
+      return;
+    }
+    try {
+      const spot = await syncToPdf(target, path, editor.current?.cursorLine() ?? 1);
+      if (spot) pdfView.current?.showSpot(spot);
+      else setInfo("No PDF location for this line");
+    } catch {
+      setInfo("Compile first");
     }
   }
 
@@ -768,6 +830,8 @@ export function Writer({ project, onSwitch }: Props) {
     onSaveAs: () => void saveCurrentAs(),
     onCompile: () => void runCompile(),
     onToggleLogs: () => setLogsOpen((open) => !open),
+    onShowInPdf: () => void showInPdf(),
+    onZoom: (kind) => (kind === "in" ? pdfView.current?.zoomIn() : kind === "out" ? pdfView.current?.zoomOut() : pdfView.current?.fit()),
     onToggleLive: () => setLiveEnabled((on) => !on && !readOnly),
     onToggleFiles: toggleFiles,
     onFormat: (command) => edit((text, selection) => wrap(text, selection, command)),
@@ -804,7 +868,7 @@ export function Writer({ project, onSwitch }: Props) {
       else if (ctrl && event.shiftKey && key === "k") action = () => run.onGit("focus");
       else if (ctrl && !event.shiftKey) {
         action =
-          { n: run.onNew, o: run.onOpen, l: run.onToggleLogs, b: () => run.onFormat("textbf"), i: () => run.onFormat("textit"), u: () => run.onFormat("underline") }[key] ??
+          { n: run.onNew, o: run.onOpen, l: run.onToggleLogs, j: run.onShowInPdf, b: () => run.onFormat("textbf"), i: () => run.onFormat("textit"), u: () => run.onFormat("underline") }[key] ??
           null;
       }
       if (!action) return;
@@ -906,6 +970,7 @@ export function Writer({ project, onSwitch }: Props) {
           settingsManaged,
           git,
           gitOpen,
+          zoomLabel: zoomLabel(zoom),
         }}
       />
 
@@ -1063,12 +1128,26 @@ export function Writer({ project, onSwitch }: Props) {
             {state.status === "error" ? (
               <div className="preview-banner">
                 <span>{state.origin === "live" ? `Preview failed: ${state.summary}` : "Compile failed. Open log."}</span>
-                <button type="button" onClick={() => setLogsOpen(true)}>
-                  Open log
+                {pdfBytes ? <span className="preview-stale">Preview is from the last successful compile.</span> : null}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDrawerTab("problems");
+                    setLogsOpen(true);
+                  }}
+                >
+                  Show problems
                 </button>
               </div>
             ) : null}
-            <PdfView bytes={pdfBytes} busy={compiling} onError={setNotice} />
+            <PdfView
+              handle={pdfView}
+              bytes={pdfBytes}
+              busy={compiling}
+              onError={setNotice}
+              onZoomChange={setZoom}
+              onDoubleClickPoint={(page, x, y) => void showInSource(page, x, y)}
+            />
           </section>
         </div>
         {gitOpen ? (
@@ -1090,6 +1169,14 @@ export function Writer({ project, onSwitch }: Props) {
       {logsOpen ? (
         <section className="log-drawer" aria-label="Compile log">
           <div className="log-header">
+            <div className="log-tabs" role="tablist">
+              <button type="button" role="tab" aria-selected={drawerTab === "problems"} onClick={() => setDrawerTab("problems")}>
+                Problems ({problems.length})
+              </button>
+              <button type="button" role="tab" aria-selected={drawerTab === "log"} onClick={() => setDrawerTab("log")}>
+                Log
+              </button>
+            </div>
             <strong>{state.summary ?? "No compile yet"}</strong>
             <button
               type="button"
@@ -1099,7 +1186,7 @@ export function Writer({ project, onSwitch }: Props) {
               Copy log
             </button>
           </div>
-          <pre>{state.log || "No log yet"}</pre>
+          {drawerTab === "log" ? <pre>{state.log || "No log yet"}</pre> : <Problems problems={problems} onJump={(file, line) => void jumpTo(file, line)} />}
         </section>
       ) : null}
 

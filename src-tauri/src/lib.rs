@@ -19,6 +19,7 @@ use tauri::{ipc::Response, AppHandle, Emitter, Manager, State};
 mod git;
 mod project;
 mod setup;
+mod sync;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -364,6 +365,13 @@ struct CompileResult {
     log: String,
     pdf_path: Option<String>,
     engine: Engine,
+    problems: Vec<sync::Problem>,
+    /// Where `pdf_path` and its SyncTeX data live, for the lookups (spec 003).
+    #[serde(skip)]
+    shown: Option<sync::Shown>,
+    /// MiKTeX's bin folder (where `synctex.exe` lives).
+    #[serde(skip)]
+    tools_dir: Option<PathBuf>,
 }
 
 /// One compile at a time per process: live and explicit compiles share build folders.
@@ -557,6 +565,7 @@ async fn compile_project(
     buffers: Vec<Buffer>,
     lock: State<'_, CompileLock>,
     project: State<'_, project::ProjectState>,
+    sync_state: State<'_, sync::SyncState>,
 ) -> Result<CompileResult, project::ProjectError> {
     let root = project.with(|open| {
         let expected = open.main.as_deref().unwrap_or_default();
@@ -566,12 +575,23 @@ async fn compile_project(
         Ok(open.root.clone())
     })?;
     let lock = Arc::clone(&lock.0);
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         compile_project_at(&build_root()?, &root, &main, &buffers)
     })
     .await
-    .map_err(|error| format!("compile task failed: {error}"))?
+    .map_err(|error| format!("compile task failed: {error}"))?;
+    let mut result = result?;
+    if let Some(shown) = result.shown.take() {
+        sync_state.store(shown);
+    }
+    Ok(result)
+}
+
+/// The build folder of a project's main document (same key for compiles and lookups).
+pub(crate) fn build_dir_for(root: &Path, main: &str) -> Result<PathBuf, String> {
+    let main_path = project::resolve_in_project(root, main).map_err(|error| error.message)?;
+    Ok(build_root()?.join(build_key(Path::new(&project::display_path(&main_path)))))
 }
 
 /// Overlay folder inside a build folder; its leading dot keeps it out of the mirrored tree.
@@ -629,6 +649,15 @@ fn compile_project_at(build_root: &Path, root: &Path, main: &str, buffers: &[Buf
     write_atomic(&out_dir.join(format!("{stem}.tex")), main_text.as_bytes())?;
 
     let overlay = out_dir.join(OVERLAY);
+    // latexmk only compares the inputs it recorded last time, so when a file moves between the
+    // project and the overlay it would skip the rerun; forget its database then.
+    let mut listed: Vec<String> = overlay_files.iter().map(|(path, _)| path.display().to_string().to_lowercase()).collect();
+    listed.sort();
+    let list_file = out_dir.join(".lexy-overlay.list");
+    if fs::read_to_string(&list_file).unwrap_or_default() != listed.join("|") {
+        let _ = fs::remove_file(out_dir.join(format!("{stem}.fdb_latexmk")));
+        let _ = fs::write(&list_file, listed.join("|"));
+    }
     let _ = fs::remove_dir_all(&overlay);
     for (path, text) in &overlay_files {
         let Ok(rel) = path.strip_prefix(root) else { continue };
@@ -642,11 +671,35 @@ fn compile_project_at(build_root: &Path, root: &Path, main: &str, buffers: &[Buf
     mirror_folders(root, &out_dir);
 
     let (tex_root, note) = tex_project_path(&out_dir, &plain_root);
-    let search_path = env::join_paths([overlay, tex_root, PathBuf::new()])
+    let search_path = env::join_paths([overlay, tex_root.clone(), PathBuf::new()])
         .map_err(|error| format!("failed to build TEXINPUTS: {error}"))?;
     let mut result = run_latexmk(&out_dir, &stem, engine, &reason, &search_path)?;
     if let Some(note) = note {
         result.log = format!("{note}\n{}", result.log);
+    }
+
+    // Problems with project-relative files, and the shown slot for click-to-jump (spec 003).
+    let mut roots = vec![plain_root.clone()];
+    if tex_root != plain_root {
+        roots.push(tex_root.clone());
+    }
+    let table = sync::PathTable {
+        base: out_dir.clone(),
+        main_snapshot: out_dir.join(format!("{stem}.tex")),
+        main_rel: main.replace('\\', "/"),
+        overlay: out_dir.join(OVERLAY),
+        roots,
+    };
+    let tex_log = fs::read(out_dir.join(format!("{stem}.log"))).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+    result.problems = sync::parse_problems(&tex_log, &table);
+    if !result.ok && !result.problems.iter().any(|p| p.severity == sync::Severity::Error) {
+        result.problems.insert(0, sync::Problem { severity: sync::Severity::Error, file: None, line: None, message: result.summary.clone() });
+    }
+    if result.ok {
+        let pdf = sync::publish(&out_dir, &stem)?;
+        result.pdf_path = Some(pdf.display().to_string());
+        let synctex_exe = sync::synctex_beside(result.tools_dir.as_deref());
+        result.shown = Some(sync::Shown { out_dir: out_dir.clone(), pdf, table, synctex_exe });
     }
     Ok(result)
 }
@@ -690,6 +743,9 @@ fn run_latexmk_inner(out_dir: &Path, stem: &str, engine: Engine, inputs: &std::f
             log: "Lexy could not find the LaTeX tools it needs. Restart Lexy to run setup.".into(),
             pdf_path: None,
             engine,
+            problems: Vec::new(),
+            shown: None,
+            tools_dir: None,
         });
     }
 
@@ -708,12 +764,12 @@ fn run_latexmk_inner(out_dir: &Path, stem: &str, engine: Engine, inputs: &std::f
 
     let mut command = Command::new(&latexmk);
     command
-        .args([engine.latexmk_flag(), "-interaction=nonstopmode", "-halt-on-error", "-file-line-error"])
+        .args([engine.latexmk_flag(), "-interaction=nonstopmode", "-halt-on-error", "-file-line-error", "-synctex=1"])
         // MiKTeX installs missing packages for this run only, without a dialog (research R6).
         .args([
-            "-pdflatex=pdflatex -enable-installer %O %S",
-            "-xelatex=xelatex -enable-installer %O %S",
-            "-lualatex=lualatex -enable-installer %O %S",
+            "-pdflatex=pdflatex -enable-installer -max-print-line=1000 %O %S",
+            "-xelatex=xelatex -enable-installer -max-print-line=1000 %O %S",
+            "-lualatex=lualatex -enable-installer -max-print-line=1000 %O %S",
         ])
         .arg(format!("{stem}.tex"))
         .current_dir(out_dir)
@@ -751,6 +807,9 @@ fn run_latexmk_inner(out_dir: &Path, stem: &str, engine: Engine, inputs: &std::f
         log: compose_log(&output, &tex_log),
         pdf_path: ok.then(|| pdf.display().to_string()),
         engine,
+        problems: Vec::new(),
+        shown: None,
+        tools_dir: environment.miktex.path.as_deref().and_then(|path| Path::new(path).parent()).map(Path::to_path_buf),
     })
 }
 
@@ -1021,6 +1080,7 @@ pub fn run() {
         .manage(FontCache(Arc::new(OnceLock::new())))
         .manage(SetupGuard(Arc::new(AtomicBool::new(false))))
         .manage(project::ProjectState::default())
+        .manage(sync::SyncState::default())
         .manage(git::GitLock::default())
         .invoke_handler(tauri::generate_handler![
             check_environment,
@@ -1063,7 +1123,9 @@ pub fn run() {
             git::git_push,
             git::git_pull,
             git::git_resolve,
-            git::git_abort_merge
+            git::git_abort_merge,
+            sync::sync_to_source,
+            sync::sync_to_pdf
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1737,6 +1799,53 @@ mod tests {
 
     /// Real end-to-end compiles; skipped on machines without MiKTeX + latexmk + Perl.
     #[test]
+    fn sync_round_trip_when_tools_are_installed() {
+        if !detect_environment().ready {
+            eprintln!("skipping: LaTeX tools not installed");
+            return;
+        }
+        let build = TempDir::new("sync-build");
+        for (label, header) in [("sync-pdf", ""), ("sync-xe", "% !TEX program = xelatex\n")] {
+            let main = format!("{header}\\documentclass{{article}}\n\\begin{{document}}\nMain first paragraph.\n\n\\newpage\n\\input{{chapters/intro}}\n\\end{{document}}\n");
+            let (dir, root) = project_dir(label, &main);
+            fs::write(dir.0.join("chapters").join("intro.tex"), "Intro line one.\n\nIntro paragraph on page two.\n").unwrap();
+            let mut result = compile_project_at(&build.0, &root, "main.tex", &[]).unwrap();
+            assert!(result.ok, "{}\n{}", result.summary, result.log);
+            let shown = result.shown.take().expect("shown slot");
+            assert!(shown.pdf.ends_with(Path::new(sync::SHOWN).join("main.pdf")) && shown.pdf.is_file());
+            assert!(shown.pdf.with_extension("synctex.gz").is_file(), "synctex data next to the shown PDF");
+            if shown.synctex_exe.is_none() {
+                eprintln!("skipping lookups: synctex.exe not found");
+                return;
+            }
+            let spot = sync::to_pdf(&shown, "chapters/intro.tex", 3).unwrap().expect("intro line has a PDF spot");
+            assert_eq!(spot.page, 2, "{label}");
+            match sync::to_source(&shown, spot.page, spot.x + 1.0, spot.y + spot.height / 2.0).unwrap() {
+                Some(sync::SyncTarget::Project { file, line }) => {
+                    assert_eq!(file, "chapters/intro.tex", "{label}");
+                    assert!((2..=4).contains(&line), "{label}: line {line}");
+                }
+                other => panic!("{label}: {other:?}"),
+            }
+            let spot = sync::to_pdf(&shown, "main.tex", 3).unwrap().expect("main line has a PDF spot");
+            assert_eq!(spot.page, 1);
+
+            // An unsaved buffer (overlay) round-trips too; a failed compile keeps the slot.
+            let unsaved = buffer("chapters\\intro.tex", "Changed intro.\n\nUnsaved paragraph.\n");
+            let mut result = compile_project_at(&build.0, &root, "main.tex", &[unsaved]).unwrap();
+            let overlay_shown = result.shown.take().expect("shown slot");
+            assert!(sync::to_pdf(&overlay_shown, "chapters/intro.tex", 3).unwrap().is_some(), "{label}: overlay lookup");
+            let before = fs::read(&shown.pdf).unwrap();
+            let failed = compile_project_at(&build.0, &root, "main.tex", &[buffer("chapters\\intro.tex", "Text\n\n\\foo\n")]).unwrap();
+            assert!(!failed.ok && failed.shown.is_none(), "{label}: {}
+{}", failed.summary, &failed.log[failed.log.len().saturating_sub(1500)..]);
+            assert_eq!(fs::read(&shown.pdf).unwrap(), before, "a failed compile must not touch the shown PDF");
+            let problem = failed.problems.iter().find(|p| p.severity == sync::Severity::Error).expect("an error");
+            assert_eq!((problem.file.as_deref(), problem.line), (Some("chapters/intro.tex"), Some(3)), "{:?}", failed.problems);
+        }
+    }
+
+    #[test]
     fn compile_end_to_end_when_tools_are_installed() {
         if !detect_environment().ready {
             eprintln!("skipping: LaTeX tools not installed");
@@ -1774,7 +1883,7 @@ mod tests {
         let before: Vec<_> = fs::read_dir(&dir.0).unwrap().flatten().map(|e| e.file_name()).collect();
         let result = compile_project_at(&build.0, &root, "main.tex", &[buffer("chapters\\intro.tex", "UNSAVEDINTRO\n")]).unwrap();
         assert!(result.ok, "multi-file compile failed: {}\n{}", result.summary, result.log);
-        let out = Path::new(result.pdf_path.as_deref().unwrap()).parent().unwrap().to_path_buf();
+        let out = Path::new(result.pdf_path.as_deref().unwrap()).parent().and_then(Path::parent).unwrap().to_path_buf();
         // TeX wraps log lines at 79 characters, so join them before searching.
         let log = fs::read_to_string(out.join("main.log")).unwrap_or_default().replace(['\r', '\n'], "");
         assert!(log.contains(".lexy-overlay"), "the unsaved intro must come from the overlay:\n{log}");
@@ -1923,8 +2032,13 @@ mod tests {
             log: String::new(),
             pdf_path: Some("C:\\x.pdf".into()),
             engine: Engine::Xelatex,
+            problems: vec![sync::Problem { severity: sync::Severity::Error, file: Some("a.tex".into()), line: Some(2), message: "x".into() }],
+            shown: None,
+            tools_dir: None,
         })
         .unwrap();
+        assert_eq!(json["problems"][0]["file"], "a.tex");
+        assert!(json.get("shown").is_none() && json.get("toolsDir").is_none());
         assert_eq!(json["pdfPath"], "C:\\x.pdf");
         assert!(json.get("pdf_path").is_none());
     }
