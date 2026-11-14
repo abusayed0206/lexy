@@ -21,7 +21,7 @@ import {
   type OpenedProject,
 } from "./projects";
 import { STARTER_DOCUMENT } from "./starter";
-import { clampSidebar, clampSplit, compileReducer, MAX_SPLIT, MIN_SPLIT, statusLabel, Writer } from "./Writer";
+import { clampSidebar, clampSplit, compileReducer, MAX_SPLIT, MIN_SPLIT, statusDetail, statusLabel, Writer } from "./Writer";
 
 // A textarea that implements the same EditorHandle; CodeMirror itself is covered in Editor.test.tsx.
 vi.mock("./Editor", async () => {
@@ -146,7 +146,7 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-const initial = { status: "idle", summary: null, log: "", pdfPath: null, origin: null, explicitBusy: false } as const;
+const initial = { status: "idle", summary: null, log: "", pdfPath: null, origin: null, explicitBusy: false, engine: null } as const;
 
 describe("compileReducer", () => {
   it.each(["idle", "dirty", "ready", "error"] as const)("edit from %s → dirty", (status) => {
@@ -175,6 +175,16 @@ describe("compileReducer", () => {
     expect(statusLabel({ ...initial, status: "error", origin: "live" })).toBe("Preview failed");
     expect(statusLabel({ ...initial, status: "error", origin: "explicit" })).toBe("Compile failed");
     expect(statusLabel({ ...initial, status: "dirty" })).toBe("Changed");
+  });
+
+  it("remembers the engine of the last result and shows it in the status tooltip", () => {
+    const done = compileReducer(initial, { type: "done", origin: "explicit", result: { ...succeeded, engine: "xelatex" } });
+    expect(done.engine).toBe("xelatex");
+    expect(statusDetail(done)).toBe("XeLaTeX · PDF ready");
+    const broken = compileReducer(done, { type: "done", origin: "live", result: failed });
+    expect(statusDetail(broken)).toBe(`pdfLaTeX · ${failed.summary}`);
+    expect(statusDetail(initial)).toBeNull();
+    expect(statusDetail({ ...initial, status: "error", summary: "boom" })).toBe("boom");
   });
 });
 

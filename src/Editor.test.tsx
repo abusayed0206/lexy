@@ -1,6 +1,6 @@
 import { act, render } from "@testing-library/react";
 import { EditorView } from "@codemirror/view";
-import { undo } from "@codemirror/commands";
+import { cursorCharLeft, deleteCharBackward, undo } from "@codemirror/commands";
 import { describe, expect, it, vi } from "vitest";
 import { Editor, type EditorHandle } from "./Editor";
 
@@ -166,6 +166,55 @@ describe("Editor", () => {
       expect(handle.textOf("thesis.tex")).toBe("M");
     });
   });
+  });
+
+  describe("Bangla and other scripts (spec 005)", () => {
+    function pressAtEnd(text: string, key: string) {
+      const { view } = mount(text);
+      act(() => view.dispatch({ selection: { anchor: view.state.doc.length } }));
+      act(() => {
+        view.contentDOM.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+      });
+      return view;
+    }
+
+    it("Backspace removes one code point after Bangla, like Windows (ক্ষ → ক্, আমি → আম)", () => {
+      expect(pressAtEnd("ক্ষ", "Backspace").state.doc.toString()).toBe("ক্");
+      expect(pressAtEnd("আমি", "Backspace").state.doc.toString()).toBe("আম");
+      expect(pressAtEnd("abc", "Backspace").state.doc.toString()).toBe("ab");
+    });
+
+    it("arrow keys step over a whole conjunct and a letter with its vowel sign", () => {
+      expect(pressAtEnd("ক্ষ", "ArrowLeft").state.selection.main.head).toBe(0);
+      expect(pressAtEnd("আমি", "ArrowLeft").state.selection.main.head).toBe(1);
+      const view = mount("ক্ষেত্র").view;
+      act(() => view.dispatch({ selection: { anchor: 0 } }));
+      act(() => {
+        view.contentDOM.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
+      });
+      expect(view.state.selection.main.head).toBe(4); // "ক্ষে" is one letter on screen
+    });
+
+    it("leaves other text to CodeMirror's own rules", () => {
+      // CodeMirror's commands still split the conjunct; the Indic keymap is what fixes it.
+      const view = mount("ক্ষ").view;
+      act(() => view.dispatch({ selection: { anchor: 3 } }));
+      act(() => {
+        cursorCharLeft(view);
+      });
+      expect(view.state.selection.main.head).toBe(2);
+      act(() => {
+        deleteCharBackward(view);
+      });
+      expect(view.state.doc.toString()).toBe("কষ"); // only the virama went: the broken result the keymap avoids
+    });
+
+    it("lets each line take its own direction (right-to-left scripts)", () => {
+      const { view, container } = mount("\\section{x}\nمرحبا");
+      expect(view.state.facet(EditorView.perLineTextDirection)).toBe(true);
+      const lines = [...container.querySelectorAll(".cm-line")];
+      expect(lines.map((line) => line.getAttribute("dir"))).toEqual(["auto", "auto"]);
+    });
   });
 
   it("cleans up the editor on unmount", () => {

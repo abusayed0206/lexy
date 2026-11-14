@@ -130,6 +130,13 @@ Lexy works on folders, not single files (`specs/004-project-workspace`).
 - Font, size and page settings always go to the main document, even when another file is shown.
 - One prompt lists every unsaved file on close, Project Home or project switch.
 
+## Bangla and other scripts (2026-11-14, feature 005)
+
+- No setup for Bangla: documents using LaTeXbangla (or fontspec, polyglossia…) compile with XeLaTeX automatically. The status tooltip names the engine ("XeLaTeX · PDF ready").
+- The editor shows every script with Windows' own fonts (Nirmala UI for Bangla/Devanagari, Segoe UI for Arabic/Hebrew, YaHei/Yu Gothic/Malgun Gothic for CJK). Right-to-left lines read right to left; LaTeX lines stay left to right.
+- Bangla editing follows Windows text boxes: Left/Right step over a whole conjunct ("ক্ষে" is one step); Backspace removes one code point (ক্ষ → ক্), so a typist can correct the last keystroke.
+- Errors name the cause in plain words: `Font "X" not found`, `Package "X" could not be found or installed (offline?)`.
+
 ## Accessibility And Responsiveness
 
 - Every icon-only button needs an accessible name and tooltip.

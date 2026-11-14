@@ -368,9 +368,19 @@ struct CompileResult {
 /// One compile at a time per process: live and explicit compiles share build folders.
 struct CompileLock(Arc<Mutex<()>>);
 
+impl Engine {
+    fn display_name(self) -> &'static str {
+        match self {
+            Engine::Pdflatex => "pdfLaTeX",
+            Engine::Xelatex => "XeLaTeX",
+            Engine::Lualatex => "LuaLaTeX",
+        }
+    }
+}
+
 /// Engine from a `% !TEX program = …` (or `TS-program`) line in the first 5 lines,
 /// the TeXworks/TeXShop convention, so the document stays the single source of truth.
-fn engine_from_marker(source: &str) -> Engine {
+fn marker_engine(source: &str) -> Option<Engine> {
     for line in source.lines().take(5) {
         let Some(comment) = line.trim().strip_prefix('%') else { continue };
         let lower = comment.trim_start().to_ascii_lowercase();
@@ -381,12 +391,156 @@ fn engine_from_marker(source: &str) -> Engine {
         };
         let Some(value) = rest.trim_start().strip_prefix('=') else { continue };
         return match value.trim() {
-            "xelatex" => Engine::Xelatex,
-            "lualatex" => Engine::Lualatex,
-            _ => Engine::Pdflatex,
+            "xelatex" => Some(Engine::Xelatex),
+            "lualatex" => Some(Engine::Lualatex),
+            "pdflatex" => Some(Engine::Pdflatex),
+            _ => None,
         };
     }
-    Engine::Pdflatex
+    None
+}
+
+/// Packages and classes that only run on XeLaTeX or LuaLaTeX (spec 005, research R1).
+const UNICODE_ENGINE_PACKAGES: [&str; 10] =
+    ["latexbangla", "fontspec", "polyglossia", "unicode-math", "xeCJK", "luatexja", "bidi", "xltxtra", "xunicode", "mathspec"];
+const UNICODE_ENGINE_CLASSES: [&str; 4] = ["bookbangla", "ctexart", "ctexbook", "ctexrep"];
+
+/// Text before `\begin{document}`, with `%` comments removed (`\%` is kept).
+fn preamble(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        let mut code = line;
+        let mut previous = ' ';
+        for (index, ch) in line.char_indices() {
+            if ch == '%' && previous != '\\' {
+                code = &line[..index];
+                break;
+            }
+            previous = ch;
+        }
+        if let Some(index) = code.find("\\begin{document}") {
+            out.push_str(&code[..index]);
+            break;
+        }
+        out.push_str(code);
+        out.push('\n');
+    }
+    out
+}
+
+/// Comma-separated names in every `\<command>[…]{a,b}` of `text`.
+fn command_args(text: &str, command: &str) -> Vec<String> {
+    let needle = format!("\\{command}");
+    let mut names = Vec::new();
+    for (index, _) in text.match_indices(&needle) {
+        let mut rest = &text[index + needle.len()..];
+        if rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            continue; // \usepackageX is another command
+        }
+        rest = rest.trim_start();
+        if let Some(options) = rest.strip_prefix('[') {
+            let Some(end) = options.find(']') else { continue };
+            rest = options[end + 1..].trim_start();
+        }
+        let Some(body) = rest.strip_prefix('{') else { continue };
+        let Some(end) = body.find('}') else { continue };
+        names.extend(body[..end].split(',').map(|name| name.trim().to_string()).filter(|name| !name.is_empty()));
+    }
+    names
+}
+
+/// Files the preamble pulls in with `\input` / `\include` (`.tex` added when missing).
+fn preamble_inputs(preamble: &str) -> Vec<String> {
+    ["input", "include"]
+        .into_iter()
+        .flat_map(|command| command_args(preamble, command))
+        .map(|name| if name.to_ascii_lowercase().ends_with(".tex") { name } else { format!("{name}.tex") })
+        .collect()
+}
+
+/// Engine for a compile and why (data-model.md EngineChoice): the explicit marker, else the
+/// first Unicode-engine class or package in the preamble (and the preamble files it inputs),
+/// else pdfLaTeX.
+fn choose_engine(main_text: &str, included: &[String]) -> (Engine, String) {
+    if let Some(engine) = marker_engine(main_text) {
+        return (engine, "marker".into());
+    }
+    let texts: Vec<String> = std::iter::once(preamble(main_text)).chain(included.iter().map(|text| preamble(text))).collect();
+    for text in &texts {
+        if let Some(class) = command_args(text, "documentclass").into_iter().find(|name| UNICODE_ENGINE_CLASSES.contains(&name.as_str())) {
+            return (Engine::Xelatex, class);
+        }
+        let packages = command_args(text, "usepackage").into_iter().chain(command_args(text, "RequirePackage"));
+        if let Some(package) = packages.into_iter().find(|name| UNICODE_ENGINE_PACKAGES.contains(&name.as_str())) {
+            return (Engine::Xelatex, package);
+        }
+    }
+    (Engine::Pdflatex, "default".into())
+}
+
+/// Printable ASCII only (0x20–0x7E): what latexmk (Perl) passes through intact (research R4).
+fn is_plain_ascii(text: &str) -> bool {
+    text.chars().all(|c| (' '..='~').contains(&c))
+}
+
+/// Snapshot file name for latexmk: the main stem when it is safe, else `document`.
+/// The exported PDF keeps the real name (`export_pdf` names it after the main document).
+fn snapshot_stem(stem: &str) -> String {
+    let safe = !stem.is_empty() && is_plain_ascii(stem) && stem.trim() == stem && !stem.contains(['%', '#', '&', '{', '}', '~', '^', '$']);
+    if safe { stem.to_string() } else { "document".to_string() }
+}
+
+/// Link name inside a build folder for projects whose path latexmk can't pass on.
+const ROOT_LINK: &str = ".lexy-root";
+
+/// The project path TeX should search: the root itself when it is plain ASCII, else an ASCII
+/// junction `<out_dir>\.lexy-root` pointing at it. Returns a log note when the link fails.
+fn tex_project_path(out_dir: &Path, root: &Path) -> (PathBuf, Option<String>) {
+    if is_plain_ascii(&root.display().to_string()) {
+        return (root.to_path_buf(), None);
+    }
+    let link = out_dir.join(ROOT_LINK);
+    let target = fs::canonicalize(root).ok();
+    if link.exists() && fs::canonicalize(&link).ok() == target {
+        return (link, None);
+    }
+    // Removes only the link (a junction is an empty reparse-point directory), never its target.
+    let _ = fs::remove_dir(&link);
+    let mut mklink = Command::new("cmd");
+    let made = hide_console(&mut mklink)
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(root)
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if made {
+        (link, None)
+    } else {
+        (
+            root.to_path_buf(),
+            Some("Could not create an ASCII link to the project folder; files with non-Latin names may not be found.".into()),
+        )
+    }
+}
+
+/// `The font "X" cannot be found` from fontspec, even when the log wraps it (research R5).
+fn missing_font(log: &str) -> Option<String> {
+    let joined: Vec<&str> = log.lines().map(|line| line.trim_start_matches("(fontspec)").trim()).collect();
+    let joined = joined.join(" ");
+    let start = joined.find("The font \"")? + "The font \"".len();
+    let end = joined[start..].find('"')?;
+    joined[start + end..].starts_with("\" cannot be found").then(|| joined[start..start + end].to_string())
+}
+
+/// A missing `.sty`/`.cls` after MiKTeX's installer ran means it could not be installed.
+fn missing_package(log: &str) -> Option<String> {
+    let line = log.lines().find(|line| line.contains("LaTeX Error: File `"))?;
+    let start = line.find("File `")? + "File `".len();
+    let end = line[start..].find('\'')?;
+    let file = &line[start..start + end];
+    let name = file.strip_suffix(".sty").or_else(|| file.strip_suffix(".cls"))?;
+    Some(name.to_string())
 }
 
 /// An open file's unsaved text, sent with each compile (contracts/backend-commands.md).
@@ -451,10 +605,24 @@ fn compile_project_at(build_root: &Path, root: &Path, main: &str, buffers: &[Buf
         None => return Err(ProjectError::new(ErrorKind::NotFound, format!("{main} does not exist"))),
     };
 
+    // Preamble files pulled in with \input/\include also decide the engine (buffers win over disk).
+    let included: Vec<String> = preamble_inputs(&preamble(&main_text))
+        .iter()
+        .filter_map(|rel| {
+            let path = resolve_in_project(root, rel).ok()?;
+            match overlay_files.iter().find(|(buffered, _)| *buffered == path) {
+                Some((_, text)) => Some(text.to_string()),
+                None => project::read_file_at(root, rel).ok(),
+            }
+        })
+        .collect();
+    let (engine, reason) = choose_engine(&main_text, &included);
+
     // Plain (non-`\\?\`) paths: TeX and latexmk don't understand verbatim paths.
     let plain_root = PathBuf::from(project::display_path(root));
     let main_abs = PathBuf::from(project::display_path(&main_path));
-    let stem = main_abs.file_stem().and_then(OsStr::to_str).ok_or_else(|| "document name is not valid text".to_string())?.to_string();
+    let real_stem = main_abs.file_stem().and_then(OsStr::to_str).ok_or_else(|| "document name is not valid text".to_string())?;
+    let stem = snapshot_stem(real_stem);
     let out_dir = build_root.join(build_key(&main_abs));
     fs::create_dir_all(&out_dir).map_err(|error| format!("failed to create build folder: {error}"))?;
     write_atomic(&out_dir.join(format!("{stem}.tex")), main_text.as_bytes())?;
@@ -472,9 +640,14 @@ fn compile_project_at(build_root: &Path, root: &Path, main: &str, buffers: &[Buf
     // \include{chapters/x} writes chapters\x.aux next to the main .aux, so the folders must exist.
     mirror_folders(root, &out_dir);
 
-    let inputs = env::join_paths([overlay, plain_root, PathBuf::new()])
+    let (tex_root, note) = tex_project_path(&out_dir, &plain_root);
+    let search_path = env::join_paths([overlay, tex_root, PathBuf::new()])
         .map_err(|error| format!("failed to build TEXINPUTS: {error}"))?;
-    Ok(run_latexmk(&out_dir, &stem, engine_from_marker(&main_text), &inputs)?)
+    let mut result = run_latexmk(&out_dir, &stem, engine, &reason, &search_path)?;
+    if let Some(note) = note {
+        result.log = format!("{note}\n{}", result.log);
+    }
+    Ok(result)
 }
 
 /// Recreate the project's (non-hidden) folder tree inside `target`.
@@ -493,8 +666,15 @@ fn mirror_folders(source: &Path, target: &Path) {
     }
 }
 
-/// Run latexmk on `<out_dir>\<stem>.tex` with `inputs` as TEXINPUTS and BIBINPUTS.
-fn run_latexmk(out_dir: &Path, stem: &str, engine: Engine, inputs: &std::ffi::OsStr) -> Result<CompileResult, String> {
+/// Run latexmk on `<out_dir>\<stem>.tex`; `search_path` (ASCII only) is used for TeX inputs,
+/// bibliographies and font files. The log starts with the engine and why it was chosen.
+fn run_latexmk(out_dir: &Path, stem: &str, engine: Engine, reason: &str, search_path: &std::ffi::OsStr) -> Result<CompileResult, String> {
+    let mut result = run_latexmk_inner(out_dir, stem, engine, search_path)?;
+    result.log = format!("Engine: {} ({reason})\n\n{}", engine.display_name(), result.log);
+    Ok(result)
+}
+
+fn run_latexmk_inner(out_dir: &Path, stem: &str, engine: Engine, inputs: &std::ffi::OsStr) -> Result<CompileResult, String> {
     // Always revalidate tool paths before compiling (docs/PLAN.md).
     let environment = detect_environment();
     if !environment.ready {
@@ -528,11 +708,20 @@ fn run_latexmk(out_dir: &Path, stem: &str, engine: Engine, inputs: &std::ffi::Os
     let mut command = Command::new(&latexmk);
     command
         .args([engine.latexmk_flag(), "-interaction=nonstopmode", "-halt-on-error", "-file-line-error"])
+        // MiKTeX installs missing packages for this run only, without a dialog (research R6).
+        .args([
+            "-pdflatex=pdflatex -enable-installer %O %S",
+            "-xelatex=xelatex -enable-installer %O %S",
+            "-lualatex=lualatex -enable-installer %O %S",
+        ])
         .arg(format!("{stem}.tex"))
         .current_dir(out_dir)
         .env("PATH", path_with_prefix(&tool_dirs)?)
         .env("TEXINPUTS", inputs)
-        .env("BIBINPUTS", inputs);
+        .env("BIBINPUTS", inputs)
+        // Font files in the project, by name or project-relative Path= (research R3).
+        .env("TTFONTS", inputs)
+        .env("OPENTYPEFONTS", inputs);
     let output = run_with_timeout(command, COMPILE_TIMEOUT)?;
 
     let pdf = out_dir.join(format!("{stem}.pdf"));
@@ -544,6 +733,10 @@ fn run_latexmk(out_dir: &Path, stem: &str, engine: Engine, inputs: &std::ffi::Os
         "PDF ready".to_string()
     } else if output.timed_out {
         format!("Compile stopped after {} s", COMPILE_TIMEOUT.as_secs())
+    } else if let Some(font) = missing_font(&tex_log) {
+        format!("Font \"{font}\" not found")
+    } else if let Some(package) = missing_package(&tex_log) {
+        format!("Package \"{package}\" could not be found or installed (offline?)")
     } else {
         first_latex_error(&tex_log)
             .or_else(|| first_latex_error(&output.stdout))
@@ -595,10 +788,25 @@ fn first_latex_error(log: &str) -> Option<String> {
 }
 
 fn build_root() -> Result<PathBuf, String> {
-    let base = env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .ok_or_else(|| "LOCALAPPDATA is not set".to_string())?;
-    Ok(base.join("Lexy").join("Build"))
+    build_root_from(
+        env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        env::var_os("ProgramData").map(PathBuf::from),
+        env::var_os("USERPROFILE").map(PathBuf::from),
+    )
+}
+
+/// `%LOCALAPPDATA%\Lexy\Build`, or an ASCII folder under ProgramData when the user's profile
+/// path has non-Latin characters that latexmk can't pass on (research R4).
+fn build_root_from(local: Option<PathBuf>, program_data: Option<PathBuf>, profile: Option<PathBuf>) -> Result<PathBuf, String> {
+    let local = local.ok_or_else(|| "LOCALAPPDATA is not set".to_string())?.join("Lexy").join("Build");
+    if is_plain_ascii(&local.display().to_string()) {
+        return Ok(local);
+    }
+    // shortcut: ProgramData is shared by all local users; the hash keeps folders apart. Upgrade to a per-user ASCII location if this matters.
+    match program_data.filter(|dir| is_plain_ascii(&dir.display().to_string())) {
+        Some(shared) => Ok(shared.join("Lexy").join("Build").join(build_key(&profile.unwrap_or_default()))),
+        None => Ok(local),
+    }
 }
 
 /// One build folder per document, keyed by its (case-insensitive) path, so
@@ -1311,20 +1519,141 @@ mod tests {
     // ----- compile -----
 
     #[test]
-    fn engine_from_marker_reads_texworks_convention() {
-        assert_eq!(engine_from_marker("% !TEX program = xelatex\n\\documentclass{article}"), Engine::Xelatex);
-        assert_eq!(engine_from_marker("%!TEX TS-program = lualatex"), Engine::Lualatex);
-        assert_eq!(engine_from_marker("  % !tex PROGRAM=XeLaTeX  "), Engine::Xelatex);
-        assert_eq!(engine_from_marker("a\nb\nc\nd\n% !TEX program = xelatex"), Engine::Xelatex);
+    fn marker_engine_reads_texworks_convention() {
+        assert_eq!(marker_engine("% !TEX program = xelatex\n\\documentclass{article}"), Some(Engine::Xelatex));
+        assert_eq!(marker_engine("%!TEX TS-program = lualatex"), Some(Engine::Lualatex));
+        assert_eq!(marker_engine("  % !tex PROGRAM=XeLaTeX  "), Some(Engine::Xelatex));
+        assert_eq!(marker_engine("a\nb\nc\nd\n% !TEX program = xelatex"), Some(Engine::Xelatex));
+        assert_eq!(marker_engine("% !TEX program = pdflatex"), Some(Engine::Pdflatex));
     }
 
     #[test]
-    fn engine_from_marker_defaults_to_pdflatex() {
-        assert_eq!(engine_from_marker("\\documentclass{article}"), Engine::Pdflatex);
-        assert_eq!(engine_from_marker("% !TEX program = context"), Engine::Pdflatex);
-        assert_eq!(engine_from_marker("a\nb\nc\nd\ne\n% !TEX program = xelatex"), Engine::Pdflatex);
-        assert_eq!(engine_from_marker("% !TEX root = main.tex"), Engine::Pdflatex);
-        assert_eq!(engine_from_marker("text % !TEX program = xelatex"), Engine::Pdflatex);
+    fn marker_engine_is_none_without_a_known_marker() {
+        assert_eq!(marker_engine("\\documentclass{article}"), None);
+        assert_eq!(marker_engine("% !TEX program = context"), None);
+        assert_eq!(marker_engine("a\nb\nc\nd\ne\n% !TEX program = xelatex"), None);
+        assert_eq!(marker_engine("% !TEX root = main.tex"), None);
+        assert_eq!(marker_engine("text % !TEX program = xelatex"), None);
+    }
+
+    // ----- engine choice (spec 005, US1) -----
+
+    fn engine(main: &str) -> (Engine, String) {
+        choose_engine(main, &[])
+    }
+
+    #[test]
+    fn engine_marker_wins_over_packages() {
+        let text = "% !TEX program = lualatex\n\\documentclass{article}\n\\usepackage{latexbangla}\n";
+        assert_eq!(engine(text), (Engine::Lualatex, "marker".into()));
+        let pinned = "% !TEX program = pdflatex\n\\usepackage{fontspec}\n";
+        assert_eq!(engine(pinned), (Engine::Pdflatex, "marker".into()));
+    }
+
+    #[test]
+    fn engine_unicode_packages_and_classes_pick_xelatex() {
+        assert_eq!(engine("\\documentclass{article}\n\\usepackage{latexbangla}\n\\setbanglamainfont{Kalpurush}"), (Engine::Xelatex, "latexbangla".into()));
+        assert_eq!(engine("\\documentclass{article}\n\\usepackage[hidelinks]{hyperref, fontspec}\n"), (Engine::Xelatex, "fontspec".into()));
+        assert_eq!(engine("\\documentclass{article}\n\\RequirePackage{polyglossia}"), (Engine::Xelatex, "polyglossia".into()));
+        assert_eq!(engine("\\documentclass[a4paper]{bookbangla}\n"), (Engine::Xelatex, "bookbangla".into()));
+        assert_eq!(engine("\\documentclass{article}\\usepackage {unicode-math}"), (Engine::Xelatex, "unicode-math".into()));
+    }
+
+    #[test]
+    fn engine_ignores_comments_body_and_lookalikes() {
+        assert_eq!(engine("\\documentclass{article}\n%\\usepackage{fontspec}\n"), (Engine::Pdflatex, "default".into()));
+        assert_eq!(engine("\\documentclass{article}\n\\usepackage{amsmath} % \\usepackage{fontspec}\n"), (Engine::Pdflatex, "default".into()));
+        assert_eq!(engine("\\documentclass{article}\n\\begin{document}\n\\usepackage{fontspec}\n"), (Engine::Pdflatex, "default".into()));
+        assert_eq!(engine("\\documentclass{article}\n\\usepackage{babel}\n"), (Engine::Pdflatex, "default".into()));
+        assert_eq!(engine("\\documentclass{article}\n\\usepackagex{fontspec}\n"), (Engine::Pdflatex, "default".into()));
+        assert_eq!(engine("\\documentclass{article}\n\\usepackage{fontspecial}\n"), (Engine::Pdflatex, "default".into()));
+        // An escaped percent is text, not a comment.
+        assert_eq!(engine("\\documentclass{article}\\newcommand{\\p}{50\\%}\\usepackage{fontspec}"), (Engine::Xelatex, "fontspec".into()));
+    }
+
+    #[test]
+    fn engine_reads_preamble_files_the_main_document_inputs() {
+        let main = "\\documentclass{article}\n\\input{preamble}\n\\begin{document}\n\\input{chapter}\n\\end{document}";
+        assert_eq!(preamble_inputs(&preamble(main)), vec!["preamble.tex".to_string()]);
+        assert_eq!(choose_engine(main, &["\\usepackage{polyglossia}".into()]), (Engine::Xelatex, "polyglossia".into()));
+        assert_eq!(preamble_inputs("\\include{setup/fonts.tex}"), vec!["setup/fonts.tex".to_string()]);
+    }
+
+    // ----- summaries (US2, US5) -----
+
+    #[test]
+    fn font_summary_finds_fontspec_error_behind_metafont_noise() {
+        let log = "! Transform components aren't all known.\n! Package fontspec Error:\n(fontspec)                The font \"MyBangla\" cannot be found; this may be\n(fontspec)                but does not have to be due to a corrupted font file.";
+        assert_eq!(missing_font(log).as_deref(), Some("MyBangla"));
+        let split = "(fontspec)                The font \"Kalpurus\"\n(fontspec)                cannot be found.";
+        assert_eq!(missing_font(split).as_deref(), Some("Kalpurus"));
+        assert_eq!(missing_font("! Undefined control sequence."), None);
+    }
+
+    #[test]
+    fn package_summary_names_the_missing_package() {
+        let log = "./main.tex:2: LaTeX Error: File `latexbangla.sty' not found.";
+        assert_eq!(missing_package(log).as_deref(), Some("latexbangla"));
+        assert_eq!(missing_package("! LaTeX Error: File `chapter.tex' not found."), None);
+        assert_eq!(missing_package("! LaTeX Error: File `bookbangla.cls' not found."), Some("bookbangla".into()));
+    }
+
+    // ----- names (US4) -----
+
+    #[test]
+    fn snapshot_stem_keeps_safe_names_only() {
+        assert_eq!(snapshot_stem("Thesis"), "Thesis");
+        assert_eq!(snapshot_stem("My Paper"), "My Paper");
+        assert_eq!(snapshot_stem("আমার প্রবন্ধ"), "document");
+        assert_eq!(snapshot_stem("a&b"), "document");
+        assert_eq!(snapshot_stem(" padded"), "document");
+        assert!(is_plain_ascii(" ~Az09"));
+        assert!(!is_plain_ascii("é"));
+        assert!(!is_plain_ascii("tab\t"));
+    }
+
+    #[test]
+    fn tex_project_path_links_non_ascii_roots_and_never_follows_the_link_on_cleanup() {
+        let base = TempDir::new("junction");
+        let ascii_root = base.0.join("plain");
+        fs::create_dir_all(&ascii_root).unwrap();
+        let out = base.0.join("out");
+        fs::create_dir_all(&out).unwrap();
+        assert_eq!(tex_project_path(&out, &ascii_root), (ascii_root.clone(), None));
+        assert!(!out.join(ROOT_LINK).exists(), "no link for ASCII roots");
+
+        let bangla = base.0.join("প্রকল্প");
+        fs::create_dir_all(bangla.join("অধ্যায়")).unwrap();
+        fs::write(bangla.join("x.tex"), "project file").unwrap();
+        let (path, note) = tex_project_path(&out, &bangla);
+        assert_eq!((path.clone(), note), (out.join(ROOT_LINK), None));
+        assert_eq!(fs::read_to_string(path.join("x.tex")).unwrap(), "project file");
+        assert_eq!(tex_project_path(&out, &bangla).0, out.join(ROOT_LINK), "reused");
+
+        let other = base.0.join("অন্য");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("y.tex"), "other").unwrap();
+        tex_project_path(&out, &other);
+        assert!(out.join(ROOT_LINK).join("y.tex").is_file(), "replaced when the project changes");
+        assert!(bangla.join("x.tex").is_file(), "replacing the link keeps the old project");
+
+        mirror_folders(&other, &out);
+        let _ = fs::remove_dir_all(out.join(OVERLAY));
+        fs::remove_dir_all(&out).unwrap();
+        assert!(other.join("y.tex").is_file(), "deleting the build folder must not follow the junction");
+        assert!(bangla.join("x.tex").is_file());
+    }
+
+    #[test]
+    fn build_root_falls_back_to_program_data_for_non_ascii_profiles() {
+        let local = PathBuf::from(r"C:\Users\me\AppData\Local");
+        assert_eq!(build_root_from(Some(local.clone()), None, None).unwrap(), local.join("Lexy").join("Build"));
+        let bangla = PathBuf::from(r"C:\Users\সায়েদ\AppData\Local");
+        let fallback = build_root_from(Some(bangla.clone()), Some(PathBuf::from(r"C:\ProgramData")), Some(PathBuf::from(r"C:\Users\সায়েদ"))).unwrap();
+        assert!(fallback.starts_with(r"C:\ProgramData\Lexy\Build"));
+        assert!(is_plain_ascii(&fallback.display().to_string()));
+        assert_eq!(build_root_from(Some(bangla.clone()), None, None).unwrap(), bangla.join("Lexy").join("Build"));
+        assert!(build_root_from(None, None, None).is_err());
     }
 
     #[test]
@@ -1442,6 +1771,62 @@ mod tests {
         let result = compile_project_at(&build.0, &root, "main.tex", &[]).unwrap();
         assert_eq!(result.engine, Engine::Xelatex);
         assert!(result.ok, "XeLaTeX failed: {}\n{}", result.summary, result.log);
+
+        // Bangla names (spec 005 US4): project, main and chapter in Bangla, pdfLaTeX, exported by real name.
+        let names = TempDir::new("e2e-names");
+        let bangla_root = names.0.join("প্রকল্প");
+        fs::create_dir_all(bangla_root.join("অধ্যায়")).unwrap();
+        fs::write(bangla_root.join("অধ্যায়").join("ভূমিকা.tex"), "Chapter from a Bangla folder.\n").unwrap();
+        fs::write(bangla_root.join("আমার প্রবন্ধ.tex"), "\\documentclass{article}\\begin{document}\\input{অধ্যায়/ভূমিকা}\\end{document}\n").unwrap();
+        let bangla_root = fs::canonicalize(&bangla_root).unwrap();
+        let result = compile_project_at(&build.0, &bangla_root, "আমার প্রবন্ধ.tex", &[]).unwrap();
+        assert!(result.ok, "Bangla names failed: {}\n{}", result.summary, result.log);
+        let pdf = result.pdf_path.unwrap();
+        assert!(pdf.ends_with("document.pdf"), "{pdf}");
+        let main_abs = project::display_path(&bangla_root.join("আমার প্রবন্ধ.tex"));
+        let exported = export_pdf_to(&build.0, &pdf, &main_abs).unwrap();
+        assert!(exported.ends_with("আমার প্রবন্ধ.pdf"), "{exported}");
+
+        if !bangla_font_installed() {
+            eprintln!("skipping Bangla font cases: no Kalpurush or Siyam Rupali installed");
+            return;
+        }
+        // The reported failure (US1): LaTeXbangla without an engine line compiles with XeLaTeX.
+        let family = if Path::new(r"C:\Windows\Fonts\kalpurush.ttf").exists() { "Kalpurush" } else { "Siyam Rupali" };
+        let bangla = format!("\\documentclass{{article}}\n\\usepackage{{latexbangla}}\n\\setbanglamainfont{{{family}}}\n\\begin{{document}}\nবাংলা ও English একই অনুচ্ছেদে। ক্ষ\n\\end{{document}}\n");
+        let (_bn, root) = project_dir("e2e-bangla", &bangla);
+        let result = compile_project_at(&build.0, &root, "main.tex", &[]).unwrap();
+        assert_eq!(result.engine, Engine::Xelatex);
+        assert!(result.ok, "LaTeXbangla failed: {}\n{}", result.summary, result.log);
+        assert!(result.log.starts_with("Engine: XeLaTeX (latexbangla)"), "{}", &result.log[..80.min(result.log.len())]);
+
+        // A font file kept only in the project (US2), and a missing font's summary.
+        let font_file = bangla_font_file().expect("font file");
+        let local = "\\documentclass{article}\n\\usepackage{latexbangla}\n\\setbanglamainfont{MyBangla.ttf}[Path=fonts/]\n\\begin{document}\nবাংলা\n\\end{document}\n";
+        let (font_dir, root) = project_dir("e2e-font", local);
+        fs::create_dir_all(font_dir.0.join("fonts")).unwrap();
+        fs::copy(&font_file, font_dir.0.join("fonts").join("MyBangla.ttf")).unwrap();
+        let result = compile_project_at(&build.0, &root, "main.tex", &[]).unwrap();
+        assert!(result.ok, "project font failed: {}\n{}", result.summary, result.log);
+        let missing = local.replace("MyBangla.ttf}[Path=fonts/]", "NoSuchFont}");
+        let result = compile_project_at(&build.0, &root, "main.tex", &[buffer("main.tex", &missing)]).unwrap();
+        assert!(!result.ok);
+        assert_eq!(result.summary, "Font \"NoSuchFont\" not found");
+    }
+
+    /// A tested Bangla font installed for all users or the current user (e2e cases skip otherwise).
+    fn bangla_font_file() -> Option<PathBuf> {
+        let mut dirs = vec![PathBuf::from(r"C:\Windows\Fonts")];
+        if let Some(local) = env::var_os("LOCALAPPDATA") {
+            dirs.push(PathBuf::from(local).join(r"Microsoft\Windows\Fonts"));
+        }
+        dirs.iter()
+            .flat_map(|dir| ["kalpurush.ttf", "Siyamrupali.ttf"].map(|name| dir.join(name)))
+            .find(|path| path.is_file())
+    }
+
+    fn bangla_font_installed() -> bool {
+        bangla_font_file().is_some()
     }
 
     // ----- default folder -----

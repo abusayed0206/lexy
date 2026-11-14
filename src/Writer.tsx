@@ -57,7 +57,18 @@ type CompileState = {
   origin: Origin | null;
   /** An explicit (F5/Compile) run is in flight; only this disables the Compile button. */
   explicitBusy: boolean;
+  /** Engine of the last result (spec 005: Lexy may pick XeLaTeX on its own, so show it). */
+  engine: CompileResult["engine"] | null;
 };
+
+export const ENGINE_NAMES: Record<CompileResult["engine"], string> = { pdflatex: "pdfLaTeX", xelatex: "XeLaTeX", lualatex: "LuaLaTeX" };
+
+/** Status tooltip: "XeLaTeX · PDF ready", or the error summary after a failure. */
+export function statusDetail(state: CompileState): string | null {
+  const text = state.status === "error" ? state.summary : state.engine ? statusLabel(state) : null;
+  if (!text) return null;
+  return state.engine ? `${ENGINE_NAMES[state.engine]} · ${text}` : text;
+}
 
 type CompileEvent =
   | { type: "edit" }
@@ -72,6 +83,7 @@ const initialState: CompileState = {
   pdfPath: null,
   origin: null,
   explicitBusy: false,
+  engine: null,
 };
 
 export function compileReducer(state: CompileState, event: CompileEvent): CompileState {
@@ -92,6 +104,7 @@ export function compileReducer(state: CompileState, event: CompileEvent): Compil
         pdfPath: event.result.pdfPath,
         origin: event.origin,
         explicitBusy,
+        engine: event.result.engine,
       };
     }
   }
@@ -823,7 +836,7 @@ export function Writer({ project, onSwitch }: Props) {
           mainName: main,
           statusLabel: statusLabel(state),
           statusClass: state.status,
-          statusDetail: state.status === "error" ? state.summary : null,
+          statusDetail: statusDetail(state),
           compiling: state.explicitBusy,
           readOnly,
           logsOpen,

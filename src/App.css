@@ -1,6 +1,6 @@
 :root {
   --font-ui: "Segoe UI Variable Text", "Segoe UI", Inter, ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, ui-monospace, monospace;
+  --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, "Nirmala UI", "Segoe UI", "Microsoft YaHei", "Yu Gothic", "Malgun Gothic", ui-monospace, monospace;
 
   --bg: #f4f3ef;
   --surface: #fffdfa;

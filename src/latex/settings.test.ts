@@ -163,3 +163,16 @@ describe("conflicts", () => {
     expect(conflicts(applySettings(DOC, with_({ font: { kind: "system", family: "Georgia" } }))!)).toEqual([]);
   });
 });
+
+describe("applySettings with LaTeXbangla (spec 005, FR-009)", () => {
+  const BANGLA = "\\documentclass{article}\n\\usepackage{latexbangla}\n\\setbanglamainfont{Kalpurush}\n\\begin{document}\nবাংলা ও English\n\\end{document}\n";
+
+  it("sets only the English font and leaves the Bangla lines untouched", () => {
+    const updated = applySettings(BANGLA, with_({ font: { kind: "system", family: "Georgia" } }))!;
+    expect(updated).toContain("\\setmainfont{Georgia}");
+    expect(updated).toContain("\n\\usepackage{latexbangla}\n\\setbanglamainfont{Kalpurush}\n");
+    expect(updated).toContain("বাংলা ও English");
+    const back = applySettings(updated, with_({ font: { kind: "builtin", id: "latin-modern" } }))!;
+    expect(back).toContain("\\usepackage{latexbangla}\n\\setbanglamainfont{Kalpurush}\n");
+  });
+});

@@ -1,11 +1,42 @@
 import { useEffect, useImperativeHandle, useRef, type Ref } from "react";
 import { basicSetup } from "codemirror";
 import { EditorSelection, EditorState, Extension } from "@codemirror/state";
-import { EditorView } from "@codemirror/view";
+import { Decoration, EditorView, ViewPlugin, type DecorationSet, type ViewUpdate } from "@codemirror/view";
 import { HighlightStyle, StreamLanguage, syntaxHighlighting } from "@codemirror/language";
 import { stex } from "@codemirror/legacy-modes/mode/stex";
 import { tags } from "@lezer/highlight";
+import { indicKeys } from "./indicKeys";
 import type { Selection, TextEdit } from "./latex/format";
+
+/**
+ * `dir="auto"` on every visible line, so each line takes its direction from its first strong
+ * character (Arabic/Hebrew lines read right to left). perLineTextDirection only reads the
+ * direction; this sets it.
+ */
+const autoDirLine = Decoration.line({ attributes: { dir: "auto" } });
+const autoDirection = ViewPlugin.fromClass(
+  class {
+    decorations: DecorationSet;
+    constructor(view: EditorView) {
+      this.decorations = this.build(view);
+    }
+    update(update: ViewUpdate) {
+      if (update.docChanged || update.viewportChanged) this.decorations = this.build(update.view);
+    }
+    build(view: EditorView): DecorationSet {
+      const ranges = [];
+      for (const { from, to } of view.visibleRanges) {
+        for (let pos = from; pos <= to; ) {
+          const line = view.state.doc.lineAt(pos);
+          ranges.push(autoDirLine.range(line.from));
+          pos = line.to + 1;
+        }
+      }
+      return Decoration.set(ranges);
+    }
+  },
+  { decorations: (plugin) => plugin.decorations },
+);
 
 /** Ribbon actions edit the document only through this, so each is exactly one undo step. */
 export type EditorHandle = {
@@ -151,11 +182,15 @@ export function Editor({ value, onChange, label, handle }: Props) {
 
   useEffect(() => {
     extensions.current = [
+      indicKeys,
       basicSetup,
       StreamLanguage.define(stex),
       syntaxHighlighting(latexHighlight),
       lexyTheme,
       EditorView.lineWrapping,
+      // Arabic/Hebrew/Urdu lines read right to left; LaTeX-only lines stay left to right.
+      EditorView.perLineTextDirection.of(true),
+      autoDirection,
       EditorView.contentAttributes.of({ "aria-label": label, spellcheck: "false" }),
       EditorView.updateListener.of((update) => {
         if (update.docChanged) onChangeRef.current(update.state.doc.toString());
