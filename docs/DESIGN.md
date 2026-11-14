@@ -96,16 +96,46 @@ Do not build a broad preferences system until required.
 
 ## Keyboard Shortcuts
 
-Initial shortcuts:
+Shortcuts (projects since feature 004):
 
-- `Ctrl+N`: new file.
-- `Ctrl+O`: open file.
-- `Ctrl+S`: save.
-- `Ctrl+Shift+S`: save as.
-- `Ctrl+B` or `F5`: compile. Pick one before implementation and document it in tracker.
+- `Ctrl+N`: new file in the current folder (on Project Home: new project).
+- `Ctrl+O`: open folder as a project.
+- `Ctrl+S`: save all modified files in the project.
+- `Ctrl+Shift+S`: save the current file as another name inside the project.
+- `F5`: save all, then compile the main document (decided 2026-11-13; `Ctrl+B` is bold).
+- `Ctrl+B` / `Ctrl+I` / `Ctrl+U`: bold / italic / underline the selection (editor only).
 - `Ctrl+L`: toggle logs.
+- `Ctrl+Shift+E`: show or hide the file sidebar (`Ctrl+B` stays Bold).
 
 Shortcuts must not conflict with text editing expectations.
+
+## Ribbon (2026-11-13, feature 002)
+
+The compact command strip is replaced by a Word-style ribbon at the user's request (`specs/002-word-style-editor`). The LaTeX source stays visible; every ribbon action is a plain text edit.
+
+- Tabs: File (New project, Open folder…, Recent projects, Project Home, New file, Save, Save as; was New, Open, Save, Save as before feature 004), Home (Font, Size, Bold/Italic/Underline, Bullets, Numbering, Styles), Insert (Equation, Table, Page break, Footnote), Layout (Margins, Size, Orientation), View (Files, Live preview, Compile now, Logs).
+- File name, unsaved dot, status pill and Compile stay visible at the right of the tab row on every tab.
+- At ≥ 900 px wide buttons show labels; below that they are icon-only with tooltips; below 820 px group captions hide. Nothing wraps or overlaps at 800 px.
+- Shortcuts are a capture-phase handler so they beat CodeMirror's own bindings: Ctrl+L (select line) and Ctrl+I (select parent) are taken over by Lexy.
+- Document-wide font, size, paper and margins are written into one marked "Lexy settings" block after `\documentclass`; Lexy never edits other preamble lines.
+- Live preview recompiles about 1 s after typing stops, without saving. Live failures show "Preview failed" in the status; only F5/Compile failures open the log drawer.
+
+## Projects (2026-11-13, feature 004)
+
+Lexy works on folders, not single files (`specs/004-project-workspace`).
+
+- Start: Project Home lists folders in `Documents\Lexy` plus recently opened folders elsewhere (newest first, location shown for outside ones, "Missing" rows can be removed). The last open project reopens directly.
+- Writer layout: file sidebar | editor | PDF. Sidebar 220 px default, 160–400 px, resizable by drag or arrow keys, hidden with Ctrl+Shift+E or View → Files; it starts hidden below 900 px wide. Nothing overlaps at 800x600 with it open.
+- The sidebar is a tree (arrow keys, Enter, F2 rename, Delete, Shift+F10 menu). The current file is highlighted, the main document has a "Main" badge, unsaved files (and folders containing them) show the unsaved dot. Build clutter and dot-files are hidden unless "Show hidden files" is on.
+- Font, size and page settings always go to the main document, even when another file is shown.
+- One prompt lists every unsaved file on close, Project Home or project switch.
+
+## Bangla and other scripts (2026-11-14, feature 005)
+
+- No setup for Bangla: documents using LaTeXbangla (or fontspec, polyglossia…) compile with XeLaTeX automatically. The status tooltip names the engine ("XeLaTeX · PDF ready").
+- The editor shows every script with Windows' own fonts (Nirmala UI for Bangla/Devanagari, Segoe UI for Arabic/Hebrew, YaHei/Yu Gothic/Malgun Gothic for CJK). Right-to-left lines read right to left; LaTeX lines stay left to right.
+- Bangla editing follows Windows text boxes: Left/Right step over a whole conjunct ("ক্ষে" is one step); Backspace removes one code point (ক্ষ → ক্), so a typist can correct the last keystroke.
+- Errors name the cause in plain words: `Font "X" not found`, `Package "X" could not be found or installed (offline?)`.
 
 ## Accessibility And Responsiveness
 
@@ -138,4 +168,5 @@ Add manual design ideas below. Keep each note dated and move accepted work into 
 
 | Date | Author | Note | Decision |
 | --- | --- | --- | --- |
-| 2026-06-10 | Codex | Keep MVP as split editor/preview with a compact command strip. | Accepted |
+| 2026-06-10 | Codex | Keep MVP as split editor/preview with a compact command strip. | Superseded 2026-11-13 by the ribbon |
+| 2026-11-13 | User | Word-style ribbon with fonts, equations, tables, margins and live preview. | Accepted (feature 002) |
