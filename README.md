@@ -61,6 +61,66 @@ Some Rust tests run real compiles with MiKTeX, `latexmk` and Perl, and skip them
 
 Lexy is a [Tauri 2](https://tauri.app) app: a React 19 + TypeScript front end (CodeMirror 6 editor, pdf.js preview) and a Rust back end that owns everything that touches files or runs programs.
 
+```mermaid
+flowchart TB
+  subgraph UI["Front end · React (presentation only)"]
+    direction LR
+    Ribbon["Ribbon<br/>LaTeX edits from src/latex"]
+    Editor["Editor<br/>CodeMirror 6 · problem markers"]
+    Preview["PDF preview<br/>pdf.js · zoom kept"]
+    GitPanel["Git panel"]
+  end
+
+  subgraph Rust["Back end · Rust (owns files and processes)"]
+    direction LR
+    Gate["project.rs<br/>path gate"]
+    Compile["compile_project<br/>engine · snapshot · overlay"]
+    Sync["sync.rs<br/>SyncTeX · log → problems"]
+    Fonts["bangla.rs · kriti.rs<br/>Bangla fonts"]
+    Setup["setup.rs<br/>first-run install"]
+    GitRs["git.rs"]
+  end
+
+  subgraph Ext["Programs and services"]
+    direction LR
+    TeX["latexmk · MiKTeX<br/>pdfLaTeX / XeLaTeX · synctex"]
+    Net["kriti.app · MiKTeX / Perl<br/>downloads"]
+    GitExe["Git for Windows<br/>GitHub CLI"]
+  end
+
+  subgraph Disk["On disk"]
+    direction LR
+    Project[("Your project folder<br/>.tex · chapters · images · .bib · fonts/")]
+    Build[("Build folder in %LOCALAPPDATA%\Lexy<br/>snapshot · overlay · last good PDF")]
+  end
+
+  Ribbon -->|"one undo step"| Editor
+  Editor -->|"save"| Gate
+  Editor -->|"1 s after typing: text + unsaved files"| Compile
+  Editor -->|"Ctrl+J: file, line"| Sync
+  Preview -->|"double-click: page, x, y"| Sync
+  GitPanel -->|"git_* commands"| GitRs
+
+  Gate -->|"read / write (inside the project only)"| Project
+  Compile -->|"snapshot + overlay"| Build
+  Compile -->|"runs latexmk"| TeX
+  Sync -->|"synctex edit / view"| TeX
+  Fonts -->|"verified download"| Net
+  Setup -->|"pinned SHA-256"| Net
+  Fonts -->|"font files + notice"| Project
+  GitRs -->|"git / gh"| GitExe
+
+  TeX -->|"reads sources"| Project
+  TeX -->|"PDF · SyncTeX · log"| Build
+  GitExe -->|"history"| Project
+
+  Compile -.->|"result: PDF path, problems"| Preview
+  Build -.->|"read_pdf"| Preview
+  Project -.->|"file watcher"| Editor
+```
+
+*Solid arrows are requests and writes; dotted arrows bring results back to the screen. Every arrow out of the front end is a typed `invoke` command, so React never touches the disk or starts a process. Compiles read your project but write only into the build folder, where the last good PDF and its SyncTeX data are kept; a failed compile never overwrites them.*
+
 - **Compiling never touches your files.** The main document is written to a snapshot in `%LOCALAPPDATA%\Lexy\Build\…`, unsaved open files go into an overlay folder that TeX searches first, and everything else (chapters, images, `.bib`, fonts) is read straight from the project. `latexmk` runs with pdfLaTeX, or XeLaTeX when the document needs it (a `% !TEX program` line, packages like `fontspec`/`polyglossia`/`latexbangla`, or Bangla text). Every compile also writes SyncTeX data for the PDF ↔ source jumps.
 - **Paths are checked in one place.** Every file command takes a project-relative path and goes through one gate that refuses `..`, other drives, reserved names and links that lead out of the project.
 - **Downloads are verified.** Setup tools and BCC Purno are downloaded from fixed versions with pinned SHA-256 hashes. kriti.app catalog fonts come only from `https://kriti.app/fonts/…` and must be real font files.
