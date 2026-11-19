@@ -12,6 +12,7 @@ import {
   marginPresetOf,
   parseSettings,
   XELATEX_MARKER,
+  replacesPdflatexLine,
   type DocumentSettings,
 } from "./settings";
 
@@ -68,6 +69,31 @@ describe("applySettings — golden examples (contracts/settings-block.md)", () =
     expect(back.startsWith("\\documentclass")).toBe(true);
     expect(back).not.toContain("fontspec");
     expect(back).not.toContain(XELATEX_MARKER);
+  });
+
+  it("leaves engine lines chosen in the Engine menu alone (spec 008)", () => {
+    const lua = `% !TEX TS-program = lualatex\n${DOC}`;
+    const georgia = applySettings(lua, with_({ font: { kind: "system", family: "Georgia" } }))!;
+    expect(georgia.split("\n")[0]).toBe("% !TEX TS-program = lualatex");
+    expect(georgia).not.toContain(XELATEX_MARKER);
+    expect(applySettings(georgia, DEFAULT_SETTINGS)!.split("\n")[0]).toBe("% !TEX TS-program = lualatex");
+  });
+
+  it("replaces an explicit pdfLaTeX line when the font needs XeLaTeX, and says so", () => {
+    const pdf = `% !TEX TS-program = pdflatex\n${DOC}`;
+    const georgia = with_({ font: { kind: "system", family: "Georgia" } });
+    expect(replacesPdflatexLine(pdf, georgia)).toBe(true);
+    expect(replacesPdflatexLine(DOC, georgia)).toBe(false);
+    const out = applySettings(pdf, georgia)!;
+    expect(out.split("\n")[0]).toBe(XELATEX_MARKER);
+    expect(out.match(/!TEX/g)).toHaveLength(1);
+  });
+
+  it("removes Lexy's marker even when it is not on line 1", () => {
+    const text = `% my note\n${XELATEX_MARKER}\n${DOC}`;
+    const out = applySettings(applySettings(text, with_({ font: { kind: "system", family: "Georgia" } }))!, DEFAULT_SETTINGS)!;
+    expect(out).not.toContain(XELATEX_MARKER);
+    expect(out.startsWith("% my note\n")).toBe(true);
   });
 
   it("keeps other class options and replaces only the size", () => {

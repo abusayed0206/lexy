@@ -2,7 +2,28 @@
 
 **A calm, Word-like LaTeX writer for Windows.** Lexy installs the TeX tools it needs, compiles while you type, and keeps your projects as plain folders that also work in TeXstudio, VS Code or Overleaf.
 
-> Status: early development (v0.1.0). There are no release builds yet; run it from source (below).
+> [!IMPORTANT]
+> **I won't work on this project anymore.** Building Lexy with Claude ate my whole context budget, so this is where I stop. If you want to take it further, fork it and carry on yourself, or gift me a Claude plan and I might come back 😂😂😂
+> Everything you need to continue is written down: [`docs/ROADMAP.md`](docs/ROADMAP.md) (unfinished work, release blockers, optimizations) and [`CLAUDE.md`](CLAUDE.md) (an architecture map).
+
+> **Status: alpha (v0.1.0-alpha.1).** Feature-complete for its first eight specs and covered by automated tests, but hardly anyone has tried it in a real window or on a fresh PC yet. Expect rough edges.
+
+## Try the alpha
+
+For enthusiasts who want to poke at it:
+
+1. Download the installer from [**Releases → v0.1.0-alpha.1**](https://github.com/abusayed0206/lexy/releases/tag/v0.1.0-alpha.1): `Lexy_0.1.0_x64-setup.exe` (NSIS, per-user) or `Lexy_0.1.0_x64_en-US.msi`.
+2. The installer is **not code-signed**, so Windows SmartScreen will warn you. Choose **More info → Run anyway** if you trust this repository.
+3. On first start, Lexy offers to install MiKTeX and a portable Strawberry Perl (per user, no admin, with visible progress). This needs an internet connection and a few hundred MB.
+4. Create a project from a template and start typing. The PDF updates as you write.
+
+Known limits of this alpha:
+- Windows 10/11 x64 only.
+- The MiKTeX setup download is not hash-pinned yet.
+- No auto-update.
+- Several features were only tested automatically, never by hand (see the roadmap).
+
+Bug reports are welcome as GitHub issues, but nobody is actively fixing them right now.
 
 ## Highlights
 
@@ -14,13 +35,24 @@
 - **Bangla and other scripts.** Bangla text compiles even without any font setup: Lexy picks XeLaTeX and a Bangla-capable font automatically, with correct conjuncts. One click adds **BCC Purno** to the project so it compiles anywhere. The font menu lists the whole free **[kriti.app](https://kriti.app)** Bangla catalog (each font is copied into the project). The editor shows Bangla in a bundled font, with Windows-like cursor movement over conjuncts, and right-to-left lines read correctly.
 - **Version history with Git.** Start history, commit, see line-by-line changes, browse and restore old versions, publish to GitHub, push, pull and resolve conflicts. Lexy uses your Git for Windows; sign-in goes through Git's own credential manager and never through Lexy.
 - **Zero-setup TeX.** On first run Lexy installs MiKTeX (per user, no admin) and a portable Strawberry Perl for `latexmk`, with visible progress. Missing LaTeX packages are installed on the fly during a compile.
-- **Light and dark themes**, keyboard shortcuts for everything, and a layout that works at 800×600.
+- **Writing aids.** Suggestions for commands, labels, citations and environments; `\begin` closes itself; offline spell check; optional grammar check (LanguageTool); word count; math preview on hover; one-key tidy.
+- **Navigation.** Outline, editor tabs, folding, a command palette (Ctrl+Shift+P), find and replace across the project, focus mode and optional Vim keys.
+- **Content and review.** Citation picker and "Add by DOI", images by drag-and-drop, a template gallery, notes on text (with a "PDF with notes" export), and word-level comparison with an earlier version.
+- **Safety.** Unsaved text survives a crash (it is offered back when you reopen the project), a Stop button for a stuck compile (Shift+F5), local snapshots for projects without Git, and optional auto-save.
+- **Control.** Pick the TeX engine (Automatic, pdfLaTeX, XeLaTeX, LuaLaTeX) from the ribbon, find text in the PDF preview (Ctrl+F), and export to Word or HTML (Pandoc is downloaded only with your consent).
+- **Light and dark themes**, Windows contrast themes, keyboard shortcuts for everything, and a layout that works at 800×600.
 
 ## Keyboard shortcuts
 
 | Action | Keys |
 |---|---|
-| Compile now | F5 |
+| Compile now / Stop compile | F5 / Shift+F5 |
+| Command palette | Ctrl+Shift+P |
+| Find in the PDF (preview focused) | Ctrl+F, then Enter / Shift+Enter, Esc |
+| Find and replace in the project | Ctrl+Shift+F |
+| Check grammar | F7 |
+| New note on the selection | Ctrl+Alt+M |
+| Focus mode / Settings | F11 / Ctrl+, |
 | Save all / Save as | Ctrl+S / Ctrl+Shift+S |
 | New file / Open folder | Ctrl+N / Ctrl+O |
 | Bold / Italic / Underline | Ctrl+B / Ctrl+I / Ctrl+U |
@@ -63,63 +95,112 @@ Lexy is a [Tauri 2](https://tauri.app) app: a React 19 + TypeScript front end (C
 
 ```mermaid
 flowchart TB
-  subgraph UI["Front end · React (presentation only)"]
-    direction LR
-    Ribbon["Ribbon<br/>LaTeX edits from src/latex"]
-    Editor["Editor<br/>CodeMirror 6 · problem markers"]
-    Preview["PDF preview<br/>pdf.js · zoom kept"]
-    GitPanel["Git panel"]
+  subgraph UI["Front end · React 19 + TypeScript (presentation only)"]
+    direction TB
+    subgraph Shell["Screens"]
+      direction LR
+      App["App.tsx<br/>check → setup → project"]
+      SetupScreen["SetupScreen<br/>first-run install"]
+      Home["ProjectHome<br/>templates · recent"]
+    end
+    subgraph WriterBox["Writer.tsx (one project)"]
+      direction LR
+      Ribbon["Ribbon<br/>File · Home · Insert · Layout<br/>Review · View · Git"]
+      Side["Side panel<br/>Files · Outline · Search · Notes"]
+      Editor["Editor<br/>CodeMirror 6 · tabs · aids"]
+      Preview["PdfView<br/>pdf.js · zoom · find"]
+      Panels["Git panel · Problems/Log drawer<br/>Settings · palette · dialogs"]
+    end
+    subgraph Pure["Pure TypeScript (unit-tested)"]
+      direction LR
+      Latex["src/latex/*<br/>format · tables · equations · settings<br/>engine · index · completions · search<br/>citations · notes · wordDiff · tidy"]
+      Sched["Schedulers<br/>livePreview.ts (1 s)<br/>recovery.ts (2 s / 10 s)"]
+      Find["pdfView/find.ts<br/>pdfView/zoom.ts"]
+    end
   end
 
-  subgraph Rust["Back end · Rust (owns files and processes)"]
-    direction LR
-    Gate["project.rs<br/>path gate"]
-    Compile["compile_project<br/>engine · snapshot · overlay"]
-    Sync["sync.rs<br/>SyncTeX · log → problems"]
-    Fonts["bangla.rs · kriti.rs<br/>Bangla fonts"]
-    Setup["setup.rs<br/>first-run install"]
-    GitRs["git.rs"]
+  subgraph Rust["Back end · Rust / Tauri 2 (owns files and processes)"]
+    direction TB
+    subgraph Core["Project and compile"]
+      direction LR
+      ProjectRs["project.rs<br/>path gate · file commands<br/>watcher · lock · snapshots"]
+      CompileRs["lib.rs<br/>compile_project · engine choice<br/>CompileLock · CompileCancel"]
+      SyncRs["sync.rs<br/>SyncTeX · log → problems"]
+      RecoveryRs["recovery.rs<br/>unsaved-text copies"]
+    end
+    subgraph Extras["Writing and services"]
+      direction LR
+      SpellRs["spell.rs<br/>Hunspell en_US"]
+      WebRs["web.rs<br/>LanguageTool · doi.org"]
+      ExportRs["export.rs<br/>Pandoc"]
+      FontsRs["bangla.rs · kriti.rs<br/>Bangla fonts"]
+      GitRs["git.rs<br/>git · gh"]
+      SettingsRs["settings.rs"]
+      SetupRs["setup.rs<br/>MiKTeX · Perl install"]
+    end
   end
 
-  subgraph Ext["Programs and services"]
+  subgraph Ext["Programs and online services"]
     direction LR
-    TeX["latexmk · MiKTeX<br/>pdfLaTeX / XeLaTeX · synctex"]
-    Net["kriti.app · MiKTeX / Perl<br/>downloads"]
+    TeX["latexmk · MiKTeX<br/>pdfLaTeX / XeLaTeX / LuaLaTeX<br/>synctex.exe"]
+    Perl["Strawberry Perl<br/>(runs latexmk)"]
     GitExe["Git for Windows<br/>GitHub CLI"]
+    Pandoc["Pandoc 3.13<br/>(on consent)"]
+    Online["kriti.app · doi.org<br/>LanguageTool (opt-in)<br/>MiKTeX / Perl downloads"]
   end
 
   subgraph Disk["On disk"]
     direction LR
-    Project[("Your project folder<br/>.tex · chapters · images · .bib · fonts/")]
-    Build[("Build folder in %LOCALAPPDATA%\Lexy<br/>snapshot · overlay · last good PDF")]
+    Project[("Your project folder<br/>.tex · chapters · images · .bib<br/>fonts/ · .lexy/notes.json")]
+    Data[("%LOCALAPPDATA%\Lexy<br/>Build · Recovery · Snapshots<br/>Setup · Tools · Fonts · Locks<br/>settings.json · projects.json")]
   end
 
-  Ribbon -->|"one undo step"| Editor
-  Editor -->|"save"| Gate
-  Editor -->|"1 s after typing: text + unsaved files"| Compile
-  Editor -->|"Ctrl+J: file, line"| Sync
-  Preview -->|"double-click: page, x, y"| Sync
-  GitPanel -->|"git_* commands"| GitRs
+  App --> SetupScreen & Home & WriterBox
+  Ribbon -->|"pure edit → one undo step"| Latex
+  Latex --> Editor
+  Editor -->|"text changes"| Sched
+  Sched -->|"compile_project(main, unsaved buffers)"| CompileRs
+  Sched -->|"recovery_save"| RecoveryRs
+  Editor -->|"read_file / write_file (Save)"| ProjectRs
+  Editor -->|"Ctrl+J"| SyncRs
+  Preview -->|"double-click"| SyncRs
+  Preview --> Find
+  Panels -->|"git_*"| GitRs
+  Panels -->|"get/set_settings"| SettingsRs
+  Editor -->|"spell / grammar / DOI"| SpellRs & WebRs
+  Panels -->|"export_document"| ExportRs
+  SetupScreen -->|"start_initial_setup"| SetupRs
 
-  Gate -->|"read / write (inside the project only)"| Project
-  Compile -->|"snapshot + overlay"| Build
-  Compile -->|"runs latexmk"| TeX
-  Sync -->|"synctex edit / view"| TeX
-  Fonts -->|"verified download"| Net
-  Setup -->|"pinned SHA-256"| Net
-  Fonts -->|"font files + notice"| Project
-  GitRs -->|"git / gh"| GitExe
-
+  ProjectRs -->|"inside the project only"| Project
+  ProjectRs -->|"snapshots"| Data
+  RecoveryRs -->|"atomic JSON copies"| Data
+  CompileRs -->|"snapshot + overlay"| Data
+  CompileRs -->|"runs, can be stopped"| TeX
+  TeX --- Perl
   TeX -->|"reads sources"| Project
-  TeX -->|"PDF · SyncTeX · log"| Build
+  TeX -->|"PDF · SyncTeX · log"| Data
+  SyncRs --> TeX
+  GitRs --> GitExe
   GitExe -->|"history"| Project
+  ExportRs --> Pandoc
+  Pandoc -->|".docx / .html beside the document"| Project
+  FontsRs -->|"verified downloads"| Online
+  FontsRs -->|"font files + notice"| Project
+  WebRs --> Online
+  SetupRs -->|"pinned SHA-256 (Perl)"| Online
+  SetupRs -->|"installs"| TeX & Perl
 
-  Compile -.->|"result: PDF path, problems"| Preview
-  Build -.->|"read_pdf"| Preview
-  Project -.->|"file watcher"| Editor
+  CompileRs -.->|"result: PDF path, problems, engine"| Preview
+  Data -.->|"read_pdf (build folder only)"| Preview
+  Project -.->|"project-changed events"| Editor
+  RecoveryRs -.->|"recovery_list on reopen"| Editor
 ```
 
-*Solid arrows are requests and writes; dotted arrows bring results back to the screen. Every arrow out of the front end is a typed `invoke` command, so React never touches the disk or starts a process. Compiles read your project but write only into the build folder, where the last good PDF and its SyncTeX data are kept; a failed compile never overwrites them.*
+*Solid arrows are requests and writes; dotted arrows bring results back to the screen. React only presents: every arrow out of the front end is a typed `invoke` command. Rust owns the disk, the processes and the network, and it writes into your project only for Save, fonts you add, exports you ask for and notes.*
+
+**What happens when you type:** the editor keeps your text in memory. A second after you pause, `livePreview.ts` asks Rust to compile the main document plus every unsaved file. Rust writes those into the build folder (never your project), runs `latexmk`, keeps the last good PDF and its SyncTeX data, and returns problems that show inline. Two seconds after you pause, `recovery.ts` also stores your unsaved text under `%LOCALAPPDATA%\Lexy\Recovery`, so a crash loses nothing. Stop (Shift+F5) kills the whole latexmk process tree.
+
+*Compiles read your project but write only into the build folder, where the last good PDF and its SyncTeX data are kept; a failed compile never overwrites them.*
 
 - **Compiling never touches your files.** The main document is written to a snapshot in `%LOCALAPPDATA%\Lexy\Build\…`, unsaved open files go into an overlay folder that TeX searches first, and everything else (chapters, images, `.bib`, fonts) is read straight from the project. `latexmk` runs with pdfLaTeX, or XeLaTeX when the document needs it (a `% !TEX program` line, packages like `fontspec`/`polyglossia`/`latexbangla`, or Bangla text). Every compile also writes SyncTeX data for the PDF ↔ source jumps.
 - **Paths are checked in one place.** Every file command takes a project-relative path and goes through one gate that refuses `..`, other drives, reserved names and links that lead out of the project.
@@ -131,12 +212,13 @@ More detail lives in the docs:
 - [`docs/DESIGN.md`](docs/DESIGN.md): UI rules
 - [`docs/SETUP.md`](docs/SETUP.md): how the first-run install works
 - [`docs/TRACKER.md`](docs/TRACKER.md): feature status, decisions and test runs
+- [`docs/ROADMAP.md`](docs/ROADMAP.md): what's unfinished, release blockers, optimizations (start here if you continue the project)
 - [`specs/`](specs/): one folder per feature (spec, plan, research, tasks)
 - [`CLAUDE.md`](CLAUDE.md): a compact architecture guide for contributors and coding agents
 
 ## Contributing
 
-Ideas go into the "Manual Feature Intake" table in `docs/TRACKER.md` first. Each feature gets a spec under `specs/`, and `docs/TRACKER.md` is updated in the same change that implements it. Run the three test commands above before sending a change.
+The original author no longer works on Lexy; forks are the way forward. [`docs/ROADMAP.md`](docs/ROADMAP.md) lists what to do next. Ideas go into the "Manual Feature Intake" table in `docs/TRACKER.md` first. Each feature gets a spec under `specs/`, and `docs/TRACKER.md` is updated in the same change that implements it. Run the three test commands above before sending a change.
 
 ## Fonts and third-party notices
 

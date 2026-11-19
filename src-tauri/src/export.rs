@@ -118,7 +118,7 @@ pub fn export_at(pandoc: &Path, root: &Path, main: &str, format: &str) -> Result
     let plain = |path: &Path| PathBuf::from(project::display_path(path));
     let mut command = Command::new(pandoc);
     command.args(export_args(&plain(&main_path), &plain(&out), format, &plain(root), cites)).current_dir(plain(root));
-    let output = run_with_timeout(command, EXPORT_TIMEOUT).map_err(|error| ProjectError::new(ErrorKind::Io, error))?;
+    let output = run_with_timeout(command, EXPORT_TIMEOUT, &|| false).map_err(|error| ProjectError::new(ErrorKind::Io, error))?;
     if output.timed_out {
         return Err(ProjectError::new(ErrorKind::Io, "The export took longer than 2 minutes and was stopped."));
     }

@@ -14,10 +14,11 @@ type Props = {
   items?: MenuItem[];
   /** Custom popup content (e.g. the table grid); rendered above the items. */
   children?: (close: () => void) => ReactNode;
+  disabled?: boolean;
 };
 
 /** A ribbon button that opens a menu (WAI-ARIA menu button pattern). */
-export function MenuButton({ label, icon, items = [], children }: Props) {
+export function MenuButton({ label, icon, items = [], children, disabled }: Props) {
   const [open, setOpen] = useState(false);
   const button = useRef<HTMLButtonElement>(null);
   const popup = useRef<HTMLDivElement>(null);
@@ -69,6 +70,7 @@ export function MenuButton({ label, icon, items = [], children }: Props) {
         aria-expanded={open}
         aria-controls={open ? id : undefined}
         title={label}
+        disabled={disabled}
         onClick={() => setOpen((value) => !value)}
         onKeyDown={(event) => {
           if (event.key === "ArrowDown") {

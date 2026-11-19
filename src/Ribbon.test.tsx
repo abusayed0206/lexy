@@ -14,6 +14,8 @@ vi.mock("./latex/fonts", async (importOriginal) => ({
 function makeActions(): RibbonActions {
   return {
     onNew: vi.fn(),
+    onStop: vi.fn(),
+    onEngine: vi.fn(),
     onNewProject: vi.fn(),
     onOpen: vi.fn(),
     onHome: vi.fn(),
@@ -321,5 +323,16 @@ describe("Ribbon panels", () => {
       }
       expect(within(panel).getAllByRole("group").length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("Stop compile (spec 008)", () => {
+  it("is offered only while a compile runs", async () => {
+    const first = setup({ stoppable: false });
+    expect(screen.queryByRole("button", { name: "Stop compile (Shift+F5)" })).toBeNull();
+    first.unmount();
+    const { user, actions } = setup({ stoppable: true });
+    await user.click(screen.getByRole("button", { name: "Stop compile (Shift+F5)" }));
+    expect(actions.onStop).toHaveBeenCalled();
   });
 });

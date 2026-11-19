@@ -55,6 +55,7 @@ function backend({ environment = [readyEnv], lastOpen = null as string | null } 
       case "list_projects":
         return [];
       case "list_dir":
+      case "recovery_list":
         return [];
       case "default_document_folder":
         return { path: "C:\\Docs\\Lexy", fallback: false };

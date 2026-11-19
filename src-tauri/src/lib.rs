@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
     thread::{self, JoinHandle},
@@ -24,6 +24,7 @@ mod setup;
 mod sync;
 mod spell;
 mod web;
+mod recovery;
 mod snapshots;
 mod settings;
 mod export;
@@ -375,12 +376,53 @@ struct CompileResult {
     problems: Vec<sync::Problem>,
     /// Set when Lexy added a font to the compile copy because Bangla text had none.
     auto_font: Option<String>,
+    /// The run was ended by `cancel_compile` (spec 008 US2); not set by the timeout.
+    #[serde(default)]
+    stopped: bool,
+    /// Why `engine` was used: "marker", a package or class name, "default", or the Bangla sentence.
+    engine_reason: String,
     /// Where `pdf_path` and its SyncTeX data live, for the lookups (spec 003).
     #[serde(skip)]
     shown: Option<sync::Shown>,
     /// MiKTeX's bin folder (where `synctex.exe` lives).
     #[serde(skip)]
     tools_dir: Option<PathBuf>,
+}
+
+/// Cancel epoch for compiles (spec 008 research R1): a compile remembers the value when it is
+/// requested and stops once `cancel_compile` has moved it on, so a press never affects later compiles.
+#[derive(Default)]
+struct CompileCancel(Arc<AtomicU64>);
+
+impl CompileCancel {
+    /// A check for one compile requested now.
+    fn token(&self) -> impl Fn() -> bool + Send + 'static {
+        let epoch = Arc::clone(&self.0);
+        let start = epoch.load(Ordering::SeqCst);
+        move || epoch.load(Ordering::SeqCst) != start
+    }
+}
+
+#[tauri::command]
+fn cancel_compile(cancel: State<'_, CompileCancel>) {
+    cancel.0.fetch_add(1, Ordering::SeqCst);
+}
+
+/// The result of a compile ended by `cancel_compile`.
+fn stopped_result(engine: Engine) -> CompileResult {
+    CompileResult {
+        ok: false,
+        summary: "Compile stopped".into(),
+        log: "Compile stopped by the user.".into(),
+        pdf_path: None,
+        engine,
+        problems: Vec::new(),
+        auto_font: None,
+        stopped: true,
+        engine_reason: String::new(),
+        shown: None,
+        tools_dir: None,
+    }
 }
 
 /// One compile at a time per process: live and explicit compiles share build folders.
@@ -573,9 +615,12 @@ async fn compile_project(
     main: String,
     buffers: Vec<Buffer>,
     lock: State<'_, CompileLock>,
+    cancel: State<'_, CompileCancel>,
     project: State<'_, project::ProjectState>,
     sync_state: State<'_, sync::SyncState>,
 ) -> Result<CompileResult, project::ProjectError> {
+    // Taken before waiting for the lock, so Stop also drops compiles queued behind the running one.
+    let cancelled = cancel.token();
     let root = project.with(|open| {
         let expected = open.main.as_deref().unwrap_or_default();
         if !expected.replace('/', "\\").eq_ignore_ascii_case(&main.replace('/', "\\")) {
@@ -586,7 +631,10 @@ async fn compile_project(
     let lock = Arc::clone(&lock.0);
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        compile_project_at(&build_root()?, &root, &main, &buffers)
+        if cancelled() {
+            return Ok(stopped_result(Engine::Pdflatex));
+        }
+        compile_project_cancellable(&build_root()?, &root, &main, &buffers, &cancelled)
     })
     .await
     .map_err(|error| format!("compile task failed: {error}"))?;
@@ -600,9 +648,17 @@ async fn compile_project(
 /// Review → Export PDF with notes (spec 007 US4): `buffers` already carry the `\todo{}` notes.
 /// Compiled in its own build root, so the preview and its SyncTeX data are never touched;
 /// the PDF is saved as `<stem> (notes).pdf` beside the main document. Returns that file name.
+#[cfg(test)]
 fn export_pdf_with_notes_at(build_root: &Path, root: &Path, main: &str, buffers: &[Buffer]) -> Result<String, project::ProjectError> {
+    export_pdf_with_notes_cancellable(build_root, root, main, buffers, &|| false)
+}
+
+fn export_pdf_with_notes_cancellable(build_root: &Path, root: &Path, main: &str, buffers: &[Buffer], cancelled: &dyn Fn() -> bool) -> Result<String, project::ProjectError> {
     use project::{ErrorKind, ProjectError};
-    let result = compile_project_at(&build_root.join("Notes"), root, main, buffers)?;
+    let result = compile_project_cancellable(&build_root.join("Notes"), root, main, buffers, cancelled)?;
+    if result.stopped {
+        return Err(ProjectError::new(ErrorKind::Io, "The PDF with notes was not made: the compile was stopped."));
+    }
     let pdf = match (&result.pdf_path, result.ok) {
         (Some(pdf), true) => PathBuf::from(pdf),
         _ => return Err(ProjectError::new(ErrorKind::Io, format!("The PDF with notes didn't compile. {}", result.summary))),
@@ -620,8 +676,10 @@ async fn export_pdf_with_notes(
     main: String,
     buffers: Vec<Buffer>,
     lock: State<'_, CompileLock>,
+    cancel: State<'_, CompileCancel>,
     project: State<'_, project::ProjectState>,
 ) -> Result<String, project::ProjectError> {
+    let cancelled = cancel.token();
     let root = project.with(|open| {
         if open.read_only {
             return Err(project::ProjectError::new(project::ErrorKind::ReadOnly, "this project is open in another Lexy window"));
@@ -631,7 +689,7 @@ async fn export_pdf_with_notes(
     let lock = Arc::clone(&lock.0);
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        export_pdf_with_notes_at(&build_root()?, &root, &main, &buffers)
+        export_pdf_with_notes_cancellable(&build_root()?, &root, &main, &buffers, &cancelled)
     })
     .await
     .map_err(|error| format!("export task failed: {error}"))?
@@ -650,7 +708,13 @@ const OVERLAY: &str = ".lexy-overlay";
 /// the main text is written as a snapshot into the build folder, unsaved open files go into
 /// an overlay folder that TeX searches before the project, and saved files and images are
 /// read straight from the project folder.
+#[cfg(test)]
 fn compile_project_at(build_root: &Path, root: &Path, main: &str, buffers: &[Buffer]) -> Result<CompileResult, project::ProjectError> {
+    compile_project_cancellable(build_root, root, main, buffers, &|| false)
+}
+
+/// `compile_project_at` that stops when `cancelled` returns true (spec 008 US2).
+fn compile_project_cancellable(build_root: &Path, root: &Path, main: &str, buffers: &[Buffer], cancelled: &dyn Fn() -> bool) -> Result<CompileResult, project::ProjectError> {
     use project::{resolve_in_project, ErrorKind, ProjectError};
     let main_path = resolve_in_project(root, main)?;
     let is_tex = main_path.extension().and_then(OsStr::to_str).is_some_and(|ext| ext.eq_ignore_ascii_case("tex"));
@@ -748,7 +812,13 @@ fn compile_project_at(build_root: &Path, root: &Path, main: &str, buffers: &[Buf
     let (tex_root, note) = tex_project_path(&out_dir, &plain_root);
     let search_path = env::join_paths([overlay, tex_root.clone(), PathBuf::new()])
         .map_err(|error| format!("failed to build TEXINPUTS: {error}"))?;
-    let mut result = run_latexmk(&out_dir, &stem, engine, &reason, &search_path)?;
+    let mut result = run_latexmk(&out_dir, &stem, engine, &reason, &search_path, cancelled)?;
+    if result.stopped {
+        // Half-written output must not be reused; the shown PDF (.lexy-shown) stays as it was.
+        let _ = fs::remove_file(out_dir.join(format!("{stem}.fdb_latexmk")));
+        let _ = fs::remove_file(out_dir.join(format!("{stem}.pdf")));
+        return Ok(result);
+    }
     if let Some(note) = note {
         result.log = format!("{note}\n{}", result.log);
     }
@@ -799,13 +869,14 @@ fn mirror_folders(source: &Path, target: &Path) {
 
 /// Run latexmk on `<out_dir>\<stem>.tex`; `search_path` (ASCII only) is used for TeX inputs,
 /// bibliographies and font files. The log starts with the engine and why it was chosen.
-fn run_latexmk(out_dir: &Path, stem: &str, engine: Engine, reason: &str, search_path: &std::ffi::OsStr) -> Result<CompileResult, String> {
-    let mut result = run_latexmk_inner(out_dir, stem, engine, search_path)?;
+fn run_latexmk(out_dir: &Path, stem: &str, engine: Engine, reason: &str, search_path: &std::ffi::OsStr, cancelled: &dyn Fn() -> bool) -> Result<CompileResult, String> {
+    let mut result = run_latexmk_inner(out_dir, stem, engine, search_path, cancelled)?;
+    result.engine_reason = reason.to_string();
     result.log = format!("Engine: {} ({reason})\n\n{}", engine.display_name(), result.log);
     Ok(result)
 }
 
-fn run_latexmk_inner(out_dir: &Path, stem: &str, engine: Engine, inputs: &std::ffi::OsStr) -> Result<CompileResult, String> {
+fn run_latexmk_inner(out_dir: &Path, stem: &str, engine: Engine, inputs: &std::ffi::OsStr, cancelled: &dyn Fn() -> bool) -> Result<CompileResult, String> {
     // Always revalidate tool paths before compiling (docs/PLAN.md).
     let environment = detect_environment();
     if !environment.ready {
@@ -822,6 +893,8 @@ fn run_latexmk_inner(out_dir: &Path, stem: &str, engine: Engine, inputs: &std::f
             engine,
             problems: Vec::new(),
             auto_font: None,
+            stopped: false,
+            engine_reason: String::new(),
             shown: None,
             tools_dir: None,
         });
@@ -857,7 +930,10 @@ fn run_latexmk_inner(out_dir: &Path, stem: &str, engine: Engine, inputs: &std::f
         // Font files in the project, by name or project-relative Path= (research R3).
         .env("TTFONTS", inputs)
         .env("OPENTYPEFONTS", inputs);
-    let output = run_with_timeout(command, COMPILE_TIMEOUT)?;
+    let output = run_with_timeout(command, COMPILE_TIMEOUT, cancelled)?;
+    if output.stopped {
+        return Ok(stopped_result(engine));
+    }
 
     let pdf = out_dir.join(format!("{stem}.pdf"));
     let tex_log = fs::read(out_dir.join(format!("{stem}.log")))
@@ -887,6 +963,8 @@ fn run_latexmk_inner(out_dir: &Path, stem: &str, engine: Engine, inputs: &std::f
         engine,
         problems: Vec::new(),
         auto_font: None,
+        stopped: false,
+        engine_reason: String::new(),
         shown: None,
         tools_dir: environment.miktex.path.as_deref().and_then(|path| Path::new(path).parent()).map(Path::to_path_buf),
     })
@@ -1087,9 +1165,13 @@ pub(crate) struct ProcessOutput {
     pub(crate) stdout: String,
     pub(crate) stderr: String,
     pub(crate) timed_out: bool,
+    /// Ended because `cancelled` returned true (spec 008 US2).
+    pub(crate) stopped: bool,
 }
 
-pub(crate) fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<ProcessOutput, String> {
+/// Run a process with a deadline; `cancelled` is polled every 50 ms and, when it returns true,
+/// the process tree is killed (spec 008 research R1). Callers that can't be cancelled pass `&|| false`.
+pub(crate) fn run_with_timeout(mut command: Command, timeout: Duration, cancelled: &dyn Fn() -> bool) -> Result<ProcessOutput, String> {
     let mut child = hide_console(&mut command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1101,13 +1183,17 @@ pub(crate) fn run_with_timeout(mut command: Command, timeout: Duration) -> Resul
     let stderr = child.stderr.take().map(read_to_end_in_background);
 
     let deadline = Instant::now() + timeout;
-    let (status, timed_out) = loop {
+    let (status, timed_out, stopped) = loop {
         if let Some(status) = child.try_wait().map_err(|error| format!("failed to wait for process: {error}"))? {
-            break (Some(status), false);
+            break (Some(status), false, false);
+        }
+        if cancelled() {
+            kill_tree(&mut child);
+            break (child.wait().ok(), false, true);
         }
         if Instant::now() >= deadline {
             kill_tree(&mut child);
-            break (child.wait().ok(), true);
+            break (child.wait().ok(), true, false);
         }
         thread::sleep(Duration::from_millis(50));
     };
@@ -1119,11 +1205,12 @@ pub(crate) fn run_with_timeout(mut command: Command, timeout: Duration) -> Resul
             .unwrap_or_default()
     };
     Ok(ProcessOutput {
-        success: !timed_out && status.is_some_and(|status| status.success()),
+        success: !timed_out && !stopped && status.is_some_and(|status| status.success()),
         code: status.and_then(|status| status.code()),
         stdout: collect(stdout),
         stderr: collect(stderr),
         timed_out,
+        stopped,
     })
 }
 
@@ -1156,6 +1243,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(CompileLock(Arc::new(Mutex::new(()))))
+        .manage(CompileCancel::default())
         .manage(FontCache(Arc::new(OnceLock::new())))
         .manage(SetupGuard(Arc::new(AtomicBool::new(false))))
         .manage(project::ProjectState::default())
@@ -1224,7 +1312,11 @@ pub fn run() {
             sync::sync_to_pdf,
             bangla::install_bangla_font,
             kriti::kriti_fonts,
-            kriti::install_kriti_font
+            kriti::install_kriti_font,
+            recovery::recovery_save,
+            recovery::recovery_list,
+            recovery::recovery_discard,
+            cancel_compile
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1575,6 +1667,7 @@ mod tests {
             stdout: "Rc files read\n".into(),
             stderr: "  \n".into(),
             timed_out: false,
+            stopped: false,
         };
         let log = compose_log(&output, "! Undefined control sequence.");
         assert_eq!(log, "--- latexmk ---\nRc files read\n\n--- LaTeX log ---\n! Undefined control sequence.");
@@ -1582,7 +1675,7 @@ mod tests {
 
     #[test]
     fn compose_log_says_no_output_when_everything_is_empty() {
-        let output = ProcessOutput { success: true, code: Some(0), stdout: String::new(), stderr: String::new(), timed_out: false };
+        let output = ProcessOutput { success: true, code: Some(0), stdout: String::new(), stderr: String::new(), timed_out: false, stopped: false };
         assert_eq!(compose_log(&output, ""), "No output.");
     }
 
@@ -1670,7 +1763,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn run_with_timeout_captures_stdout_stderr_and_exit_code() {
-        let output = run_with_timeout(cmd(&["/C", "echo out & echo err 1>&2 & exit 4"]), Duration::from_secs(20)).unwrap();
+        let output = run_with_timeout(cmd(&["/C", "echo out & echo err 1>&2 & exit 4"]), Duration::from_secs(20), &|| false).unwrap();
         assert!(!output.success);
         assert_eq!(output.code, Some(4));
         assert!(output.stdout.contains("out"));
@@ -1683,15 +1776,85 @@ mod tests {
     fn run_with_timeout_kills_the_whole_process_tree() {
         let started = Instant::now();
         // cmd → ping: a parent with a long-running child, like latexmk → pdflatex.
-        let output = run_with_timeout(cmd(&["/C", "ping -n 30 127.0.0.1 >NUL"]), Duration::from_millis(500)).unwrap();
+        let output = run_with_timeout(cmd(&["/C", "ping -n 30 127.0.0.1 >NUL"]), Duration::from_millis(500), &|| false).unwrap();
         assert!(output.timed_out);
         assert!(!output.success);
         assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
     }
 
     #[test]
+    fn run_with_timeout_stops_the_tree_when_cancelled() {
+        let started = Instant::now();
+        let fired = Arc::new(Mutex::new(None::<Instant>));
+        let mark = Arc::clone(&fired);
+        let check = move || {
+            let stop = started.elapsed() > Duration::from_millis(300);
+            if stop {
+                mark.lock().unwrap().get_or_insert_with(Instant::now);
+            }
+            stop
+        };
+        let output = run_with_timeout(cmd(&["/C", "ping -n 30 127.0.0.1 >NUL"]), Duration::from_secs(60), &check).unwrap();
+        assert!(output.stopped && !output.timed_out && !output.success);
+        // shortcut: 5 s so a fully loaded test machine passes; the 2 s target (SC-004) is checked in quickstart B.
+        let since = fired.lock().unwrap().expect("cancel fired").elapsed();
+        assert!(since < Duration::from_secs(5), "stopped {since:?} after the cancel");
+    }
+
+    #[test]
+    fn cancel_tokens_only_stop_compiles_requested_before_the_press() {
+        let cancel = CompileCancel::default();
+        let before = cancel.token();
+        assert!(!before());
+        cancel.0.fetch_add(1, Ordering::SeqCst);
+        let after = cancel.token();
+        assert!(before(), "a compile requested before Stop is stopped");
+        assert!(!after(), "a compile requested after Stop runs normally");
+    }
+
+    #[test]
+    fn a_stopped_result_keeps_nothing_and_serializes_stopped() {
+        let result = stopped_result(Engine::Xelatex);
+        assert!(!result.ok && result.stopped && result.pdf_path.is_none() && result.problems.is_empty());
+        assert_eq!(result.summary, "Compile stopped");
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["stopped"], true);
+    }
+
+    /// Real latexmk run: Stop ends an endless loop within 2 s, drops partial output, keeps the
+    /// shown PDF, and the next compile works. Skipped without MiKTeX + latexmk + Perl.
+    #[test]
+    fn compile_stop_kills_latexmk_tree() {
+        if !detect_environment().ready {
+            eprintln!("skipping: LaTeX tools not installed");
+            return;
+        }
+        let build = TempDir::new("stop-build");
+        let good = "\\documentclass{article}\n\\begin{document}\nHello.\n\\end{document}\n";
+        let (_dir, root) = project_dir("stop-src", good);
+        let first = compile_project_at(&build.0, &root, "main.tex", &[]).unwrap();
+        assert!(first.ok, "{}\n{}", first.summary, first.log);
+        let shown = PathBuf::from(first.pdf_path.unwrap());
+        let shown_bytes = fs::read(&shown).unwrap();
+
+        let looping = "\\documentclass{article}\n\\begin{document}\n\\def\\x{\\x}\\x\n\\end{document}\n";
+        let started = Instant::now();
+        let check = move || started.elapsed() > Duration::from_secs(1);
+        let stopped = compile_project_cancellable(&build.0, &root, "main.tex", &[buffer("main.tex", looping)], &check).unwrap();
+        assert!(stopped.stopped && !stopped.ok, "{}", stopped.summary);
+        // shortcut: generous bound for loaded machines; SC-004's 2 s is checked in quickstart B.
+        assert!(started.elapsed() < Duration::from_secs(6), "took {:?}", started.elapsed());
+        let out = build.0.join(build_key(&PathBuf::from(project::display_path(&root.join("main.tex")))));
+        assert!(!out.join("main.fdb_latexmk").exists() && !out.join("main.pdf").exists(), "partial output removed");
+        assert_eq!(fs::read(&shown).unwrap(), shown_bytes, "the shown PDF is untouched");
+
+        let again = compile_project_at(&build.0, &root, "main.tex", &[]).unwrap();
+        assert!(again.ok, "{}\n{}", again.summary, again.log);
+    }
+
+    #[test]
     fn run_with_timeout_reports_missing_program() {
-        let error = run_with_timeout(Command::new("lexy-no-such-program-9f3b"), Duration::from_secs(1)).err().unwrap();
+        let error = run_with_timeout(Command::new("lexy-no-such-program-9f3b"), Duration::from_secs(1), &|| false).err().unwrap();
         assert!(error.contains("failed to start"), "{error}");
     }
 
@@ -1719,6 +1882,23 @@ mod tests {
 
     fn engine(main: &str) -> (Engine, String) {
         choose_engine(main, &[])
+    }
+
+    #[test]
+    fn engine_menu_lines_are_markers() {
+        // The Engine menu (spec 008 US3) writes the TeXworks `TS-program` form.
+        let lua = "% !TEX TS-program = lualatex\n\\documentclass{article}\n\\usepackage{fontspec}\n";
+        assert_eq!(engine(lua), (Engine::Lualatex, "marker".into()));
+    }
+
+    #[test]
+    fn an_explicit_pdflatex_line_turns_off_the_automatic_bangla_switch() {
+        let build = TempDir::new("bangla-pinned-build");
+        let (_dir, root) = project_dir("bangla-pinned", "% !TEX TS-program = pdflatex\n\\documentclass{article}\n\\begin{document}\nআমার লেখা\n\\end{document}\n");
+        let result = compile_project_at(&build.0, &root, "main.tex", &[]).unwrap();
+        assert_eq!(result.engine, Engine::Pdflatex);
+        assert_eq!(result.engine_reason, "marker");
+        assert!(result.auto_font.is_none());
     }
 
     #[test]
@@ -2260,6 +2440,8 @@ mod tests {
             engine: Engine::Xelatex,
             problems: vec![sync::Problem { severity: sync::Severity::Error, file: Some("a.tex".into()), line: Some(2), message: "x".into() }],
             auto_font: None,
+            stopped: false,
+            engine_reason: "fontspec".into(),
             shown: None,
             tools_dir: None,
         })
@@ -2268,6 +2450,8 @@ mod tests {
         assert!(json.get("shown").is_none() && json.get("toolsDir").is_none());
         assert_eq!(json["pdfPath"], "C:\\x.pdf");
         assert!(json.get("pdf_path").is_none());
+        assert_eq!(json["stopped"], false);
+        assert_eq!(json["engineReason"], "fontspec");
     }
 
 }

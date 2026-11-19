@@ -158,7 +158,7 @@ fn modified_ms(metadata: &fs::Metadata) -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
@@ -854,7 +854,7 @@ fn start_watcher(app: &AppHandle, root: &Path, writes: RecentWrites) -> Option<B
     Some(Box::new(debouncer))
 }
 
-fn app_data_dir() -> Result<PathBuf> {
+pub(crate) fn app_data_dir() -> Result<PathBuf> {
     std::env::var_os("LOCALAPPDATA")
         .map(|base| PathBuf::from(base).join("Lexy"))
         .ok_or_else(|| ProjectError::new(ErrorKind::Io, "LOCALAPPDATA is not set"))

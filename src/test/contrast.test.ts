@@ -67,6 +67,13 @@ describe.each(Object.entries(themes))("%s theme contrast", (_name, theme) => {
   });
 });
 
+describe.each(Object.entries(themes))("%s theme: PDF find highlights (spec 008)", (_name, theme) => {
+  // PDF pages are always white, so the outlines must stand out against white in every theme.
+  it.each(["find-match", "find-current"])("%s on the page is at least 3:1", (token) => {
+    expect(contrast(theme[token], "#ffffff")).toBeGreaterThanOrEqual(3);
+  });
+});
+
 describe("contrast()", () => {
   it("matches the WCAG reference values", () => {
     expect(contrast("#000000", "#ffffff")).toBeCloseTo(21, 5);

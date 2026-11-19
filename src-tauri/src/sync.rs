@@ -358,7 +358,7 @@ fn parse_view(stdout: &str) -> Option<PdfSpot> {
 fn run_synctex(exe: &Path, args: &[String]) -> Result<String, String> {
     let mut command = Command::new(exe);
     command.args(args);
-    let output = run_with_timeout(command, LOOKUP_TIMEOUT)?;
+    let output = run_with_timeout(command, LOOKUP_TIMEOUT, &|| false)?;
     Ok(output.stdout)
 }
 

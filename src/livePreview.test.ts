@@ -23,6 +23,29 @@ function setup() {
 }
 
 describe("createLivePreview", () => {
+  it("cancel while waiting compiles nothing; the next edit schedules again (spec 008)", async () => {
+    const { live, compile } = setup();
+    live.edit("a");
+    live.cancel();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(compile).not.toHaveBeenCalled();
+    live.edit("ab");
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(compile).toHaveBeenCalledWith("ab");
+  });
+
+  it("cancel while running drops the queued compile", async () => {
+    const { live, compile, finish, onResult } = setup();
+    live.now("a");
+    live.edit("ab");
+    expect(live.state().queued).toBe(true);
+    live.cancel();
+    await finish();
+    expect(onResult).toHaveBeenCalledTimes(1);
+    expect(compile).toHaveBeenCalledTimes(1);
+    expect(live.state().phase).toBe("idle");
+  });
+
   it("compiles once, 1 s after the last edit", async () => {
     const { live, compile } = setup();
     live.edit("a");

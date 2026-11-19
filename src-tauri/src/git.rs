@@ -152,7 +152,7 @@ impl Ctx {
     }
 
     fn run(&self, args: &[&str], timeout: Duration) -> Result<ProcessOutput> {
-        run_with_timeout(self.command(&self.git, args), timeout).map_err(|message| err(K::Failed, message))
+        run_with_timeout(self.command(&self.git, args), timeout, &|| false).map_err(|message| err(K::Failed, message))
     }
 
     /// Run and require success; failures are classified.
@@ -762,14 +762,14 @@ fn publish_at(ctx: &Ctx, app: &AppHandle, name: &str, private: bool) -> Result<S
     }
     let gh = find_gh().ok_or_else(|| err(K::GhNotInstalled, "Publishing needs GitHub CLI."))?;
     let (top, _) = locate(ctx)?.ok_or_else(|| err(K::NoRepo, "This project has no version history yet."))?;
-    let signed_in = run_with_timeout(ctx.command(&gh, &["auth", "status", "--hostname", "github.com"]), LOCAL)
+    let signed_in = run_with_timeout(ctx.command(&gh, &["auth", "status", "--hostname", "github.com"]), LOCAL, &|| false)
         .map_err(|message| err(K::Failed, message))?;
     if !signed_in.success {
         gh_sign_in(ctx, &gh, app)?;
     }
     let visibility = if private { "--private" } else { "--public" };
     let created =
-        run_with_timeout(ctx.command(&gh, &["repo", "create", name, visibility, "--source", &top, "--remote", "origin", "--push"]), NETWORK)
+        run_with_timeout(ctx.command(&gh, &["repo", "create", name, visibility, "--source", &top, "--remote", "origin", "--push"]), NETWORK, &|| false)
             .map_err(|message| err(K::Failed, message))?;
     if !created.success {
         return Err(classify_stderr(&created.stderr));

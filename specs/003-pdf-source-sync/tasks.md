@@ -92,7 +92,7 @@ description: "Task list for 003: live preview, PDF ↔ source sync, actionable e
 ## Phase 6: Polish
 
 - [X] T038 [P] Update `CLAUDE.md` (Architecture: SyncTeX, shown slot, `sync.rs` commands, problems, zoom, Ctrl+J) and `docs/TRACKER.md` (feature rows for sync, problems and zoom; Verification Log entry)
-- [ ] T039 Final full run (suites run and green; the SyncTeX compile-time measurement for SC-004 is not done yet): `cd src-tauri; cargo test`, `npm test`, `npm run build`; measure compile time with and without `-synctex=1` on a 10-page document (SC-004 ≤ +10 %) and record it in the TRACKER Verification Log
+- [X] T039 Final full run (done 2026-11-18: suites green; SC-004 measured at −1 %, within noise): `cd src-tauri; cargo test`, `npm test`, `npm run build`; measure compile time with and without `-synctex=1` on a 10-page document (SC-004 ≤ +10 %) and record it in the TRACKER Verification Log
 
 ---
 

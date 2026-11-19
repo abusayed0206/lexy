@@ -16,6 +16,8 @@ export type LivePreview = {
   /** Compile now (document opened, explicit refresh); still at most one at a time. */
   now: (text: string) => void;
   setEnabled: (enabled: boolean) => void;
+  /** Stop pressed (spec 008 US2): drop the pending timer and the queued compile; the next edit schedules again. */
+  cancel: () => void;
   /** Pause before a compile (Settings → Live preview delay); applies from the next edit. */
   setDelay: (ms: number) => void;
   dispose: () => void;
@@ -98,6 +100,11 @@ export function createLivePreview({
     now,
     setDelay(ms) {
       delayMs = ms;
+    },
+    cancel() {
+      cancelTimer();
+      queued = false;
+      if (phase === "waiting") phase = "idle";
     },
     setEnabled(next) {
       enabled = next;

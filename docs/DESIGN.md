@@ -104,6 +104,7 @@ Shortcuts (projects since feature 004):
 - `Ctrl+S`: save all modified files in the project.
 - `Ctrl+Shift+S`: save the current file as another name inside the project.
 - `F5`: save all, then compile the main document (decided 2026-11-13; `Ctrl+B` is bold).
+- `Shift+F5`: stop the running compile (spec 008); the Stop button beside the status does the same.
 - `Ctrl+B` / `Ctrl+I` / `Ctrl+U`: bold / italic / underline the selection (editor only).
 - `Ctrl+L`: toggle logs.
 - `Ctrl+Shift+E`: show or hide the file sidebar (`Ctrl+B` stays Bold).
@@ -117,6 +118,7 @@ Shortcuts (projects since feature 004):
 - `F11`: focus mode.
 - `Ctrl+,`: Settings.
 - `Ctrl+Alt+M`: new note on the selection (Review tab: notes, PDF with notes, compare with an earlier version).
+- `Ctrl+F` with the PDF focused: find in the PDF (`Enter` / `Shift+Enter` next / previous, `Esc` closes); in the editor `Ctrl+F` stays the editor's own search (spec 008).
 
 Shortcuts must not conflict with text editing expectations.
 
@@ -124,7 +126,7 @@ Shortcuts must not conflict with text editing expectations.
 
 The compact command strip is replaced by a Word-style ribbon at the user's request (`specs/002-word-style-editor`). The LaTeX source stays visible; every ribbon action is a plain text edit.
 
-- Tabs: File (New project, Open folder…, Recent projects, Project Home, New file, Save, Save as; was New, Open, Save, Save as before feature 004), Home (Font, Size, Bold/Italic/Underline, Bullets, Numbering, Styles), Insert (Equation, Table, Page break, Footnote), Layout (Margins, Size, Orientation), View (Files, Live preview, Compile now, Logs).
+- Tabs: File (New project, Open folder…, Recent projects, Project Home, New file, Save, Save as; was New, Open, Save, Save as before feature 004), Home (Font, Size, Bold/Italic/Underline, Bullets, Numbering, Styles), Insert (Equation, Table, Page break, Footnote), Layout (Margins, Size, Orientation, Engine since spec 008), View (Files, Live preview, Compile now, Logs).
 - File name, unsaved dot, status pill and Compile stay visible at the right of the tab row on every tab.
 - At ≥ 900 px wide buttons show labels; below that they are icon-only with tooltips; below 820 px group captions hide. Nothing wraps or overlaps at 800 px.
 - Shortcuts are a capture-phase handler so they beat CodeMirror's own bindings: Ctrl+L (select line) and Ctrl+I (select parent) are taken over by Lexy.

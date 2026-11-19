@@ -1,13 +1,15 @@
 import { lazy, Suspense, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { converterStatus, exportDocument, exportPdf, exportPdfWithNotes, installBanglaFont, installConverter, type ConverterProgress, type ExportReport, loadPdf, syncToPdf, syncToSource, type CompileResult, type Problem } from "./compile";
+import { cancelCompile, converterStatus, exportDocument, exportPdf, exportPdfWithNotes, installBanglaFont, installConverter, type ConverterProgress, type ExportReport, loadPdf, syncToPdf, syncToSource, type CompileResult, type Problem } from "./compile";
 import { addPurnoSetup, hasOutdatedPurnoSetup } from "./latex/scriptFont";
 import { Editor, type EditorHandle } from "./Editor";
 import { findEquationAt, wrapEquation, type FoundEquation } from "./latex/equations";
 import { installKritiFont, type FontChoice } from "./latex/fonts";
 import { footnote, insertBlock, pageBreak, replaceWith, setHeading, toList, wrap, type TextEdit } from "./latex/format";
-import { applySettings, conflicts, hasSettingsBlock, parseSettings, type DocumentSettings, type FontSize } from "./latex/settings";
+import { applySettings, conflicts, hasSettingsBlock, parseSettings, replacesPdflatexLine, type DocumentSettings, type FontSize } from "./latex/settings";
+import { engineEdit, readEngine, type EngineChoice } from "./latex/engine";
+import { reasonLabel } from "./ribbon/EngineMenu";
 import { tableLatex, type TableSpec } from "./latex/tables";
 import { createLivePreview, type LivePreview } from "./livePreview";
 import { dirtyFiles, emptyOpenFiles, isDirty, keyOf, openFilesReducer, type OpenFilesEvent } from "./openFiles";
@@ -38,6 +40,9 @@ import {
   projectTexts,
   readFile,
   readSnapshot,
+  recoveryDiscard,
+  recoveryList,
+  recoverySave,
   renameEntry,
   sameRel,
   setMainDocument,
@@ -46,7 +51,10 @@ import {
   type Entry,
   type OpenedProject,
   type ProjectSummary,
+  type RecoveryCopy,
 } from "./projects";
+import { createRecoveryScheduler, type RecoveryScheduler } from "./recovery";
+import { RecoveryDialog } from "./RecoveryDialog";
 import { Ribbon, type RibbonActions } from "./Ribbon";
 import { buildIndex, type IndexCache, type ProjectIndex } from "./latex/index";
 import { annotate } from "./latex/readable";
@@ -78,7 +86,7 @@ import { STARTER_DOCUMENT } from "./starter";
 
 const EquationDialog = lazy(() => import("./ribbon/EquationDialog"));
 
-type Status = "idle" | "dirty" | "compiling" | "ready" | "error";
+type Status = "idle" | "dirty" | "compiling" | "ready" | "error" | "stopped";
 type Origin = "live" | "explicit";
 
 type CompileState = {
@@ -91,7 +99,13 @@ type CompileState = {
   explicitBusy: boolean;
   /** Engine of the last result (spec 005: Lexy may pick XeLaTeX on its own, so show it). */
   engine: CompileResult["engine"] | null;
+  /** Why that engine was used (spec 008 US3). */
+  engineReason?: string | null;
 };
+
+/** The exit export's compile was stopped (spec 008 FR-016). */
+class CompileStopped extends Error {}
+const STOPPED_EXPORT = "The PDF was not updated: the compile was stopped.";
 
 export const ENGINE_NAMES: Record<CompileResult["engine"], string> = { pdflatex: "pdfLaTeX", xelatex: "XeLaTeX", lualatex: "LuaLaTeX" };
 
@@ -129,6 +143,8 @@ export function compileReducer(state: CompileState, event: CompileEvent): Compil
       return { ...state, status: "compiling", explicitBusy: state.explicitBusy || event.origin === "explicit" };
     case "done": {
       const explicitBusy = event.origin === "explicit" ? false : state.explicitBusy;
+      // Stopped (spec 008 US2): the previous PDF, engine and log stay.
+      if (event.result.stopped) return { ...state, status: explicitBusy ? "compiling" : "stopped", origin: event.origin, explicitBusy };
       return {
         status: explicitBusy ? "compiling" : event.result.ok ? "ready" : "error",
         summary: event.result.summary,
@@ -137,6 +153,7 @@ export function compileReducer(state: CompileState, event: CompileEvent): Compil
         origin: event.origin,
         explicitBusy,
         engine: event.result.engine,
+        engineReason: event.result.engineReason ?? null,
       };
     }
   }
@@ -144,7 +161,7 @@ export function compileReducer(state: CompileState, event: CompileEvent): Compil
 
 export function statusLabel(state: CompileState): string {
   if (state.status === "error") return state.origin === "live" ? "Preview failed" : "Compile failed";
-  return { idle: "Idle", dirty: "Changed", compiling: "Compiling", ready: "PDF ready" }[state.status];
+  return { idle: "Idle", dirty: "Changed", compiling: "Compiling", ready: "PDF ready", stopped: "Compile stopped" }[state.status];
 }
 
 export const MIN_SPLIT = 0.2;
@@ -270,7 +287,16 @@ export function Writer({ project, onSwitch }: Props) {
   /** The PDF in the build folder and whether it was compiled from exactly what is on disk. */
   const lastPdf = useRef<{ pdfPath: string; clean: boolean; diskVersion: number } | null>(null);
   const exportWarned = useRef(false);
+  /** A compile is running (read by the Shift+F5 handler and the palette). */
+  const compilingRef = useRef(false);
   const editSeq = useRef(0);
+  /** Crash recovery (spec 008 US1): unsaved text is copied outside the project. */
+  const recovery = useRef<RecoveryScheduler | null>(null);
+  const [recovered, setRecovered] = useState<RecoveryCopy[]>([]);
+  const recoveredRef = useRef(recovered);
+  recoveredRef.current = recovered;
+  const [recoveryReview, setRecoveryReview] = useState(false);
+  const [recoveryFailed, setRecoveryFailed] = useState(false);
 
   const current = files.current;
   const currentFile = current !== null ? files.files.get(current) : undefined;
@@ -390,6 +416,7 @@ export function Writer({ project, onSwitch }: Props) {
       }
     }
     dispatch({ type: "done", origin, result: final });
+    if (final.stopped) return;
     setProblems(final.problems ?? (final.ok ? [] : [{ severity: "error", file: null, line: null, message: final.summary }]));
     if (origin === "explicit" && !final.ok) {
       setDrawerTab("problems");
@@ -437,6 +464,7 @@ export function Writer({ project, onSwitch }: Props) {
     let pdf = lastPdf.current;
     if (!pdf || !pdf.clean || pdf.diskVersion !== diskVersion.current) {
       const result = await compileProject(target, []);
+      if (result.stopped) throw new CompileStopped();
       if (!result.ok || !result.pdfPath) throw new Error(`the saved document doesn't compile (${result.summary})`);
       pdf = { pdfPath: result.pdfPath, clean: true, diskVersion: diskVersion.current };
     }
@@ -462,6 +490,84 @@ export function Writer({ project, onSwitch }: Props) {
     live.current?.setEnabled(liveEnabled);
     if (!readOnly) writeStorage(LIVE_KEY, liveEnabled ? "1" : "0");
   }, [liveEnabled]);
+
+  // Crash recovery: keep unsaved text outside the project; never in read-only windows.
+  useEffect(() => {
+    if (readOnly) return;
+    const scheduler = createRecoveryScheduler({
+      save: recoverySave,
+      discard: recoveryDiscard,
+      onError: () => setRecoveryFailed(true),
+    });
+    recovery.current = scheduler;
+    void recoveryList().then((copies) => {
+      // Files restored or opened meanwhile keep their own text; offer the rest.
+      setRecovered(copies);
+    }, () => undefined);
+    return () => scheduler.dispose();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => {
+    recovery.current?.changed([...files.files].map(([path, file]) => ({ path, text: file.text, dirty: isDirty(file) })));
+  }, [files]);
+
+  /** A clean close (Save all or Don't save): the session's recovery copies are no longer needed. */
+  function finishRecovery() {
+    if (readOnly) return;
+    recovery.current?.dispose();
+    // Copies the user hasn't decided on yet stay offered next time; everything else goes.
+    const undecided = new Set(recoveredRef.current.map((copy) => copy.path.toLowerCase()));
+    if (!undecided.size) void recoveryDiscard(null).catch(() => undefined);
+    else {
+      const session = [...filesRef.current.files.keys()].filter((path) => !undecided.has(path.split("\\").join("/").toLowerCase()));
+      if (session.length) void recoveryDiscard(session).catch(() => undefined);
+    }
+  }
+
+  /** Put recovered text into its file as an unsaved change (one undo step back to the disk text). */
+  async function restoreRecovered(copy: RecoveryCopy) {
+    const path = copy.path.split("/").join("\\");
+    try {
+      let key = keyOf(filesRef.current, path);
+      if (key === undefined && copy.missing) {
+        editor.current?.switchTo(path, "");
+        applyFiles({ type: "opened", path, text: "" });
+        key = path;
+      } else if (!sameRel(path, filesRef.current.current)) {
+        await openFile(path);
+        key = keyOf(filesRef.current, path);
+      }
+      if (key === undefined) return;
+      replaceMainText(key, filesRef.current.files.get(key)!.text, copy.text);
+      setRecovered((list) => list.filter((item) => item.path !== copy.path));
+      const changed = copy.diskChanged && !copy.missing ? " This file changed on disk since." : "";
+      setInfo(`Restored unsaved text in ${baseName(path)}. Press Ctrl+Z to undo, Ctrl+S to keep it.${changed}`);
+    } catch (error) {
+      setNotice(`Could not restore ${baseName(path)}. ${errorText(error)}`);
+    }
+  }
+
+  function discardRecovered(copies: RecoveryCopy[]) {
+    const paths = new Set(copies.map((copy) => copy.path));
+    setRecovered((list) => list.filter((item) => !paths.has(item.path)));
+    void recoveryDiscard([...paths]).catch(() => undefined);
+  }
+
+  async function restoreAllRecovered() {
+    setRecoveryReview(false);
+    for (const copy of recovered) await restoreRecovered(copy);
+  }
+
+  async function discardAllRecovered() {
+    const count = recovered.length;
+    const choice = await ask("Discard unsaved text", `Discard unsaved text in ${count} ${count === 1 ? "file" : "files"}? This can't be undone.`, [
+      { label: "Cancel", value: "cancel" },
+      { label: "Discard", value: "discard", primary: true, destructive: true },
+    ]);
+    if (choice !== "discard") return;
+    setRecoveryReview(false);
+    discardRecovered(recovered);
+  }
 
   // Open the main document (or ask which one it is).
   useEffect(() => {
@@ -653,6 +759,12 @@ export function Writer({ project, onSwitch }: Props) {
     }
   }
 
+  /** Stop (spec 008 US2): drop live preview's queue, then end the running compile. */
+  function stopCompile() {
+    live.current?.cancel();
+    void cancelCompile().catch(() => undefined);
+  }
+
   async function runCompile() {
     if (state.explicitBusy || readOnly) return;
     if (!(await saveAll())) return;
@@ -686,10 +798,11 @@ export function Writer({ project, onSwitch }: Props) {
   /** Leave the project: unsaved prompt, PDF export, then switch. */
   async function leave(target: string | null) {
     if (!(await settleUnsaved())) return;
+    finishRecovery();
     try {
       await exportPdfOnExit();
     } catch (error) {
-      setNotice(`Lexy couldn't save the PDF next to your document: ${errorText(error)}`);
+      setNotice(error instanceof CompileStopped ? STOPPED_EXPORT : `Lexy couldn't save the PDF next to your document: ${errorText(error)}`);
     }
     onSwitch(target);
   }
@@ -911,9 +1024,39 @@ export function Writer({ project, onSwitch }: Props) {
       const key = keyOf(filesRef.current, target)!;
       const shown = key === filesRef.current.current;
       replaceMainText(key, text, updated);
-      if (!shown) setInfo(`Applied to ${baseName(key)}`);
+      if (replacesPdflatexLine(text, next)) setInfo("This font needs XeLaTeX, so Lexy changed the engine line from pdfLaTeX to XeLaTeX.");
+      else if (!shown) setInfo(`Applied to ${baseName(key)}`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  /** Layout → Engine (spec 008 US3): edit the main document's engine line as one undo step. */
+  async function changeEngine(choice: EngineChoice) {
+    if (readOnly) return;
+    const target = filesRef.current.main;
+    const key = target !== null ? keyOf(filesRef.current, target) : undefined;
+    const text = key !== undefined ? filesRef.current.files.get(key)?.text : undefined;
+    if (key === undefined || text === undefined) {
+      setNotice("Open the main document first. Lexy keeps the engine line there.");
+      return;
+    }
+    if (choice === "pdflatex" && parseSettings(text).font.kind !== "builtin") {
+      const answer = await ask("Use pdfLaTeX?", "This font needs XeLaTeX or LuaLaTeX. Use pdfLaTeX anyway?", [
+        { label: "Cancel", value: "cancel" },
+        { label: "Use pdfLaTeX", value: "use", primary: true, destructive: true },
+      ]);
+      if (answer !== "use") return;
+    }
+    const edit = engineEdit(text, choice);
+    if (!edit) return;
+    if (key === filesRef.current.current) editor.current?.apply(edit);
+    else {
+      const result = editor.current?.applyTo(key, edit) ?? null;
+      if (result === null) editor.current?.forget(key);
+      applyFiles({ type: "edited", path: key, text: result ?? text.slice(0, edit.from) + edit.insert + text.slice(edit.to) });
+      afterEdit();
+      setInfo(`Applied to ${baseName(key)}`);
     }
   }
 
@@ -1511,6 +1654,8 @@ export function Writer({ project, onSwitch }: Props) {
     onSave: () => void saveAll(),
     onSaveAs: () => void saveCurrentAs(),
     onCompile: () => void runCompile(),
+    onEngine: (choice: EngineChoice) => void changeEngine(choice),
+    onStop: stopCompile,
     onToggleLogs: () => setLogsOpen((open) => !open),
     onShowInPdf: () => void showInPdf(),
     onZoom: (kind) => (kind === "in" ? pdfView.current?.zoomIn() : kind === "out" ? pdfView.current?.zoomOut() : pdfView.current?.fit()),
@@ -1568,6 +1713,22 @@ export function Writer({ project, onSwitch }: Props) {
       title: appSettings.vim ? "Turn off Vim keys" : "Turn on Vim keys",
       run: () => void updateAppSettings({ vim: !appSettings.vim }),
     },
+    ...(readOnly
+      ? []
+      : (["auto", "pdflatex", "xelatex", "lualatex"] as const).map((choice) => ({
+          id: `engine.${choice}`,
+          group: "Layout",
+          title: `Engine: ${{ auto: "Automatic", pdflatex: "pdfLaTeX", xelatex: "XeLaTeX", lualatex: "LuaLaTeX" }[choice]}`,
+          run: () => void changeEngine(choice),
+        }))),
+    {
+      id: "compile.stop",
+      group: "Compile",
+      title: "Stop compile",
+      shortcut: "Shift+F5",
+      enabled: () => compilingRef.current,
+      run: stopCompile,
+    },
     {
       id: "settings.autoSave",
       group: "Settings",
@@ -1615,7 +1776,8 @@ export function Writer({ project, onSwitch }: Props) {
       const ctrl = event.ctrlKey && !event.altKey && !event.metaKey;
       const run = actionsRef.current;
       let action: (() => void) | null = null;
-      if (event.key === "F5" && !event.ctrlKey) action = run.onCompile;
+      if (event.key === "F5" && event.shiftKey && !event.ctrlKey) action = compilingRef.current ? run.onStop : () => undefined;
+      else if (event.key === "F5" && !event.ctrlKey) action = run.onCompile;
       else if (ctrl && key === "s") action = event.shiftKey ? run.onSaveAs : run.onSave;
       else if (ctrl && event.shiftKey && key === "e") action = run.onToggleFiles;
       else if (ctrl && event.shiftKey && key === "g") action = () => run.onGit("changes");
@@ -1652,6 +1814,8 @@ export function Writer({ project, onSwitch }: Props) {
 
   const settleRef = useRef(settleUnsaved);
   settleRef.current = settleUnsaved;
+  const finishRecoveryRef = useRef(finishRecovery);
+  finishRecoveryRef.current = finishRecovery;
   const exportRef = useRef(exportPdfOnExit);
   exportRef.current = exportPdfOnExit;
 
@@ -1673,9 +1837,11 @@ export function Writer({ project, onSwitch }: Props) {
             if (!exportWarned.current) {
               exportWarned.current = true;
               event.preventDefault();
-              setNotice(`Lexy couldn't save the PDF next to your document: ${errorText(error)}. Close again to quit without it.`);
+              setNotice(error instanceof CompileStopped ? `${STOPPED_EXPORT} Close again to quit without it.` : `Lexy couldn't save the PDF next to your document: ${errorText(error)}. Close again to quit without it.`);
+              return;
             }
           }
+          finishRecoveryRef.current();
         })
         .then((dispose) => (disposed ? dispose() : (unlisten = dispose)));
     } catch {
@@ -1712,6 +1878,7 @@ export function Writer({ project, onSwitch }: Props) {
   }
 
   const compiling = state.status === "compiling";
+  compilingRef.current = compiling;
   const currentName = current ?? "No file open";
 
   const hidePdf = focusMode && appSettings.hidePdfInFocus;
@@ -1737,6 +1904,9 @@ export function Writer({ project, onSwitch }: Props) {
           mainName: main,
           statusLabel: statusLabel(state),
           statusClass: state.status,
+          engine: readEngine(mainText ?? "").choice,
+          lastEngine: state.engine ? `Last compile: ${ENGINE_NAMES[state.engine]} (${reasonLabel(state.engineReason ?? undefined)})` : null,
+          stoppable: compiling && !readOnly,
           statusDetail: statusDetail(state),
           compiling: state.explicitBusy,
           readOnly,
@@ -1850,6 +2020,38 @@ export function Writer({ project, onSwitch }: Props) {
             ? `. ${exportState.report.warnings.length} ${exportState.report.warnings.length === 1 ? "part was" : "parts were"} approximated.`
             : "."}
         </InfoBar>
+      ) : null}
+      {recovered.length && !readOnly ? (
+        <InfoBar
+          actions={
+            <>
+              <button type="button" className="primary" onClick={() => void restoreAllRecovered()}>
+                Restore all
+              </button>
+              <button type="button" onClick={() => void discardAllRecovered()}>
+                Discard all
+              </button>
+              <button type="button" onClick={() => setRecoveryReview(true)}>
+                Review…
+              </button>
+            </>
+          }
+        >
+          {`Lexy found unsaved text from your last session in ${recovered.length} ${recovered.length === 1 ? "file" : "files"}.`}
+        </InfoBar>
+      ) : null}
+      {recoveryFailed ? (
+        <InfoBar severity="warning" onClose={() => setRecoveryFailed(false)}>
+          Lexy couldn't keep a recovery copy of your unsaved text. Save often.
+        </InfoBar>
+      ) : null}
+      {recoveryReview ? (
+        <RecoveryDialog
+          copies={recovered}
+          onRestore={(copy) => void restoreRecovered(copy)}
+          onDiscard={(copy) => discardRecovered([copy])}
+          onClose={() => setRecoveryReview(false)}
+        />
       ) : null}
       {info ? <InfoBar>{info}</InfoBar> : null}
 

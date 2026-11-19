@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { gitLog, gitShowFile, gitStatus } from "./git";
-import { converterStatus, exportDocument, exportPdf, installBanglaFont, installConverter, loadPdf, syncToPdf, syncToSource, type CompileResult } from "./compile";
+import { cancelCompile, converterStatus, exportDocument, exportPdf, installBanglaFont, installConverter, loadPdf, syncToPdf, syncToSource, type CompileResult } from "./compile";
 import type { EditorHandle } from "./Editor";
 import { BLOCK_START, XELATEX_MARKER } from "./latex/settings";
 import { chooseProjectFolder } from "./ProjectDialogs";
@@ -19,11 +19,15 @@ import {
   projectTexts,
   readFile,
   readSnapshot,
+  recoveryDiscard,
+  recoveryList,
+  recoverySave,
   renameEntry,
   setMainDocument,
   writeFile,
   type Entry,
   type OpenedProject,
+  type RecoveryCopy,
 } from "./projects";
 import { STARTER_DOCUMENT } from "./starter";
 import { countWords } from "./latex/wordCount";
@@ -101,7 +105,7 @@ vi.mock("./settings", async (importOriginal) => {
   return { ...real, useSettings: vi.fn(() => ({ settings: real.DEFAULT_SETTINGS, update: vi.fn(async () => undefined) })) };
 });
 vi.mock("./writingAids", () => ({ spellCheck: vi.fn(async () => []), spellSuggest: vi.fn(async () => []), dictionaryAdd: vi.fn(async () => undefined), grammarCheck: vi.fn(), fetchDoi: vi.fn() }));
-vi.mock("./compile", () => ({ loadPdf: vi.fn(), exportPdf: vi.fn(), syncToSource: vi.fn(), syncToPdf: vi.fn(), installBanglaFont: vi.fn(), exportPdfWithNotes: vi.fn(), converterStatus: vi.fn(), installConverter: vi.fn(), exportDocument: vi.fn() }));
+vi.mock("./compile", () => ({ cancelCompile: vi.fn(async () => undefined), loadPdf: vi.fn(), exportPdf: vi.fn(), syncToSource: vi.fn(), syncToPdf: vi.fn(), installBanglaFont: vi.fn(), exportPdfWithNotes: vi.fn(), converterStatus: vi.fn(), installConverter: vi.fn(), exportDocument: vi.fn() }));
 vi.mock("./projects", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./projects")>()),
   compileProject: vi.fn(),
@@ -109,6 +113,9 @@ vi.mock("./projects", async (importOriginal) => ({
   copyEntry: vi.fn(),
   listSnapshots: vi.fn(),
   readSnapshot: vi.fn(),
+  recoverySave: vi.fn(async () => undefined),
+  recoveryList: vi.fn(async () => []),
+  recoveryDiscard: vi.fn(async () => undefined),
   projectTexts: vi.fn(() => Promise.resolve({ files: [], truncated: false })),
   writeFile: vi.fn(),
   listDir: vi.fn(),
@@ -220,7 +227,7 @@ function deferred<T>() {
 const initial = { status: "idle", summary: null, log: "", pdfPath: null, origin: null, explicitBusy: false, engine: null } as const;
 
 describe("compileReducer", () => {
-  it.each(["idle", "dirty", "ready", "error"] as const)("edit from %s → dirty", (status) => {
+  it.each(["idle", "dirty", "ready", "error", "stopped"] as const)("edit from %s → dirty", (status) => {
     expect(compileReducer({ ...initial, status }, { type: "edit" }).status).toBe("dirty");
   });
 
@@ -240,6 +247,15 @@ describe("compileReducer", () => {
     const afterLive = compileReducer(busy, { type: "done", origin: "live", result: succeeded });
     expect(afterLive).toMatchObject({ status: "compiling", explicitBusy: true });
     expect(compileReducer(afterLive, { type: "done", origin: "explicit", result: failed })).toMatchObject({ status: "error", explicitBusy: false });
+  });
+
+  it("a stopped result keeps the previous PDF, engine and log (spec 008)", () => {
+    const shown = compileReducer(initial, { type: "done", origin: "explicit", result: { ...succeeded, engine: "xelatex" } });
+    const running = compileReducer(shown, { type: "start", origin: "explicit" });
+    const stopped = compileReducer(running, { type: "done", origin: "explicit", result: { ...failed, stopped: true, summary: "Compile stopped", pdfPath: null } });
+    expect(stopped).toMatchObject({ status: "stopped", pdfPath: PDF, engine: "xelatex", log: succeeded.log, explicitBusy: false });
+    expect(statusLabel(stopped)).toBe("Compile stopped");
+    expect(statusDetail(stopped)).toBe("XeLaTeX · Compile stopped");
   });
 
   it("labels live failures differently from explicit ones", () => {
@@ -302,6 +318,7 @@ describe("Writer", () => {
     vi.mocked(compileProject).mockResolvedValue(succeeded);
     vi.mocked(loadPdf).mockResolvedValue(new Uint8Array([1, 2, 3]));
     vi.mocked(exportPdf).mockResolvedValue("exported.pdf");
+    vi.mocked(recoveryList).mockResolvedValue([]);
   });
   afterEach(() => vi.useRealTimers());
 
@@ -527,6 +544,33 @@ describe("Writer", () => {
       expect(drawer()).not.toBeInTheDocument();
     });
 
+    it("Stop and Shift+F5 end a running compile; the PDF stays and the log stays closed (spec 008)", async () => {
+      const { user } = await renderWriter();
+      await user.click(compileButton());
+      await waitFor(() => expect(compileStatus()).toHaveTextContent("PDF ready"));
+      const pending = deferred<CompileResult>();
+      vi.mocked(compileProject).mockReturnValueOnce(pending.promise);
+      await user.keyboard("{F5}");
+      const stop = await screen.findByRole("button", { name: "Stop compile (Shift+F5)" });
+      await user.keyboard("{Shift>}{F5}{/Shift}");
+      expect(cancelCompile).toHaveBeenCalledTimes(1);
+      await user.click(stop);
+      expect(cancelCompile).toHaveBeenCalledTimes(2);
+      await act(async () => pending.resolve({ ...failed, stopped: true, summary: "Compile stopped", pdfPath: null, problems: [] }));
+      await waitFor(() => expect(compileStatus()).toHaveTextContent("Compile stopped"));
+      expect(screen.queryByRole("button", { name: "Stop compile (Shift+F5)" })).toBeNull();
+      expect(drawer()).toBeNull();
+      expect(loadPdf).toHaveBeenCalledTimes(1);
+      expect(preview()).not.toHaveTextContent("No PDF yet");
+    });
+
+    it("Shift+F5 does nothing when no compile runs", async () => {
+      const { user } = await renderWriter();
+      await user.keyboard("{Shift>}{F5}{/Shift}");
+      expect(cancelCompile).not.toHaveBeenCalled();
+      expect(compileProject).not.toHaveBeenCalled();
+    });
+
     it("disables Compile while running and ignores F5 meanwhile", async () => {
       const { user } = await renderWriter();
       const run = deferred<CompileResult>();
@@ -702,6 +746,65 @@ describe("Writer", () => {
       await user.selectOptions(screen.getByRole("combobox", { name: "Font size" }), "11");
       expect(screen.getByRole("alert")).toHaveTextContent("Add a \\documentclass line first.");
       expect(editor()).toHaveValue("just text");
+    });
+  });
+
+  describe("engine choice (spec 008 US3)", () => {
+    async function chooseEngine(user: ReturnType<typeof userEvent.setup>, name: string) {
+      await user.click(tab("Layout"));
+      await user.click(screen.getByRole("button", { name: "Engine" }));
+      await user.click(screen.getByRole("menuitemradio", { name }));
+    }
+
+    it("writes the engine line as line 1, replaces it in place and removes it for Automatic", async () => {
+      const { user } = await renderWriter();
+      await chooseEngine(user, "LuaLaTeX");
+      expect(editor().value).toBe(`% !TEX TS-program = lualatex\n${STARTER_DOCUMENT}`);
+      await chooseEngine(user, "XeLaTeX");
+      expect(editor().value).toBe(`% !TEX TS-program = xelatex\n${STARTER_DOCUMENT}`);
+      await chooseEngine(user, "Automatic");
+      expect(editor().value).toBe(STARTER_DOCUMENT);
+      expect(writeFile).not.toHaveBeenCalled();
+    });
+
+    it("edits the main document while a chapter is shown", async () => {
+      const { user } = await renderWriter();
+      await openIntro(user);
+      await chooseEngine(user, "LuaLaTeX");
+      expect(editor()).toHaveValue("Intro text.");
+      expect(screen.getByText("Applied to thesis.tex")).toBeInTheDocument();
+      await user.click(row(MAIN));
+      await waitFor(() => expect(editor().value.startsWith("% !TEX TS-program = lualatex\n")).toBe(true));
+    });
+
+    it("asks before choosing pdfLaTeX for an installed font; Cancel changes nothing", async () => {
+      const { user } = await renderWriter();
+      await user.click(screen.getByRole("combobox", { name: "Font" }));
+      await user.click(await screen.findByRole("option", { name: "Georgia" }));
+      const before = editor().value;
+      await chooseEngine(user, "pdfLaTeX");
+      const dialog = await screen.findByRole("dialog", { name: "Use pdfLaTeX?" });
+      expect(within(dialog).getByRole("button", { name: "Cancel" })).toHaveFocus();
+      await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      expect(editor().value).toBe(before);
+    });
+
+    it("shows the engine and reason of the last compile in the menu", async () => {
+      vi.mocked(compileProject).mockResolvedValueOnce({ ...succeeded, engine: "xelatex", engineReason: "fontspec" });
+      const { user } = await renderWriter();
+      await user.click(compileButton());
+      await waitFor(() => expect(compileStatus()).toHaveTextContent("PDF ready"));
+      await user.click(tab("Layout"));
+      await user.click(screen.getByRole("button", { name: "Engine" }));
+      expect(screen.getByText("Last compile: XeLaTeX (fontspec package)")).toBeInTheDocument();
+      expect(screen.getByRole("menuitemradio", { name: "Automatic" })).toHaveAttribute("aria-checked", "true");
+    });
+
+    it("the palette offers the four engine commands", async () => {
+      const { user } = await renderWriter();
+      fireEvent.keyDown(editor(), { key: "P", ctrlKey: true, shiftKey: true });
+      await user.type(await screen.findByRole("combobox", { name: "Type a command" }), "Engine: Lua{Enter}");
+      await waitFor(() => expect(editor().value.startsWith("% !TEX TS-program = lualatex\n")).toBe(true));
     });
   });
 
@@ -1174,6 +1277,94 @@ describe("Writer", () => {
     });
   });
 
+  describe("crash recovery (spec 008 US1)", () => {
+    const copy = (path: string, text: string, extra: Partial<RecoveryCopy> = {}): RecoveryCopy => ({
+      path,
+      text,
+      savedAt: Date.now() - 60_000,
+      baseHash: "",
+      diskChanged: false,
+      missing: false,
+      ...extra,
+    });
+
+    async function close() {
+      const event = { preventDefault: vi.fn() };
+      let done!: Promise<void>;
+      await act(async () => {
+        done = closeHandler!(event);
+      });
+      return { event, done };
+    }
+
+    it("keeps unsaved text outside the project after a pause, and drops it on save", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const { user } = await renderWriter();
+      type("draft");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+      });
+      expect(recoverySave).toHaveBeenCalledWith(MAIN, `${STARTER_DOCUMENT}draft`);
+      expect(writeFile).not.toHaveBeenCalled();
+      await user.keyboard("{Control>}s{/Control}");
+      await waitFor(() => expect(recoveryDiscard).toHaveBeenCalledWith([MAIN]));
+    });
+
+    it("a clean close discards the copies; Cancel keeps them", async () => {
+      const { user } = await renderWriter();
+      type("!");
+      let { done } = await close();
+      await user.click(within(await screen.findByRole("dialog", { name: "Unsaved changes" })).getByRole("button", { name: "Cancel" }));
+      await act(() => done);
+      expect(recoveryDiscard).not.toHaveBeenCalledWith(null);
+      ({ done } = await close());
+      await user.click(within(await screen.findByRole("dialog", { name: "Unsaved changes" })).getByRole("button", { name: "Don't save" }));
+      await act(() => done);
+      expect(recoveryDiscard).toHaveBeenCalledWith(null);
+    });
+
+    it("offers recovered text on open and restores it as an unsaved change", async () => {
+      vi.mocked(recoveryList).mockResolvedValue([copy("thesis.tex", "Recovered main"), copy("chapters/intro.tex", "Recovered intro", { diskChanged: true })]);
+      const { user } = await renderWriter();
+      expect(await screen.findByText("Lexy found unsaved text from your last session in 2 files.")).toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: "Restore all" }));
+      await waitFor(() => expect(editor()).toHaveValue("Recovered intro"));
+      expect(await screen.findByText(/This file changed on disk since\./)).toBeInTheDocument();
+      expect(unsavedInTitle()).not.toBeNull();
+      await user.click(row(MAIN));
+      await waitFor(() => expect(editor()).toHaveValue("Recovered main"));
+      expect(writeFile).not.toHaveBeenCalled();
+      expect(screen.queryByText(/Lexy found unsaved text/)).toBeNull();
+    });
+
+    it("Review lists files; Discard all asks first", async () => {
+      vi.mocked(recoveryList).mockResolvedValue([copy("thesis.tex", "Recovered main")]);
+      const { user } = await renderWriter();
+      await user.click(await screen.findByRole("button", { name: "Review…" }));
+      const review = await screen.findByRole("dialog", { name: "Unsaved text from your last session" });
+      expect(within(review).getByText("thesis.tex")).toBeInTheDocument();
+      await user.click(within(review).getByRole("button", { name: "Done" }));
+      await user.click(screen.getByRole("button", { name: "Discard all" }));
+      const confirm = await screen.findByRole("dialog", { name: "Discard unsaved text" });
+      expect(within(confirm).getByRole("button", { name: "Cancel" })).toHaveFocus();
+      await user.click(within(confirm).getByRole("button", { name: "Discard" }));
+      expect(recoveryDiscard).toHaveBeenCalledWith(["thesis.tex"]);
+      expect(screen.queryByText(/Lexy found unsaved text/)).toBeNull();
+      expect(editor()).toHaveValue(STARTER_DOCUMENT);
+    });
+
+    it("a read-only window never touches recovery copies", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      await renderWriter({ ...PROJECT, readOnly: true });
+      type("x");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+      });
+      expect(recoveryList).not.toHaveBeenCalled();
+      expect(recoverySave).not.toHaveBeenCalled();
+    });
+  });
+
   describe("leaving the project", () => {
     async function close() {
       const event = { preventDefault: vi.fn() };
@@ -1241,6 +1432,16 @@ describe("Writer", () => {
       await act(() => done);
       expect(compileProject).toHaveBeenCalledWith(MAIN, []);
       expect(exportPdf).toHaveBeenCalledWith("C:\\build\\saved.pdf", `${ROOT}\\${MAIN}`);
+    });
+
+    it("says the PDF was not updated when the exit compile is stopped (spec 008)", async () => {
+      await renderWriter();
+      vi.mocked(compileProject).mockResolvedValueOnce({ ...failed, stopped: true, summary: "Compile stopped", pdfPath: null });
+      const { event, done } = await close();
+      await act(() => done);
+      expect(event.preventDefault).toHaveBeenCalled();
+      expect(screen.getByRole("alert")).toHaveTextContent("The PDF was not updated: the compile was stopped. Close again to quit without it.");
+      expect(exportPdf).not.toHaveBeenCalled();
     });
 
     it("stays open once with a notice when the PDF can't be written, then lets you quit", async () => {

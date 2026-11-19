@@ -11,7 +11,14 @@ export type CompileResult = {
   problems?: Problem[];
   /** Set when Lexy compiled a copy with this font because Bangla text had no font setup. */
   autoFont?: string | null;
+  /** The run was ended by `cancel_compile` (spec 008); `ok` is false and the shown PDF is unchanged. */
+  stopped?: boolean;
+  /** Why `engine` was used: "marker", a package or class name, "default", or the Bangla sentence. */
+  engineReason?: string;
 };
+
+/** Stop the running compile and any queued behind it (spec 008 US2); a no-op when idle. */
+export const cancelCompile = () => invoke<void>("cancel_compile");
 
 /** Copy BCC Purno into the `fonts` folder next to the main document; returns the files written. */
 export const installBanglaFont = (main: string) => invoke<string[]>("install_bangla_font", { main });

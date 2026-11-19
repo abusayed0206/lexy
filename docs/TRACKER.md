@@ -1,6 +1,6 @@
 # Lexy Feature Tracker
 
-Last updated: 2026-11-14
+Last updated: 2026-11-19
 
 This tracker is the source of truth for implementation status. Any contributor working here for the first time must read this file, `docs/PLAN.md`, and `docs/DESIGN.md` before making changes.
 
@@ -20,7 +20,7 @@ This tracker is the source of truth for implementation status. Any contributor w
 | --- | --- | --- |
 | Tauri 2 scaffold | Done | `src-tauri`, `tauri.conf.json`, `package.json` exist. |
 | React/Vite scaffold | Done | `src`, `vite.config.ts`, React dependencies exist. |
-| Lexy product identity | In Progress | README, HTML title, Cargo/package metadata and license done; `tauri.conf.json` `productName` and window `title` are still `lexy`. |
+| Lexy product identity | Done | README, HTML title, Cargo/package metadata, license, `productName` and window title. |
 | Minimal LaTeX writer UI | In Progress | Writer, ribbon, sidebar, CodeMirror editor, pdf.js preview, log drawer, Git panel (specs 001–006). Native-window checks pending. |
 | Rust LaTeX commands | Done | `compile_project`, engine choice, SyncTeX, problems, PDF export; real latexmk e2e tests pass. |
 | MiKTeX integration | In Progress | Detection, per-user standalone setup, per-run package install; fresh-VM validation pending; setup hash unpinned. |
@@ -38,7 +38,7 @@ Blocks a public release.
 
 | ID | Feature | Priority | Status | Owner | Verification | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
-| F-003 | Set app metadata and window title to Lexy | P0 | In Progress | Codex | `npm run tauri dev` | HTML title, README, Cargo/package metadata done; `tauri.conf.json` `productName` and window `title` still `lexy`. |
+| F-003 | Set app metadata and window title to Lexy | P0 | Done | Claude | `tauri.conf.json` review + installer build | HTML title, README, Cargo/package metadata, and since 2026-11-19 `productName` and window `title` = `Lexy`. |
 | F-028 | Windows installer target decision | P0 | Blocked | Product | Decision recorded | NSIS vs MSI vs both. |
 | F-029 | Bundle dependency resource decision | P0 | Blocked | Product/Engineering | Decision recorded | Bundle installers or download on demand. |
 | F-030 | WebView2 installer mode decision | P1 | Blocked | Engineering | Build review | Tauri supports download/offline/fixed runtime modes. |
@@ -88,7 +88,7 @@ Blocks a public release.
 | F-009 | Collapsible log panel | P0 | In Progress | Claude | Compile failure test | Collapsed by default, Ctrl+L toggle, opens on failed compile, Copy log. Live check pending. |
 | F-015 | Rust workspace service | P0 | Done | Claude | Rust tests | `src-tauri/src/project.rs`: project-relative file commands behind one path gate (`resolve_in_project`); `cargo test` covers escapes, junctions, limits, CRUD, import. |
 | F-016 | Rust compiler service | P0 | Done | Claude | Rust tests + smoke test | `compile_project`: latexmk in the build folder, unsaved buffers in an overlay first on TEXINPUTS/BIBINPUTS, tool PATH, hidden console, 180 s tree-kill timeout, first-error summary. Real multi-file e2e (input, include, image, bib) passed on dev machine. |
-| F-017 | Compile job cancellation/queue | P1 | In Progress | Claude | Rapid edit test | Compile disabled while running (F5 ignored) and timed out after 180 s; no user-facing cancel yet. |
+| F-017 | Compile job cancellation/queue | P1 | Superseded | Claude | Rapid edit test | Compile disabled while running (F5 ignored) and timed out after 180 s; Superseded by F-075 (Stop button / Shift+F5, spec 008 US2), 2026-11-18. |
 | F-018 | PDF preview refresh | P0 | In Progress | Claude | Successful compile test | pdf.js canvases, double-buffered, scroll kept; last good PDF kept on failure. Unit-tested; native WebView2 check pending. |
 | F-045 | PDF saved next to the document on exit | P1 | In Progress | Claude | Rust + UI tests | PDF lives in the build folder while editing; on close it is written as `<name>.pdf` beside the saved `.tex` (recompiled first if the preview doesn't match the saved text). Native check pending. |
 | F-049 | Multi-file compile with unsaved buffers | P1 | Done | Claude | Rust e2e + UI tests | Live preview and F5 compile the main document from any file; unsaved files go to an overlay in the build folder, never to disk; images/bib read from the project. |
@@ -143,6 +143,17 @@ Plan, research, contracts and tasks: `specs/007-writing-toolkit/`. Order: F-066 
 | F-072 | Export to Word and HTML (Pandoc on demand, with consent) | P3 | In Progress | Claude | Gate G + quickstart G | US7, T072–T076 done 2026-11-14: File → Export → Word document / Web page; first use asks before downloading Pandoc 3.13 (43 MB, SHA-256 pinned) into `%LOCALAPPDATA%\Lexy\Tools\Pandoc` with progress; saves first, writes `<name>.docx/.html` beside the main document, reports approximated parts. Real download and conversion not yet run. |
 | F-073 | Windows design alignment: type ramp, dialog order, InfoBar, F6/Esc, tabs, high contrast, contrast test, access keys | P1 | In Progress | Claude | Gate W + quickstart W | `docs/DESIGN.md` "Windows design alignment"; T077–T085 done 2026-11-14: 14 px type ramp tokens, primary-first dialogs with verb buttons and safe focus for destructive actions, InfoBars for every notice, F6 pane cycling, `forced-colors` styles, a contrast test (fixed line-number and text-field contrast), Alt key tips on the ribbon. Native check in a Windows contrast theme pending. |
 
+### Safety and control (spec 008)
+
+Plan, research, contracts: `specs/008-safety-control-polish/`. US1 and US2 first (P1), then US3, US4.
+
+| ID | Feature | Priority | Status | Owner | Verification | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| F-074 | Crash recovery: unsaved text kept outside the project, offered on reopen | P1 | In Progress | Claude | Rust + Vitest + quickstart A | US1; `recovery.rs` + `src/recovery.ts` (2 s pause, 10 s max), `RecoveryDialog.tsx`; restore through the snapshot-restore path; copies the user hasn't decided on survive a clean close. Gate A passed 2026-11-18; native kill-and-restart (quickstart A) pending. |
+| F-075 | Stop a running compile (Stop button, Shift+F5) | P1 | In Progress | Claude | Rust e2e + Vitest + quickstart B | US2; cancel epoch (`CompileCancel`, `cancel_compile`) polled in `run_with_timeout`; partial output deleted, shown PDF kept; Stop button + Shift+F5 + palette; exit export says the PDF was not updated. Gate B passed 2026-11-18 incl. a real latexmk stop; native quickstart B pending. Finishes F-017. |
+| F-076 | Engine choice from the ribbon (Automatic / pdfLaTeX / XeLaTeX / LuaLaTeX) | P2 | In Progress | Claude | Vitest + quickstart C | US3; `src/latex/engine.ts`, Layout → Engine (`src/ribbon/EngineMenu.tsx`) and palette commands; writes `% !TEX TS-program = …`; font settings own only their exact XeLaTeX line and replace an explicit pdfLaTeX line (with a notice); `CompileResult.engineReason` shown as "Last compile: …". Gate C passed 2026-11-18; native quickstart C pending. |
+| F-077 | Find text in the PDF preview | P3 | In Progress | Claude | Vitest + quickstart D | US4; `src/pdfView/find.ts` over pdf.js text content (case-insensitive, whitespace collapsed, proportional boxes); Ctrl+F on the PDF, Enter / Shift+Enter, Esc; re-runs after a recompile; `--find-*` tokens with forced-colors. Gate D passed 2026-11-18; native quickstart D and 50-page timing pending. |
+
 ### Archive (early scaffolding and superseded)
 
 | ID | Feature | Priority | Status | Owner | Verification | Notes |
@@ -163,7 +174,6 @@ Collected from the unchecked or "pending" tasks in `specs/001`–`006`, so they 
 | `specs/001-writer-shell` T024 | Run all quickstart scenarios in the native window, 800x600 at 100/125/150 % scaling | F-004, F-005, F-008, F-009, F-034 |
 | `specs/002-word-style-editor` T055 | Run every quickstart scenario in the native window, incl. dark mode and a OneDrive-redirected Documents folder | F-037–F-043 |
 | `specs/003-pdf-source-sync` T013/T026/T037 | Walk quickstarts A–C in the native window | F-060–F-062 |
-| `specs/003-pdf-source-sync` T039 | Measure compile time with and without `-synctex=1` on a 10-page document (SC-004 ≤ +10 %) | F-060 |
 | `specs/003-pdf-source-sync` analysis 2026-11-14 | SC-002 jump timing (< 300 ms, 50 pages); SC-001 10-page accuracy; SC-005 seeded mistakes (missing `}`, missing file, missing citation, multiply defined label); outdated "Untitled documents" edge case in spec.md | F-060, F-061 |
 | `specs/004-project-workspace` | Native checks: Explorer drag-drop, two windows, outside changes, close prompt | F-046–F-051 |
 | `specs/005-bangla-multilingual` | Native typing with Avro / Windows Bangla keyboard; editor font visual check | F-054, F-065 |
@@ -211,6 +221,14 @@ Add new ideas here first. During triage, either move them into the feature track
 | 2026-11-14 | User (from upvote research) | Select and copy text in the PDF preview. | TeXstudio 16👍. | Declined by user (2026-11-14) |
 | 2026-11-14 | User (from upvote research) | Zotero / Mendeley citation insert. | LaTeX Workshop "Mendeley API support" 10👍. | Declined by user for now; citations intake row covers .bib |
 | 2026-11-14 | User | Follow the Windows app design guidelines (learn.microsoft.com/windows/apps/design) for the UI. | Lexy should feel native on Windows. | Planned as F-073 (`docs/DESIGN.md` "Windows design alignment") |
+| 2026-11-18 | Claude (code review) | Code-sign the installer and app binaries. | Unsigned installers get a SmartScreen "unknown publisher" block, which stops most non-technical users; `tauri.conf.json` has no signing settings. | Needs triage (release blocker, pairs with F-028) |
+| 2026-11-18 | Claude (code review) | Recover unsaved text after a crash or power loss. | Auto-save is off by default and snapshots are taken only on save, so unsaved edits are lost if the app dies. | Specced: `specs/008-safety-control-polish` US1 |
+| 2026-11-18 | Claude (code review) | Stop button for a running compile. | F-017: a stuck compile blocks every other compile for up to 180 s with no way out. | Specced: `specs/008-safety-control-polish` US2 (finishes F-017) |
+| 2026-11-18 | Claude (code review) | Choose the engine (pdfLaTeX / XeLaTeX / LuaLaTeX) from the UI. | Only a `% !TEX program` line or automatic choice picks the engine today; LuaLaTeX can't be picked without typing the marker. | Specced: `specs/008-safety-control-polish` US3 |
+| 2026-11-18 | Claude (code review) | Find text in the PDF preview (Ctrl+F on the PDF). | pdf.js canvases have no text search; long documents are hard to scan. | Specced: `specs/008-safety-control-polish` US4 |
+| 2026-11-18 | Claude (code review) | More spell-check dictionaries, Bangla first. | Only `en_US` is bundled (`src-tauri/resources/dictionaries`), yet Bangla is a headline feature. | Needs triage |
+| 2026-11-18 | Claude (code review) | In-app updates (Tauri updater, signed). | No `tauri-plugin-updater`; users would have to reinstall manually to get fixes. | Covered by F-031 |
+| 2026-11-18 | Claude (code review) | Keep MiKTeX packages up to date (update check / button). | Lexy installs MiKTeX once and never updates it; packages age and new ones can clash with old ones. | Needs triage |
 
 ## Decision Log
 
@@ -292,3 +310,10 @@ Add new ideas here first. During triage, either move them into the feature track
 | 2026-11-14 | Spec 007 Gate G (US7 export): `cargo test`, `npm test`, `npx tsc --noEmit`, `npm run build`; browser pane with a stub backend at 800x600 | Passed | 162 Rust tests (install from a local server: hash mismatch refused, wrong archive refused, progress, ZIP removed; arguments; warnings) and 532 Vitest tests (consent → install → save → export → result; cancel downloads nothing). The real-Pandoc test skipped (not installed). Not run: the 43 MB download, a real .docx/.html conversion. |
 | 2026-11-14 | Spec 007 Gate W (Windows design alignment): `npm test`, `npx tsc --noEmit`, `npm run build`; browser pane at 800x600 light and dark | Passed | 582 Vitest tests incl. 41 contrast checks (light/dark), dialog order and safe focus, prompt verbs, ribbon key tips, F6. Contrast test found two real gaps, both fixed: light line numbers 2.7:1 → 3.4:1; text fields now outlined with `--control-border` ≥ 3:1. Browser pane: all 7 ribbon tabs fit at 800 px in both themes. Not covered: Windows contrast themes and display scaling in the native window. |
 | 2026-11-14 | Spec 007 final run (T086–T088): `cargo test`, `npm test`, `npx tsc --noEmit`, `npm run build`; performance checks; data-safety pass | Passed | 162 Rust and 587 Vitest tests. Performance (500 files, 3.1 MB, in Vitest): index 66 ms cold / 3 ms after an edit, suggestions ≤ 1 ms (SC-001 < 100 ms), search ≤ 7 ms (SC-005 < 1 s), word count 143 ms. Data safety (SC-008): auto-save + Replace all + note + restore in one session wrote only texts the user saw. Found and fixed: notes containing `?` or `:` were refused. Flaky under CPU load: `TablePicker.test.tsx` failed once while `cargo test` ran in parallel, passed alone and in a full rerun. Not covered: native window, close/reopen, IPC time for project texts. |
+| 2026-11-18 | Tracker vs code review: `cargo test`, `npm test`, `npx tsc --noEmit`; registered commands and files checked against each row | Passed | 162 Rust (no "skipping", so real latexmk e2e ran) and 587 Vitest tests; typecheck clean. Every command and file named in the tracker exists; no status changes needed. Still true: `productName`/window `title` are `lexy` (F-003), no MiKTeX setup hash (F-024), no compile cancel (F-017), only `en_US` dictionary. Missing features added to Manual Feature Intake. Not covered: native window, fresh VM. |
+| 2026-11-18 | Spec 003 T039: SC-004 SyncTeX overhead; `npm run build` | Passed | 14-page pdfLaTeX article (30 sections, equations), latexmk from a clean folder, 5 alternating runs each: mean 1621 ms without `-synctex=1`, 1605 ms with it (−1 %, within run-to-run noise of ±300 ms); target ≤ +10 %. Build passes. Not covered: XeLaTeX and very long documents. |
+| 2026-11-18 | Spec 008 planning: spec, research R1–R6, data model, contracts, quickstart | Passed (docs only) | `specs/008-safety-control-polish/`; quality checklist 16/16; rows F-074–F-077 added. Design reuses `run_with_timeout`/`kill_tree`, `write_atomic`, snapshot restore, `EditorHandle.applyTo`; no new dependencies. No code changed. |
+| 2026-11-18 | Spec 008 Gate A (US1 crash recovery): `cargo test`, `npm test`, `npx tsc --noEmit` | Passed | 169 Rust tests (7 new: exact round trip incl. Bangla/CRLF, copy equal to disk dropped, disk-changed/missing flags, failed write keeps the old copy, discard, 30-day prune, nothing written into the project) and all 59 Vitest files (scheduler, RecoveryDialog, 5 Writer flows). Fixed: the App test mock had no `recovery_list`. Flaky: the 500-file word-count timing test (2.4 s under full-suite load, 0.18 s alone). Not covered: native kill-and-restart. |
+| 2026-11-18 | Spec 008 Gate B (US2 stop compile): `cargo test`, `npm test`, `npx tsc --noEmit` | Passed | 173 Rust tests (4 new: cancelled tree killed in < 2 s, cancel tokens only stop compiles requested before the press, stopped-result shape, and a real latexmk run of an endless `\def` loop stopped after 1 s with partial output removed, the shown PDF untouched and the next compile succeeding) and 608 Vitest tests (scheduler cancel, reducer, Ribbon Stop, Writer Stop/Shift+F5, exit export). Not covered: native window. |
+| 2026-11-18 | Spec 008 Gate C (US3 engine choice): `cargo test`, `npm test`, `npx tsc --noEmit` | Passed | 175 Rust tests (new: menu `TS-program` lines are markers; an explicit pdfLaTeX line keeps the automatic Bangla switch off) and 641 Vitest tests (engine line read/edit incl. CRLF and line 5/6, settings keep menu lines, EngineMenu, Writer: line 1 / in place / Automatic, main document from a chapter, pdfLaTeX font warning, last-compile reason, palette). Load flakes: running `cargo test` and Vitest together timed out the two stop-timing tests and several waitFor UI tests (EquationDialog, CompareView, performance); every one passes alone. The stop tests now measure from the cancel with a 5 s bound. Not covered: native window. |
+| 2026-11-18 | Spec 008 Gate D (US4 find in PDF): `npm test`, `npx tsc --noEmit`, `npm run build` | Passed | 658 Vitest tests (find: page text, case folding, matches across items/lines/pages, proportional boxes, nearest match; PdfView: Ctrl+F, count, Enter/Shift+Enter wrap, No results, Esc clears and refocuses, no PDF, re-run on a new PDF; highlight outlines >= 3:1 on the white page in both themes). Build passes. Not covered: native window, real pdf.js text extraction, SC-007 timing on 50 pages. |

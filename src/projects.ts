@@ -82,6 +82,13 @@ export type Snapshot = { time: number; size: number };
 export const listSnapshots = (file: string) => invoke<Snapshot[]>("list_snapshots", { file });
 export const readSnapshot = (file: string, time: number) => invoke<string>("read_snapshot", { file, time });
 
+/** Mirrors `recovery::RecoveryEntry` (spec 008): unsaved text kept outside the project. `path` uses `/`. */
+export type RecoveryCopy = { path: string; text: string; savedAt: number; baseHash: string; diskChanged: boolean; missing: boolean };
+export const recoverySave = (path: string, text: string) => invoke<void>("recovery_save", { path, text });
+export const recoveryList = () => invoke<RecoveryCopy[]>("recovery_list");
+/** `null` discards every copy of the open project. */
+export const recoveryDiscard = (paths: string[] | null) => invoke<void>("recovery_discard", { paths });
+
 /** Mirrors `ProjectText` / `ProjectTexts` in project.rs (spec 007 R1). */
 export type ProjectText = { path: string; text: string; modified: number };
 export type ProjectTexts = { files: ProjectText[]; truncated: boolean };

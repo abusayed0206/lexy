@@ -3,6 +3,13 @@ import { getDocument, GlobalWorkerOptions, type PDFDocumentProxy } from "pdfjs-d
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import type { PdfSpot } from "./compile";
 import { captureAnchor, cssScale, parseZoom, restoreAnchor, zoomIn, zoomOut, type Zoom } from "./pdfView/zoom";
+import { findMatches, matchRects, nearestMatch, pageText, type PageText, type TextItemLike } from "./pdfView/find";
+import { Icon } from "./ribbon/icons";
+
+/** One page's searchable text, kept per loaded document (spec 008 US4). */
+type CachedPage = { items: TextItemLike[]; text: PageText; viewport: { convertToViewportRectangle: (rect: number[]) => number[] } };
+/** A match in CSS pixels relative to its page wrapper. */
+type Hit = { page: number; top: number; boxes: { left: number; top: number; width: number; height: number }[] };
 
 GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -58,6 +65,16 @@ export function PdfView({ bytes, busy, onError, onDoubleClickPoint, onZoomChange
   onErrorRef.current = onError;
   const [hasPages, setHasPages] = useState(false);
   const [zoom, setZoomState] = useState<Zoom>(loadZoom);
+  // Find in PDF (spec 008 US4).
+  const [findOpen, setFindOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [hits, setHits] = useState<Hit[]>([]);
+  const [currentHit, setCurrentHit] = useState(0);
+  /** Bumped whenever new pages are swapped in, so an open search runs again. */
+  const [pagesVersion, setPagesVersion] = useState(0);
+  const textCache = useRef(new Map<number, CachedPage>());
+  const findInput = useRef<HTMLInputElement>(null);
+  const searchSeq = useRef(0);
 
   function setZoom(next: Zoom) {
     setZoomState(next);
@@ -157,6 +174,8 @@ export function PdfView({ bytes, busy, onError, onDoubleClickPoint, onZoomChange
       void current.current?.destroy();
       current.current = loaded;
       loaded = null;
+      textCache.current = new Map();
+      setPagesVersion((version) => version + 1);
     })().catch((error) => {
       if (!cancelled) onErrorRef.current?.(`The PDF could not be shown. ${error}`);
     });
@@ -168,6 +187,105 @@ export function PdfView({ bytes, busy, onError, onDoubleClickPoint, onZoomChange
   }, [bytes, zoom]);
 
   useEffect(() => () => void current.current?.destroy(), []);
+
+  async function pageTextOf(doc: PDFDocumentProxy, number: number): Promise<CachedPage> {
+    const cached = textCache.current.get(number);
+    if (cached) return cached;
+    const page = await doc.getPage(number);
+    const content = await page.getTextContent();
+    const items = content.items.filter((item): item is TextItemLike & typeof item => "str" in item) as TextItemLike[];
+    const entry = { items, text: pageText(items), viewport: page.getViewport({ scale: 1 }) };
+    textCache.current.set(number, entry);
+    return entry;
+  }
+
+  /** Search every page; `near` keeps the current match close to where it was (after a recompile). */
+  async function runSearch(text: string, near?: { page: number; top: number }) {
+    const seq = ++searchSeq.current;
+    const doc = current.current;
+    if (!doc || !text.trim()) {
+      setHits([]);
+      setCurrentHit(0);
+      return;
+    }
+    const pages: CachedPage[] = [];
+    for (let number = 1; number <= doc.numPages; number++) pages.push(await pageTextOf(doc, number));
+    if (seq !== searchSeq.current) return;
+    const wrappers = [...(pagesHost.current?.children ?? [])] as HTMLElement[];
+    const found: Hit[] = findMatches(
+      pages.map((page) => page.text),
+      text,
+    ).map((match) => {
+      const page = pages[match.page];
+      const scale = Number(wrappers[match.page]?.dataset.scale) || 1;
+      const boxes = matchRects(match, page.items, page.text).map((rect) => {
+        const [x1, y1, x2, y2] = page.viewport.convertToViewportRectangle([rect.x, rect.y, rect.x + rect.width, rect.y + rect.height]);
+        return { left: Math.min(x1, x2) * scale, top: Math.min(y1, y2) * scale, width: Math.abs(x2 - x1) * scale, height: Math.abs(y2 - y1) * scale };
+      });
+      return { page: match.page, top: Math.min(Infinity, ...boxes.map((box) => box.top)), boxes };
+    });
+    setHits(found);
+    const from = near ?? { page: visiblePage(), top: 0 };
+    const index = found.length ? nearestMatch(found, from.page, from.top) : 0;
+    setCurrentHit(index);
+    if (found.length) scrollToHit(found[index]);
+  }
+
+  /** Index of the first page whose bottom is below the top of the view. */
+  function visiblePage(): number {
+    const box = scroller.current;
+    const { tops, heights } = pageGeometry();
+    if (!box) return 0;
+    const index = tops.findIndex((top, i) => top + heights[i] > box.scrollTop);
+    return index < 0 ? 0 : index;
+  }
+
+  function scrollToHit(hit: Hit) {
+    const box = scroller.current;
+    const wrapper = pagesHost.current?.children[hit.page] as HTMLElement | undefined;
+    if (!box || !wrapper || !Number.isFinite(hit.top)) return;
+    const y = wrapper.offsetTop + hit.top;
+    if (y < box.scrollTop || y > box.scrollTop + box.clientHeight - 40) box.scrollTop = y - box.clientHeight / 2;
+  }
+
+  function step(delta: number) {
+    if (!hits.length) return;
+    const index = (currentHit + delta + hits.length) % hits.length;
+    setCurrentHit(index);
+    scrollToHit(hits[index]);
+  }
+
+  function closeFind() {
+    searchSeq.current++;
+    setFindOpen(false);
+    setHits([]);
+    scroller.current?.focus();
+  }
+
+  // Draw the highlight boxes into the page wrappers.
+  useEffect(() => {
+    const host = pagesHost.current;
+    if (!host) return;
+    host.querySelectorAll(".pdf-find-match").forEach((node) => node.remove());
+    hits.forEach((hit, index) => {
+      const wrapper = host.children[hit.page] as HTMLElement | undefined;
+      if (!wrapper) return;
+      for (const box of hit.boxes) {
+        const mark = document.createElement("div");
+        mark.className = index === currentHit ? "pdf-find-match pdf-find-current" : "pdf-find-match";
+        Object.assign(mark.style, { left: `${box.left}px`, top: `${box.top}px`, width: `${box.width}px`, height: `${box.height}px` });
+        wrapper.append(mark);
+      }
+    });
+  }, [hits, currentHit, pagesVersion]);
+
+  // Run the search again on a new PDF, keeping the current match near where it was.
+  useEffect(() => {
+    if (!findOpen || !query.trim()) return;
+    const last = hits[currentHit];
+    void runSearch(query, last ? { page: last.page, top: last.top } : undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pagesVersion]);
 
   // Ctrl+wheel zooms; the listener must be non-passive to stop the page zoom.
   useEffect(() => {
@@ -193,6 +311,14 @@ export function PdfView({ bytes, busy, onError, onDoubleClickPoint, onZoomChange
       tabIndex={0}
       onKeyDown={(event) => {
         if (!event.ctrlKey || event.altKey) return;
+        if (event.key.toLowerCase() === "f" && !event.shiftKey) {
+          if (!hasPages) return;
+          event.preventDefault();
+          setFindOpen(true);
+          requestAnimationFrame(() => findInput.current?.select());
+          findInput.current?.focus();
+          return;
+        }
         const next = { "=": "in", "+": "in", "-": "out", "0": "fit" }[event.key];
         if (!next) return;
         event.preventDefault();
@@ -206,6 +332,46 @@ export function PdfView({ bytes, busy, onError, onDoubleClickPoint, onZoomChange
         onDoubleClickPoint(Number(wrapper.dataset.page), (event.clientX - rect.left) / scale, (event.clientY - rect.top) / scale);
       }}
     >
+      {findOpen ? (
+        <div className="pdf-find-host">
+          <div className="pdf-find" role="search" aria-label="Find in PDF">
+            <input
+              ref={findInput}
+              type="search"
+              aria-label="Find in PDF"
+              placeholder="Find in PDF"
+              value={query}
+              autoFocus
+              onChange={(event) => {
+                setQuery(event.target.value);
+                void runSearch(event.target.value);
+              }}
+              onKeyDown={(event) => {
+                event.stopPropagation();
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  step(event.shiftKey ? -1 : 1);
+                } else if (event.key === "Escape") {
+                  event.preventDefault();
+                  closeFind();
+                }
+              }}
+            />
+            <span className="pdf-find-count" aria-live="polite">
+              {query.trim() ? (hits.length ? `${currentHit + 1} of ${hits.length}` : "No results") : ""}
+            </span>
+            <button type="button" className="icon-button" aria-label="Previous match (Shift+Enter)" title="Previous match (Shift+Enter)" disabled={!hits.length} onClick={() => step(-1)}>
+              <Icon name="up" size={16} />
+            </button>
+            <button type="button" className="icon-button" aria-label="Next match (Enter)" title="Next match (Enter)" disabled={!hits.length} onClick={() => step(1)}>
+              <Icon name="down" size={16} />
+            </button>
+            <button type="button" className="icon-button" aria-label="Close (Esc)" title="Close (Esc)" onClick={closeFind}>
+              <Icon name="close" size={16} />
+            </button>
+          </div>
+        </div>
+      ) : null}
       <div className="pdf-pages" ref={pagesHost} />
       {!hasPages ? <p className="preview-empty">{busy ? "Compiling" : "No PDF yet"}</p> : null}
     </div>

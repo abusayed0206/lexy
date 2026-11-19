@@ -1,4 +1,5 @@
 import { DEFAULT_FONT, fontFromLines, fontLines, type FontChoice } from "./fonts";
+import { readEngine } from "./engine";
 
 export type Margins = { top: number; bottom: number; left: number; right: number };
 export type FontSize = 10 | 11 | 12;
@@ -150,12 +151,22 @@ export function applySettings(source: string, settings: DocumentSettings): strin
   if (existing) lines.splice(existing.start, existing.end - existing.start + 1, ...block);
   else lines.splice(classIndex + 1, 0, ...block);
 
-  const hasMarker = lines[0]?.trim() === XELATEX_MARKER;
+  // Lexy owns only its exact marker line; engine lines chosen in the Engine menu stay (spec 008 R5).
+  const marker = lines.slice(0, 5).findIndex((line) => line.trim() === XELATEX_MARKER);
   const wantsMarker = settings.font.kind !== "builtin";
-  if (hasMarker && !wantsMarker) lines.shift();
-  if (!hasMarker && wantsMarker) lines.unshift(XELATEX_MARKER);
+  if (marker >= 0 && !wantsMarker) lines.splice(marker, 1);
+  if (marker < 0 && wantsMarker) {
+    const engine = readEngine(lines.join("\n"));
+    if (engine.choice === "pdflatex" && engine.line !== null) lines[engine.line] = XELATEX_MARKER;
+    else if (engine.choice === "auto") lines.unshift(XELATEX_MARKER);
+  }
 
   return lines.join(eol);
+}
+
+/** True when applying `settings` turns an explicit pdfLaTeX engine line into Lexy's XeLaTeX one. */
+export function replacesPdflatexLine(source: string, settings: DocumentSettings): boolean {
+  return settings.font.kind !== "builtin" && readEngine(source).choice === "pdflatex";
 }
 
 const CONFLICTING =

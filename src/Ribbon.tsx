@@ -5,6 +5,8 @@ import type { TableSpec } from "./latex/tables";
 import { FontPicker } from "./ribbon/FontPicker";
 import { Icon, type IconName } from "./ribbon/icons";
 import { LayoutMenu } from "./ribbon/LayoutMenu";
+import { EngineMenu } from "./ribbon/EngineMenu";
+import type { EngineChoice } from "./latex/engine";
 import { MenuButton } from "./ribbon/Menu";
 import { TablePicker } from "./ribbon/TablePicker";
 import type { GitState } from "./git";
@@ -30,6 +32,8 @@ export type RibbonActions = {
   /** Save the current file under another name in the project. */
   onSaveAs: () => void;
   onCompile: () => void;
+  /** Stop the running compile (spec 008 US2). */
+  onStop: () => void;
   onToggleLogs: () => void;
   /** Ctrl+J: show the cursor's line in the PDF. */
   onShowInPdf: () => void;
@@ -46,6 +50,8 @@ export type RibbonActions = {
   onFont: (font: FontChoice) => void;
   onSize: (size: FontSize) => void;
   onLayout: (settings: DocumentSettings) => void;
+  /** Layout → Engine (spec 008 US3). */
+  onEngine: (choice: EngineChoice) => void;
   onGit: (action: GitAction) => void;
   /** Re-indent environments (Shift+Alt+F). */
   onTidy: () => void;
@@ -83,12 +89,18 @@ export type RibbonState = {
   statusClass: string;
   statusDetail: string | null;
   compiling: boolean;
+  /** Any compile (live or explicit) is running, so Stop is offered. */
+  stoppable?: boolean;
   readOnly: boolean;
   logsOpen: boolean;
   liveEnabled: boolean;
   filesOpen: boolean;
   recent: { path: string; name: string }[];
   settings: DocumentSettings;
+  /** The main document's engine line (spec 008 US3). */
+  engine?: EngineChoice;
+  /** "Last compile: XeLaTeX (fontspec package)", or null before the first compile. */
+  lastEngine?: string | null;
   settingsManaged: boolean;
   git: GitState | null;
   gitOpen: boolean;
@@ -255,6 +267,11 @@ export function Ribbon({ actions, state, hidden = false }: { actions: RibbonActi
         >
           {state.statusLabel}
         </span>
+        {state.stoppable ? (
+          <button type="button" className="stop-button" title="Stop compile (Shift+F5)" aria-label="Stop compile (Shift+F5)" onClick={actions.onStop}>
+            Stop
+          </button>
+        ) : null}
         <button
           className="primary compile-button"
           type="button"
@@ -393,9 +410,14 @@ export function Ribbon({ actions, state, hidden = false }: { actions: RibbonActi
         );
       case "layout":
         return (
-          <Group label="Page setup">
-            <LayoutMenu settings={state.settings} onChange={actions.onLayout} />
-          </Group>
+          <>
+            <Group label="Page setup">
+              <LayoutMenu settings={state.settings} onChange={actions.onLayout} />
+            </Group>
+            <Group label="Typesetting">
+              <EngineMenu choice={state.engine ?? "auto"} lastCompile={state.lastEngine ?? null} disabled={state.readOnly} onChange={actions.onEngine} />
+            </Group>
+          </>
         );
       case "review":
         return (
